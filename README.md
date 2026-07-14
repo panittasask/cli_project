@@ -89,6 +89,11 @@ common secret fields are omitted. This trace is an operational summary, not
 the model's private chain-of-thought. `/clear` starts a clean task context while
 keeping the saved session history on disk.
 
+The CLI records token usage returned by llama.cpp for each successful request.
+It shows cumulative session tokens, request count, output tokens, and the latest
+active context usage after every answer. Use `/usage` to show it again. `/clear`
+resets the active context counter while preserving the session totals.
+
 To compare the loaded model without Agent history or tools, start
 `llama-server` and run:
 

@@ -10,12 +10,21 @@ interface SessionMessage {
     timestamp: number;
 }
 
+interface SessionUsage {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    requestCount: number;
+    activeContextTokens: number;
+}
+
 interface ChatSession {
     id: string;
     title: string;
     createdAt: number;
     updatedAt: number;
     messages: SessionMessage[];
+    usage?: SessionUsage;
 }
 
 interface SessionStore {
@@ -185,6 +194,42 @@ class SessionTool {
         this.saveStore(store);
     }
 
+    recordUsage(sessionId: string, usage: { promptTokens: number; completionTokens: number; totalTokens: number }): void {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        if (!session) {
+            return;
+        }
+
+        const current = this.normalizeUsage(session.usage);
+        session.usage = {
+            promptTokens: current.promptTokens + usage.promptTokens,
+            completionTokens: current.completionTokens + usage.completionTokens,
+            totalTokens: current.totalTokens + usage.totalTokens,
+            requestCount: current.requestCount + 1,
+            activeContextTokens: usage.totalTokens
+        };
+        this.saveStore(store);
+    }
+
+    getUsage(sessionId: string): SessionUsage {
+        return this.normalizeUsage(this.getSession(sessionId)?.usage);
+    }
+
+    resetActiveContextUsage(sessionId: string): void {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        if (!session) {
+            return;
+        }
+
+        session.usage = {
+            ...this.normalizeUsage(session.usage),
+            activeContextTokens: 0
+        };
+        this.saveStore(store);
+    }
+
     private createSession(title: string): ChatSession {
         const store = this.loadStore();
         const now = Date.now();
@@ -234,7 +279,11 @@ class SessionTool {
         } else {
             sessions.forEach((session, index) => {
                 const when = new Date(session.updatedAt).toLocaleString();
-                console.log(`${index + 1}. ${session.title} (${session.messages.length} msgs, updated ${when})`);
+                const usage = this.normalizeUsage(session.usage);
+                const tokenSummary = usage.requestCount > 0
+                    ? `, ${usage.totalTokens.toLocaleString()} tokens`
+                    : "";
+                console.log(`${index + 1}. ${session.title} (${session.messages.length} msgs${tokenSummary}, updated ${when})`);
             });
         }
 
@@ -297,6 +346,21 @@ class SessionTool {
 
     private estimateSize(store: SessionStore): number {
         return Buffer.byteLength(JSON.stringify(store), "utf8");
+    }
+
+    private normalizeUsage(usage?: Partial<SessionUsage>): SessionUsage {
+        const toTokenCount = (value: unknown): number => {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+        };
+
+        return {
+            promptTokens: toTokenCount(usage?.promptTokens),
+            completionTokens: toTokenCount(usage?.completionTokens),
+            totalTokens: toTokenCount(usage?.totalTokens),
+            requestCount: toTokenCount(usage?.requestCount),
+            activeContextTokens: toTokenCount(usage?.activeContextTokens)
+        };
     }
 
     private loadStore(): SessionStore {

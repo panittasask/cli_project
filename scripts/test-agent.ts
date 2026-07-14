@@ -1,5 +1,6 @@
 import assert = require("node:assert/strict");
 import fs = require("node:fs");
+import http = require("node:http");
 import os = require("node:os");
 import path = require("node:path");
 const { loadCliSettings, getSamplingSettings } = require("../cli/config") as {
@@ -19,9 +20,79 @@ const { SessionTool } = require("../cli/session") as { SessionTool: new (storage
     getContextMessages: (sessionId: string, limit?: number, afterTimestamp?: number) => Array<{ content: string }>;
     deleteSession: (sessionId: string) => boolean;
     clearSessions: () => number;
+    recordUsage: (sessionId: string, usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void;
+    getUsage: (sessionId: string) => {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        requestCount: number;
+        activeContextTokens: number;
+    };
+    resetActiveContextUsage: (sessionId: string) => void;
+} };
+const { LlamaClient } = require("../cli/llamaClient") as { LlamaClient: new (apiUrl: string, timeoutMs?: number) => {
+    post: (
+        payload: Record<string, unknown>,
+        onRetry?: (attempt: number, errorCode: string) => void
+    ) => Promise<{ data: { choices: Array<{ message: { content: string } }> } }>;
+    formatError: (error: unknown) => string;
+    close: () => void;
 } };
 
+async function testConnectionResetRetry(): Promise<void> {
+    let completionRequests = 0;
+    const server = http.createServer((request, response) => {
+        if (request.url === "/health") {
+            response.writeHead(200, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({ status: "ok" }));
+            return;
+        }
+
+        if (request.url === "/v1/chat/completions") {
+            completionRequests += 1;
+            if (completionRequests === 1) {
+                request.socket.destroy();
+                return;
+            }
+
+            response.writeHead(200, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({
+                choices: [{ message: { content: "recovered" } }]
+            }));
+            return;
+        }
+
+        response.writeHead(404);
+        response.end();
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+    });
+
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const client = new LlamaClient(`http://127.0.0.1:${address.port}/v1/chat/completions`, 5000);
+    let retries = 0;
+
+    try {
+        const response = await client.post({ model: "test", messages: [] }, () => {
+            retries += 1;
+        });
+        assert.equal(response.data.choices[0]?.message.content, "recovered");
+        assert.equal(completionRequests, 2);
+        assert.equal(retries, 1);
+        assert.equal(client.formatError(Object.assign(new Error("reset"), { code: "ECONNRESET" })), "reset");
+    } finally {
+        client.close();
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+}
+
 async function main(): Promise<void> {
+    await testConnectionResetRetry();
+
     const settings = loadCliSettings(path.resolve(__dirname, ".."));
     assert.equal(settings.contextLength, 65536);
     const actionSampling = getSamplingSettings(settings, "action");
@@ -79,6 +150,18 @@ async function main(): Promise<void> {
         }), "utf8");
         const session = new SessionTool(sessionPath);
         assert.deepEqual(session.getContextMessages("test", 6, 200).map((item) => item.content), ["new task"]);
+        session.recordUsage("test", { promptTokens: 100, completionTokens: 20, totalTokens: 120 });
+        session.recordUsage("test", { promptTokens: 140, completionTokens: 30, totalTokens: 170 });
+        assert.deepEqual(session.getUsage("test"), {
+            promptTokens: 240,
+            completionTokens: 50,
+            totalTokens: 290,
+            requestCount: 2,
+            activeContextTokens: 170
+        });
+        session.resetActiveContextUsage("test");
+        assert.equal(session.getUsage("test").activeContextTokens, 0);
+        assert.equal(session.getUsage("test").totalTokens, 290);
         assert.equal(session.deleteSession("test"), true);
         assert.equal(session.deleteSession("missing"), false);
         assert.deepEqual(session.getContextMessages("keep").map((item) => item.content), ["keep me"]);
@@ -104,7 +187,7 @@ async function main(): Promise<void> {
         fs.rmSync(tempDirectory, { recursive: true, force: true });
     }
 
-    console.log("Agent config, context boundary, trace, and redaction tests passed.");
+    console.log("Agent config, connection retry, context boundary, trace, and redaction tests passed.");
 }
 
 main().catch((error) => {

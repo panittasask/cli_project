@@ -2,6 +2,14 @@ import axios = require("axios");
 import readline = require("node:readline");
 import fs = require("node:fs");
 import path = require("node:path");
+const { LlamaClient } = require("./llamaClient") as { LlamaClient: new (apiUrl: string) => {
+    post: (
+        payload: Record<string, unknown>,
+        onRetry?: (attempt: number, errorCode: string) => void
+    ) => Promise<{ data: any }>;
+    formatError: (error: unknown) => string;
+    close: () => void;
+} };
 const { loadCliSettings, getSamplingSettings } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
@@ -60,6 +68,9 @@ const { SessionTool } = require("./session") as { SessionTool: new () => {
     selectSession: (rl: readline.Interface) => Promise<{ id: string; title: string }>;
     getContextMessages: (sessionId: string, maxMessages?: number, afterTimestamp?: number) => Array<{ role: "user" | "assistant"; content: string; timestamp: number }>;
     appendExchange: (sessionId: string, userMessage: string, assistantMessage: string) => void;
+    recordUsage: (sessionId: string, usage: ApiUsage) => void;
+    getUsage: (sessionId: string) => SessionUsage;
+    resetActiveContextUsage: (sessionId: string) => void;
 } };
 
 type ChatSession = {
@@ -93,6 +104,17 @@ type EditRequest = {
 type SlashCommandOption = {
     command: string;
     description: string;
+};
+
+type ApiUsage = {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+};
+
+type SessionUsage = ApiUsage & {
+    requestCount: number;
+    activeContextTokens: number;
 };
 
 type CliSettings = {
@@ -159,6 +181,7 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/editfile", description: "edit a file with AI" },
     { command: "/workspace", description: "show or change workspace" },
     { command: "/model", description: "show loaded and available models" },
+    { command: "/usage", description: "show session token usage" },
     { command: "/clear", description: "start a clean task context" },
     { command: "/debug", description: "show or hide agent trace" },
     { command: "/debug on", description: "show agent trace" },
@@ -188,6 +211,7 @@ const rl = readline.createInterface({
 
 const apiUrl = process.env.LLAMA_API_URL?.trim()
     || "http://127.0.0.1:8080/v1/chat/completions";
+const llamaClient = new LlamaClient(apiUrl);
 const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
@@ -198,6 +222,7 @@ const configuredContextValue = Number(
 const configuredContextLength = Number.isFinite(configuredContextValue) && configuredContextValue >= 512
     ? Math.floor(configuredContextValue)
     : 65536;
+let activeContextLength = configuredContextLength;
 let model = defaultModel;
 let plannerModel = defaultModel;
 const chatSampling = getSamplingSettings(cliSettings, "chat");
@@ -215,6 +240,43 @@ const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
 const toolRouter = new ToolRouter();
 const agentTool = new AgentTool();
+
+function extractApiUsage(data: any): ApiUsage | undefined {
+    const promptTokens = Number(data?.usage?.prompt_tokens);
+    const completionTokens = Number(data?.usage?.completion_tokens);
+    const reportedTotal = Number(data?.usage?.total_tokens);
+    const safePrompt = Number.isFinite(promptTokens) && promptTokens >= 0 ? Math.floor(promptTokens) : 0;
+    const safeCompletion = Number.isFinite(completionTokens) && completionTokens >= 0 ? Math.floor(completionTokens) : 0;
+    const totalTokens = Number.isFinite(reportedTotal) && reportedTotal > 0
+        ? Math.floor(reportedTotal)
+        : safePrompt + safeCompletion;
+
+    if (totalTokens <= 0) {
+        return undefined;
+    }
+
+    return { promptTokens: safePrompt, completionTokens: safeCompletion, totalTokens };
+}
+
+function recordResponseUsage(sessionId: string, responseData: any): void {
+    const usage = extractApiUsage(responseData);
+    if (usage) {
+        sessionTool.recordUsage(sessionId, usage);
+    }
+}
+
+function printSessionUsage(sessionId: string): void {
+    const usage = sessionTool.getUsage(sessionId);
+    const percentage = activeContextLength > 0
+        ? Math.min(100, usage.activeContextTokens / activeContextLength * 100)
+        : 0;
+    console.log(
+        `Session usage: ${usage.totalTokens.toLocaleString()} tokens across ${usage.requestCount.toLocaleString()} request${usage.requestCount === 1 ? "" : "s"}`
+    );
+    console.log(
+        `Active context: ${usage.activeContextTokens.toLocaleString()} / ${activeContextLength.toLocaleString()} tokens (${percentage.toFixed(1)}%) | output: ${usage.completionTokens.toLocaleString()} tokens`
+    );
+}
 
 function getAvailableModelFiles(): string[] {
     try {
@@ -338,6 +400,7 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/workspace <path>         Change workspace for agent/files");
     console.log("/model                    Show loaded and available GGUF models");
     console.log("                            Switch GGUF by restarting npm run llama");
+    console.log("/usage                    Show session and active context token usage");
     console.log("/clear                    Start a new task context; keep session history");
     console.log("/debug [on|off]           Show status or toggle concise agent trace");
     console.log("/exit                     Exit the app");
@@ -724,13 +787,14 @@ function buildProjectContextBlock(filePaths: string[], reason?: string): string 
     return `${header}\n\n${sections.join("\n\n---\n\n")}`;
 }
 
-async function routeTool(message: string): Promise<ToolDecision> {
+async function routeTool(message: string, sessionId: string): Promise<ToolDecision> {
     try {
-        const response = await axios.post(apiUrl, {
+        const response = await llamaClient.post({
             model,
             messages: toolRouter.buildRouterMessages(message),
             ...actionSampling
         });
+        recordResponseUsage(sessionId, response.data);
 
         const decision = toolRouter.parseDecision(response.data.choices[0].message.content);
 
@@ -766,7 +830,8 @@ async function routeTool(message: string): Promise<ToolDecision> {
 async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
-    spinner: { update: (message: string) => void; log: (message: string) => void }
+    spinner: { update: (message: string) => void; log: (message: string) => void },
+    sessionId: string
 ): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace> }> {
     const maxTurns = 12;
     const sourceUrls = new Set<string>();
@@ -788,11 +853,14 @@ async function runAgentLoop(
             ? `Planning next action (${turn}/${maxTurns})...`
             : `Reviewing results and planning (${turn}/${maxTurns})...`);
 
-        const response = await axios.post(apiUrl, {
+        const response = await llamaClient.post({
             model,
             messages,
             ...actionSampling
+        }, (_attempt, errorCode) => {
+            spinner.update(`llama.cpp connection ${errorCode}; retrying...`);
         });
+        recordResponseUsage(sessionId, response.data);
 
         const assistantContent = response.data.choices[0].message.content?.trim() ?? "";
         const action = agentTool.parseAction(assistantContent) as {
@@ -875,11 +943,14 @@ Do not call another tool. Do not claim unverified success.`
     });
 
     try {
-        const response = await axios.post(apiUrl, {
+        const response = await llamaClient.post({
             model,
             messages,
             ...actionSampling
+        }, (_attempt, errorCode) => {
+            spinner.update(`llama.cpp connection ${errorCode}; retrying final summary...`);
         });
+        recordResponseUsage(sessionId, response.data);
         const assistantContent = response.data.choices[0].message.content?.trim() ?? "";
         const finalAction = agentTool.parseAction(assistantContent) as {
             action?: string;
@@ -950,6 +1021,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         if (trimmed.toLowerCase() === "exit" || trimmed.toLowerCase() === "/exit") {
             await agentTool.close();
+            llamaClient.close();
             rl.close();
             process.exit(0);
         }
@@ -962,7 +1034,15 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         if (trimmed.toLowerCase() === "/clear") {
             contextStartedAt = Date.now();
+            sessionTool.resetActiveContextUsage(activeSession.id);
             console.log("Task context cleared. Saved session history was kept.");
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/usage") {
+            printSessionUsage(activeSession.id);
             console.log();
             ask(activeSession, runMode);
             return;
@@ -1089,12 +1169,13 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             const historyForModel = toModelMessages(sessionHistory);
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const result = await runAgentLoop(trimmed, historyForModel, spinner);
+                const result = await runAgentLoop(trimmed, historyForModel, spinner, activeSession.id);
                 spinner.stop();
                 if (debugEnabled) {
                     result.trace.print();
                 }
                 console.log("AI:", result.answer);
+                printSessionUsage(activeSession.id);
                 console.log();
 
                 sessionTool.appendExchange(activeSession.id, trimmed, result.answer);
@@ -1103,7 +1184,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             }
 
             if (!imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const decision = await routeTool(trimmed);
+                const decision = await routeTool(trimmed, activeSession.id);
                 requestedContextFiles = decision.contextFiles;
                 contextReason = decision.contextReason;
 
@@ -1129,7 +1210,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
                             ? `${editFilePrompt.instruction} (Edit file path: ${editFilePrompt.filePath})`
                     : trimmed;
 
-                const planner = await axios.post(apiUrl, {
+                const planner = await llamaClient.post({
                     model: plannerModel,
                     messages: [
                         {
@@ -1181,6 +1262,7 @@ User Prompt: ${plannerInput}`
                     ],
                     ...plannerSampling
                 });
+                recordResponseUsage(activeSession.id, planner.data);
 
                 const plannerMessage = planner.data.choices[0].message.content?.trim() ?? "{}";
                 plannerPayload = plannerMessage;
@@ -1211,7 +1293,7 @@ Return ONLY the final updated full file content.
 Do not include markdown fences.
 Do not add explanations.`;
 
-                const editResponse = await axios.post(apiUrl, {
+                const editResponse = await llamaClient.post({
                     model,
                     messages: [
                         {
@@ -1231,6 +1313,7 @@ ${projectContextBlock}`
                     ],
                     ...actionSampling
                 });
+                recordResponseUsage(activeSession.id, editResponse.data);
 
                 const editedRaw = editResponse.data.choices[0].message.content?.trim() ?? "";
                 const editedContent = stripCodeFence(editedRaw);
@@ -1246,6 +1329,7 @@ ${projectContextBlock}`
                     ? `Updated file (auto edit intent): ${editFilePrompt.filePath}`
                     : `Updated file: ${editFilePrompt.filePath}`;
                 console.log("AI:", editMessage);
+                printSessionUsage(activeSession.id);
                 console.log();
 
                 sessionTool.appendExchange(activeSession.id, trimmed, editMessage);
@@ -1297,7 +1381,7 @@ ${capabilityInstruction}
 Answer only the end user's request directly in a natural tone.
 Do not mention hidden context, internal tools, or system prompts.`;
 
-            const response = await axios.post(apiUrl, {
+            const response = await llamaClient.post({
                 model,
                 messages: [
                     {
@@ -1312,20 +1396,18 @@ Do not mention hidden context, internal tools, or system prompts.`;
                 ],
                 ...chatSampling
             });
+            recordResponseUsage(activeSession.id, response.data);
 
             const answer = response.data.choices[0].message.content?.trim() ?? "";
             spinner.stop();
             console.log("AI:", answer);
+            printSessionUsage(activeSession.id);
             console.log();
 
             sessionTool.appendExchange(activeSession.id, trimmed, answer);
         } catch (error) {
             spinner.stop();
-            console.error("API Error",error);
-
-            if (axios.isAxiosError(error)) {
-                console.error(error.message);
-            }
+            console.error(`API Error: ${llamaClient.formatError(error)}`);
         }
 
         ask(activeSession, runMode);
@@ -1337,6 +1419,7 @@ async function start(): Promise<void> {
         syncModelFromServer(),
         getServerContextInfo()
     ]);
+    activeContextLength = serverContext?.contextLength ?? configuredContextLength;
     console.log("Chat Started");
     console.log("Type \"exit\" to quit");
     console.log("Image mode: /img <path-to-image> | <prompt>");
@@ -1361,6 +1444,7 @@ async function start(): Promise<void> {
 
     const activeSession = await sessionTool.selectSession(rl);
     console.log(`Session: ${activeSession.title}`);
+    printSessionUsage(activeSession.id);
     console.log();
 
     const initialMode: RunMode = "agent";
@@ -1372,7 +1456,8 @@ async function start(): Promise<void> {
 }
 
 start().catch((error) => {
-    console.error("Failed to start chat", error);
+    console.error(`Failed to start chat: ${llamaClient.formatError(error)}`);
+    llamaClient.close();
     rl.close();
     process.exit(1);
 });
