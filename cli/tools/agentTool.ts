@@ -13,7 +13,7 @@ const { McpTool } = require("./mcpTool") as { McpTool: new () => {
     close: () => Promise<void>;
 } };
 
-type AgentAction =
+type AgentAction = (
     | {
         action: "final";
         answer: string;
@@ -49,6 +49,8 @@ type AgentAction =
         server: string;
         tool: string;
         arguments: Record<string, unknown>;
+    }) & {
+        reason?: string | undefined;
     };
 
 type AgentToolResult = {
@@ -72,15 +74,16 @@ You may have a natural conversation, inspect files, search code, edit files, run
 Work in small steps. Use tools until you have enough evidence, then return final.
 
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
+For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. This is a decision summary, not private chain-of-thought.
 
 Available actions:
-{"action":"list_files","path":"optional relative path"}
-{"action":"search_files","query":"text or regex","path":"optional relative path"}
-{"action":"read_file","path":"relative path"}
-{"action":"write_file","path":"relative path","content":"full updated file content"}
-{"action":"run_command","command":"safe read-only or verification command"}
-{"action":"mcp_list_tools","server":"optional configured server name"}
-{"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{}}
+{"action":"list_files","path":"optional relative path","reason":"brief rationale"}
+{"action":"search_files","query":"text or regex","path":"optional relative path","reason":"brief rationale"}
+{"action":"read_file","path":"relative path","reason":"brief rationale"}
+{"action":"write_file","path":"relative path","content":"full updated file content","reason":"brief rationale"}
+{"action":"run_command","command":"safe read-only or verification command","reason":"brief rationale"}
+{"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
+{"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
 Discovered MCP tools may also be called directly using their input schema, for example:
 {"action":"search_web","query":"focused query","maxResults":5}
 {"action":"final","answer":"final answer to the user"}
@@ -129,29 +132,32 @@ ${mcpSection}`;
 
         const data = parsed as Record<string, unknown>;
         const action = typeof data.action === "string" ? data.action : "";
+        const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
 
         if (action === "final") {
             return {
                 action,
-                answer: typeof data.answer === "string" ? data.answer : ""
+                answer: typeof data.answer === "string" ? data.answer : "",
+                reason
             };
         }
 
         if (action === "list_files") {
             const pathValue = typeof data.path === "string" ? data.path : undefined;
-            return pathValue ? { action, path: pathValue } : { action };
+            return pathValue ? { action, path: pathValue, reason } : { action, reason };
         }
 
         if (action === "search_files") {
             const query = typeof data.query === "string" ? data.query : "";
             const pathValue = typeof data.path === "string" ? data.path : undefined;
-            return pathValue ? { action, query, path: pathValue } : { action, query };
+            return pathValue ? { action, query, path: pathValue, reason } : { action, query, reason };
         }
 
         if (action === "read_file") {
             return {
                 action,
-                path: typeof data.path === "string" ? data.path : ""
+                path: typeof data.path === "string" ? data.path : "",
+                reason
             };
         }
 
@@ -159,20 +165,22 @@ ${mcpSection}`;
             return {
                 action,
                 path: typeof data.path === "string" ? data.path : "",
-                content: typeof data.content === "string" ? data.content : ""
+                content: typeof data.content === "string" ? data.content : "",
+                reason
             };
         }
 
         if (action === "run_command") {
             return {
                 action,
-                command: typeof data.command === "string" ? data.command : ""
+                command: typeof data.command === "string" ? data.command : "",
+                reason
             };
         }
 
         if (action === "mcp_list_tools") {
             const server = typeof data.server === "string" ? data.server : undefined;
-            return server ? { action, server } : { action };
+            return server ? { action, server, reason } : { action, reason };
         }
 
         if (action === "mcp_call_tool") {
@@ -182,7 +190,8 @@ ${mcpSection}`;
                 tool: typeof data.tool === "string" ? data.tool : "",
                 arguments: data.arguments && typeof data.arguments === "object" && !Array.isArray(data.arguments)
                     ? data.arguments as Record<string, unknown>
-                    : {}
+                    : {},
+                reason
             };
         }
 
@@ -192,7 +201,8 @@ ${mcpSection}`;
                 action: "mcp_call_tool",
                 server: directMcpCall.server,
                 tool: directMcpCall.tool,
-                arguments: directMcpCall.arguments
+                arguments: directMcpCall.arguments,
+                reason
             };
         }
 

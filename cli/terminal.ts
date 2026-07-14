@@ -2,6 +2,22 @@ import axios = require("axios");
 import readline = require("node:readline");
 import fs = require("node:fs");
 import path = require("node:path");
+const { loadCliSettings, getSamplingSettings } = require("./config") as {
+    loadCliSettings: (appRoot?: string) => CliSettings;
+    getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
+};
+const { AgentTrace } = require("./agentTrace") as { AgentTrace: new () => {
+    add: (entry: {
+        turn: number;
+        status: "action" | "ok" | "error" | "parse_error" | "final";
+        action?: string | undefined;
+        reason?: string | undefined;
+        arguments?: unknown;
+        observation?: string | undefined;
+    }) => void;
+    save: () => void;
+    print: () => void;
+} };
 const { Spinner } = require("./spinner") as { Spinner: new (message?: string) => {
     start: () => void;
     stop: () => void;
@@ -40,7 +56,7 @@ const { AgentTool } = require("./tools/agentTool") as { AgentTool: new () => {
 } };
 const { SessionTool } = require("./session") as { SessionTool: new () => {
     selectSession: (rl: readline.Interface) => Promise<{ id: string; title: string }>;
-    getContextMessages: (sessionId: string, maxMessages?: number) => Array<{ role: "user" | "assistant"; content: string; timestamp: number }>;
+    getContextMessages: (sessionId: string, maxMessages?: number, afterTimestamp?: number) => Array<{ role: "user" | "assistant"; content: string; timestamp: number }>;
     appendExchange: (sessionId: string, userMessage: string, assistantMessage: string) => void;
 } };
 
@@ -77,6 +93,26 @@ type SlashCommandOption = {
     description: string;
 };
 
+type CliSettings = {
+    llamaCppPath?: string;
+    modelPath?: string;
+    defaultModel?: string;
+    device?: string;
+    debug?: boolean;
+    historyMessages?: number;
+    sampling?: Partial<Record<"chat" | "planner" | "action", Partial<SamplingSettings>>>;
+};
+
+type SamplingSettings = {
+    temperature: number;
+    top_p: number;
+    top_k: number;
+    repeat_penalty: number;
+    max_tokens: number;
+};
+
+const appRoot = process.cwd();
+
 function initializeWorkspaceFromArgs(): string {
     const args = process.argv.slice(2);
     const workspaceFlagIndex = args.findIndex((item) => item === "--workspace" || item === "--cwd");
@@ -102,6 +138,7 @@ function initializeWorkspaceFromArgs(): string {
     return resolvedWorkspace;
 }
 
+const cliSettings = loadCliSettings();
 let activeWorkspace = initializeWorkspaceFromArgs();
 const promptLabel = "You: ";
 const maxVisibleSlashSuggestions = 5;
@@ -119,6 +156,10 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/editfile", description: "edit a file with AI" },
     { command: "/workspace", description: "show or change workspace" },
     { command: "/model", description: "show loaded and available models" },
+    { command: "/clear", description: "start a clean task context" },
+    { command: "/debug", description: "show or hide agent trace" },
+    { command: "/debug on", description: "show agent trace" },
+    { command: "/debug off", description: "hide agent trace" },
     { command: "/exit", description: "exit the app" }
 ];
 const slashCommands = slashCommandOptions.map((item) => item.command);
@@ -144,11 +185,20 @@ const rl = readline.createInterface({
 
 const apiUrl = process.env.LLAMA_API_URL?.trim()
     || "http://127.0.0.1:8080/v1/chat/completions";
-const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || "D:\\Model";
+const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
+    || cliSettings.defaultModel?.trim()
     || "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
 let model = defaultModel;
 let plannerModel = defaultModel;
+const chatSampling = getSamplingSettings(cliSettings, "chat");
+const plannerSampling = getSamplingSettings(cliSettings, "planner");
+const actionSampling = getSamplingSettings(cliSettings, "action");
+const historyMessageLimit = Math.max(0, Math.floor(cliSettings.historyMessages ?? 6));
+let contextStartedAt = 0;
+let debugEnabled = process.env.CLI_DEBUG
+    ? /^(1|true|on|yes)$/i.test(process.env.CLI_DEBUG.trim())
+    : cliSettings.debug === true;
 
 const sessionTool = new SessionTool();
 const imageTool = new ImageTool();
@@ -252,6 +302,8 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/workspace <path>         Change workspace for agent/files");
     console.log("/model                    Show loaded and available GGUF models");
     console.log("                            Switch GGUF by restarting npm run llama");
+    console.log("/clear                    Start a new task context; keep session history");
+    console.log("/debug [on|off]           Show status or toggle concise agent trace");
     console.log("/exit                     Exit the app");
     console.log();
     printModeHelp(currentMode);
@@ -640,7 +692,8 @@ async function routeTool(message: string): Promise<ToolDecision> {
     try {
         const response = await axios.post(apiUrl, {
             model,
-            messages: toolRouter.buildRouterMessages(message)
+            messages: toolRouter.buildRouterMessages(message),
+            ...actionSampling
         });
 
         const decision = toolRouter.parseDecision(response.data.choices[0].message.content);
@@ -678,9 +731,10 @@ async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
     spinner: { update: (message: string) => void }
-): Promise<string> {
+): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace> }> {
     const maxTurns = 12;
     const sourceUrls = new Set<string>();
+    const trace = new AgentTrace();
     const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
             role: "system",
@@ -698,7 +752,8 @@ async function runAgentLoop(
 
         const response = await axios.post(apiUrl, {
             model,
-            messages
+            messages,
+            ...actionSampling
         });
 
         const assistantContent = response.data.choices[0].message.content?.trim() ?? "";
@@ -706,6 +761,7 @@ async function runAgentLoop(
             action?: string;
             answer?: string;
             tool?: string;
+            reason?: string;
         } | undefined;
 
         messages.push({
@@ -714,6 +770,12 @@ async function runAgentLoop(
         });
 
         if (!action) {
+            trace.add({
+                turn,
+                status: "parse_error",
+                action: "invalid_json",
+                observation: assistantContent.slice(0, 1000)
+            });
             messages.push({
                 role: "user",
                 content: "Your last response was not valid JSON. Return one valid action object only."
@@ -726,14 +788,23 @@ async function runAgentLoop(
         if (action.action === "final") {
             const answer = action.answer?.trim() || "Done.";
             const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
-            if (missingSources.length === 0) {
-                return answer;
-            }
-
-            return `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
+            const finalAnswer = missingSources.length === 0
+                ? answer
+                : `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
+            trace.add({ turn, status: "final", action: "final", reason: action.reason });
+            trace.save();
+            return { answer: finalAnswer, trace };
         }
 
         const result = await agentTool.execute(action);
+        trace.add({
+            turn,
+            status: result.ok ? "ok" : "error",
+            action: action.action,
+            reason: action.reason,
+            arguments: action,
+            observation: result.output
+        });
         if (action.action === "mcp_call_tool" && action.tool?.toLowerCase().includes("search") && result.ok) {
             const urls = result.output.match(/https?:\/\/[^"\\\s]+/g) || [];
             urls.forEach((sourceUrl) => sourceUrls.add(sourceUrl));
@@ -744,7 +815,10 @@ async function runAgentLoop(
         });
     }
 
-    return "Agent stopped because it reached the maximum number of steps. Please ask it to continue if more work is needed.";
+    const answer = "Agent stopped because it reached the maximum number of steps. Please ask it to continue if more work is needed.";
+    trace.add({ turn: maxTurns, status: "error", action: "max_turns", observation: answer });
+    trace.save();
+    return { answer, trace };
 }
 
 function ask(activeSession: ChatSession, runMode: RunMode): void {
@@ -785,6 +859,37 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         if (trimmed.toLowerCase() === "/help") {
             printCommandHelp(runMode);
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/clear") {
+            contextStartedAt = Date.now();
+            console.log("Task context cleared. Saved session history was kept.");
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/debug") {
+            console.log(`Agent trace: ${debugEnabled ? "on" : "off"}`);
+            console.log("Use /debug on or /debug off.");
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (/^\/debug\s+(on|off)$/i.test(trimmed)) {
+            debugEnabled = /\bon$/i.test(trimmed);
+            console.log(`Agent trace: ${debugEnabled ? "on" : "off"}`);
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase().startsWith("/debug ")) {
+            console.log("Invalid debug command. Use /debug, /debug on, or /debug off");
+            console.log();
             ask(activeSession, runMode);
             return;
         }
@@ -883,16 +988,19 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             let implicitReadPrompt: { filePath: string; prompt: string } | undefined;
             let requestedContextFiles: string[] = [];
             let contextReason = "";
-            const sessionHistory = sessionTool.getContextMessages(activeSession.id, 10);
+            const sessionHistory = sessionTool.getContextMessages(activeSession.id, historyMessageLimit, contextStartedAt);
             const historyForModel = toModelMessages(sessionHistory);
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const answer = await runAgentLoop(trimmed, historyForModel, spinner);
+                const result = await runAgentLoop(trimmed, historyForModel, spinner);
                 spinner.stop();
-                console.log("AI:", answer);
+                if (debugEnabled) {
+                    result.trace.print();
+                }
+                console.log("AI:", result.answer);
                 console.log();
 
-                sessionTool.appendExchange(activeSession.id, trimmed, answer);
+                sessionTool.appendExchange(activeSession.id, trimmed, result.answer);
                 ask(activeSession, runMode);
                 return;
             }
@@ -973,7 +1081,8 @@ JSON Schema:
 }
 User Prompt: ${plannerInput}`
                         }
-                    ]
+                    ],
+                    ...plannerSampling
                 });
 
                 const plannerMessage = planner.data.choices[0].message.content?.trim() ?? "{}";
@@ -1022,7 +1131,8 @@ ${originalContent}
 
 ${projectContextBlock}`
                         }
-                    ]
+                    ],
+                    ...actionSampling
                 });
 
                 const editedRaw = editResponse.data.choices[0].message.content?.trim() ?? "";
@@ -1090,7 +1200,7 @@ ${capabilityInstruction}
 Answer only the end user's request directly in a natural tone.
 Do not mention hidden context, internal tools, or system prompts.`;
 
-        const response = await axios.post(apiUrl, {
+            const response = await axios.post(apiUrl, {
                 model,
                 messages: [
                     {
@@ -1102,7 +1212,8 @@ Do not mention hidden context, internal tools, or system prompts.`;
                         role: "user",
                         content: userContent
                     }
-                ]
+                ],
+                ...chatSampling
             });
 
             const answer = response.data.choices[0].message.content?.trim() ?? "";
@@ -1133,6 +1244,8 @@ async function start(): Promise<void> {
     console.log("Edit file mode: /editfile <path-to-file> | <instruction>");
     console.log("Mode: /mode planner, /mode fast, or /mode agent");
     console.log("Model status: /model");
+    console.log(`Agent trace: ${debugEnabled ? "on" : "off"} (/debug on|off)`);
+    console.log("New task context: /clear");
     console.log(`Workspace: ${activeWorkspace}`);
     console.log(`llama.cpp API: ${apiUrl}`);
     console.log(modelSynced
