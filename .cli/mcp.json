@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "example": {
+      "command": "node",
+      "args": ["mcp/servers/example/server.mjs"],
+      "cwd": "."
+    },
+    "web-search": {
+      "command": "node",
+      "args": ["mcp/servers/web-search/server.mjs"],
+      "cwd": "."
+    }
+  }
+}

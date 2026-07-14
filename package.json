@@ -1,0 +1,31 @@
+{
+  "name": "cli",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "npm run dev",
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1",
+    "dev:cli": "tsx cli/terminal.ts",
+    "llama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-llama.ps1",
+    "test:mcp": "tsx scripts/test-mcp.ts",
+    "run test": "npm test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.18.0",
+    "dotenv": "^17.4.2",
+    "duck-duck-scrape": "^2.2.7",
+    "openai": "^6.44.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
