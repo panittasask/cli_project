@@ -36,11 +36,10 @@ class SessionTool {
     }
 
     async selectSession(rl: readline.Interface): Promise<ChatSession> {
-        const store = this.loadStore();
-        this.printMenu(store.sessions);
-
         while (true) {
-            const rawChoice = (await this.prompt(rl, "Select session number or type N for new session: ")).trim();
+            const store = this.loadStore();
+            this.printMenu(store.sessions);
+            const rawChoice = (await this.prompt(rl, "Select number, N new, D delete, or C clear all: ")).trim();
 
             if (/^n$/i.test(rawChoice)) {
                 const rawTitle = (await this.prompt(rl, "Session name (optional): ")).trim();
@@ -49,6 +48,58 @@ class SessionTool {
                 console.log(`Using new session: ${created.title}`);
                 console.log();
                 return created;
+            }
+
+            if (/^d$/i.test(rawChoice)) {
+                if (store.sessions.length === 0) {
+                    console.log("No sessions to delete.");
+                    console.log();
+                    continue;
+                }
+
+                const rawIndex = (await this.prompt(rl, "Session number to delete: ")).trim();
+                const deleteIndex = Number(rawIndex);
+                const target = Number.isInteger(deleteIndex) ? store.sessions[deleteIndex - 1] : undefined;
+                if (!target) {
+                    console.log("Invalid session number.");
+                    console.log();
+                    continue;
+                }
+
+                const confirmation = (await this.prompt(rl, `Delete session "${target.title}"? (y/N): `)).trim();
+                if (!/^y(es)?$/i.test(confirmation)) {
+                    console.log("Delete cancelled.");
+                    console.log();
+                    continue;
+                }
+
+                this.deleteSession(target.id);
+                console.log(`Deleted session: ${target.title}`);
+                console.log();
+                continue;
+            }
+
+            if (/^c$/i.test(rawChoice)) {
+                if (store.sessions.length === 0) {
+                    console.log("No sessions to clear.");
+                    console.log();
+                    continue;
+                }
+
+                const confirmation = (await this.prompt(
+                    rl,
+                    `Type DELETE to permanently remove all ${store.sessions.length} sessions: `
+                )).trim();
+                if (confirmation !== "DELETE") {
+                    console.log("Clear cancelled.");
+                    console.log();
+                    continue;
+                }
+
+                const deletedCount = this.clearSessions();
+                console.log(`Deleted ${deletedCount} sessions.`);
+                console.log();
+                continue;
             }
 
             const index = Number(rawChoice);
@@ -84,6 +135,26 @@ class SessionTool {
         return session.messages
             .filter((message) => message.timestamp > afterTimestamp)
             .slice(-maxMessages);
+    }
+
+    deleteSession(sessionId: string): boolean {
+        const store = this.loadStore();
+        const nextSessions = store.sessions.filter((session) => session.id !== sessionId);
+        if (nextSessions.length === store.sessions.length) {
+            return false;
+        }
+
+        store.sessions = nextSessions;
+        this.saveStore(store);
+        return true;
+    }
+
+    clearSessions(): number {
+        const store = this.loadStore();
+        const deletedCount = store.sessions.length;
+        store.sessions = [];
+        this.saveStore(store);
+        return deletedCount;
     }
 
     appendExchange(sessionId: string, userMessage: string, assistantMessage: string): void {
@@ -168,6 +239,8 @@ class SessionTool {
         }
 
         console.log("N. New session");
+        console.log("D. Delete one session");
+        console.log("C. Clear all sessions");
     }
 
     private defaultSessionTitle(): string {

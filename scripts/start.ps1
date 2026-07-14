@@ -14,6 +14,11 @@ $settings = Get-CliSettings
 $llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b9908-bin-win-sycl-x64" }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($settings.modelPath) { $settings.modelPath } else { "D:\Model" }
 $llamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "" }
+$contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 65536 }
+$parsedContextLength = 0
+if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
+    throw "Invalid context length: $contextLength"
+}
 
 $serverExecutable = Join-Path $llamaDirectory "llama-server.exe"
 $logDirectory = Join-Path $PSScriptRoot "..\.cli\logs"
@@ -63,6 +68,7 @@ for ($index = 0; $index -lt $models.Count; $index += 1) {
 Write-Host ""
 Write-Host "Available models"
 Write-Host "================"
+Write-Host ("Context length: {0:N0} tokens" -f $parsedContextLength)
 for ($index = 0; $index -lt $models.Count; $index += 1) {
     $sizeGb = [Math]::Round($models[$index].Length / 1GB, 2)
     $marker = if ($index -eq $defaultModelIndex) { " *" } else { "" }
@@ -88,7 +94,7 @@ Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyCont
 
 $serverArguments = @(
     "-m", ('"{0}"' -f $selectedModel.FullName),
-    "-c", "65536",
+    "-c", $parsedContextLength.ToString(),
     "-np", "1",
     "-fa", "auto",
     "--host", "127.0.0.1",
@@ -102,6 +108,7 @@ if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
 Write-Host ""
 Write-Host "Starting llama.cpp with: $($selectedModel.Name)"
 Write-Host "llama.cpp path: $llamaDirectory"
+Write-Host ("llama.cpp configured context: {0:N0} tokens" -f $parsedContextLength)
 if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
     Write-Host "llama.cpp device: $llamaDevice"
 }

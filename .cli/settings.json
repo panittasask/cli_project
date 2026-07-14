@@ -2,6 +2,7 @@
   "llamaCppPath": "G:\\llama.cpp",
   "modelPath": "G:\\Model",
   "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
+  "contextLength": 65536,
   "device": "CUDA0",
   "debug": true,
   "historyMessages": 6,

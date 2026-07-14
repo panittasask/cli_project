@@ -16,6 +16,10 @@ waits until it is ready, and opens the CLI in the same terminal at the normal
 session-selection screen. Exiting the CLI also stops that background server.
 Logs are written to `.cli/logs/`.
 
+At session selection, use `D` to delete one saved session or `C` to clear all
+saved sessions. Both paths require confirmation. `/clear` inside a session only
+starts a clean model context and does not delete saved session data.
+
 The separate two-terminal workflow below remains available when server logs
 need to stay visible.
 
@@ -39,6 +43,7 @@ Settings:
   "llamaCppPath": "D:\\llama.cpp\\llama-b9908-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
   "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
+  "contextLength": 65536,
   "device": "CUDA0",
   "debug": true,
   "historyMessages": 6,
@@ -64,11 +69,18 @@ $env:LLAMA_MODEL_DIR = "D:\path\to\models"
 $env:LLAMA_DEVICE = "CUDA0"
 $env:LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 $env:LLAMA_MODEL = "another-model.gguf"
+$env:LLAMA_CONTEXT_LENGTH = "65536"
 ```
 
 Sampling values can be overridden per profile with variables such as
 `LLAMA_CHAT_TEMPERATURE`, `LLAMA_PLANNER_MAX_TOKENS`, and
 `LLAMA_ACTION_TOP_K`. Set `CLI_DEBUG=1` to show the concise agent trace.
+
+`contextLength` is the context requested from llama.cpp with `-c`; it is not
+automatically inferred from text such as `1M` in a model filename. The startup
+screen shows the configured value, and `/model` shows both that value and the
+active per-slot context reported by llama.cpp. The server may lower the active
+value when automatic VRAM fitting requires it.
 
 Inside the CLI, `/debug on` displays each agent action, its short decision
 summary, and whether the tool succeeded. The full redacted trace is always

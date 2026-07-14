@@ -52,6 +52,15 @@ class Spinner {
 
         this.message = message;
     }
+
+    log(message: string): void {
+
+        if (this.timer) {
+            process.stdout.write('\r\x1b[K');
+        }
+
+        process.stdout.write(`${message}\n`);
+    }
 }
 
 module.exports = {
