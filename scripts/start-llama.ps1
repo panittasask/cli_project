@@ -13,6 +13,11 @@ $settings = Get-CliSettings
 $llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b9908-bin-win-sycl-x64" }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($settings.modelPath) { $settings.modelPath } else { "D:\Model" }
 $llamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "" }
+$contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 65536 }
+$parsedContextLength = 0
+if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
+    throw "Invalid context length: $contextLength"
+}
 
 $launcher = Join-Path $llamaDirectory "llama-server.exe"
 
@@ -36,6 +41,7 @@ for ($index = 0; $index -lt $models.Count; $index += 1) {
 
 Write-Host "Available models"
 Write-Host "================"
+Write-Host ("Context length: {0:N0} tokens" -f $parsedContextLength)
 for ($index = 0; $index -lt $models.Count; $index += 1) {
     $sizeGb = [Math]::Round($models[$index].Length / 1GB, 2)
     $marker = if ($index -eq $defaultModelIndex) { " *" } else { "" }
@@ -54,7 +60,7 @@ if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 
 }
 
 $selectedModel = $models[$selectedNumber - 1]
-$serverArguments = @("-m", $selectedModel.FullName, "-c", "65536", "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080")
+$serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080")
 if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
     $serverArguments += @("--device", $llamaDevice, "-ngl", "all")
 }
@@ -62,6 +68,7 @@ if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
 Write-Host "Starting llama.cpp from: $llamaDirectory"
 Write-Host "Model: $($selectedModel.Name)"
 Write-Host "Device: $(if ($llamaDevice) { $llamaDevice } else { 'auto' })"
+Write-Host ("Configured context: {0:N0} tokens" -f $parsedContextLength)
 Write-Host "The CLI will connect to: http://127.0.0.1:8080"
 Write-Host ""
 

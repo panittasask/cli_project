@@ -62,7 +62,17 @@ class AgentTool {
     private readonly maxFileChars = 20000;
     private readonly maxObservationChars = 12000;
     private readonly maxListedFiles = 180;
-    private readonly ignoredDirectories = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage"]);
+    private readonly ignoredDirectories = new Set([
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        ".next",
+        "coverage",
+        "$recycle.bin",
+        "system volume information",
+        "recovery"
+    ]);
     private readonly mcpTool = new McpTool();
 
     async buildSystemPrompt(): Promise<string> {
@@ -74,7 +84,7 @@ You may have a natural conversation, inspect files, search code, edit files, run
 Work in small steps. Use tools until you have enough evidence, then return final.
 
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
-For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. This is a decision summary, not private chain-of-thought.
+For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. Use the user's language when practical. This is a decision summary, not private chain-of-thought.
 
 Available actions:
 {"action":"list_files","path":"optional relative path","reason":"brief rationale"}
@@ -276,6 +286,30 @@ ${mcpSection}`;
         await this.mcpTool.close();
     }
 
+    formatActionStatus(action: AgentAction, turn: number, maxTurns: number): string {
+        const clean = (value: string | undefined, maxChars = 100): string => {
+            const redacted = (value ?? "")
+                .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
+                .replace(/\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
+                .replace(/\s+/g, " ")
+                .trim();
+            return redacted.length > maxChars ? `${redacted.slice(0, maxChars - 3)}...` : redacted;
+        };
+        const target = (() => {
+            if (action.action === "list_files") return `Listing files: ${clean(action.path || ".")}`;
+            if (action.action === "search_files") return `Searching files: ${clean(action.query)}`;
+            if (action.action === "read_file") return `Reading file: ${clean(action.path)}`;
+            if (action.action === "write_file") return `Writing file: ${clean(action.path)}`;
+            if (action.action === "run_command") return `Running check: ${clean(action.command)}`;
+            if (action.action === "mcp_list_tools") return `Discovering MCP tools${action.server ? `: ${clean(action.server)}` : ""}`;
+            if (action.action === "mcp_call_tool") return `Calling tool: ${clean(`${action.server}.${action.tool}`)}`;
+            return "Preparing final answer";
+        })();
+        const reason = clean(action.reason, 120);
+
+        return `[${turn}/${maxTurns}] ${target}${reason ? ` - ${reason}` : ""}`;
+    }
+
     formatObservation(action: AgentAction, result: AgentToolResult): string {
         const actionName = action.action;
         const status = result.ok ? "ok" : "error";
@@ -317,7 +351,12 @@ ${mcpSection}`;
 
         for (const relativeFile of files) {
             const absoluteFile = path.resolve(process.cwd(), relativeFile);
-            const buffer = fs.readFileSync(absoluteFile);
+            let buffer: Buffer;
+            try {
+                buffer = fs.readFileSync(absoluteFile);
+            } catch {
+                continue;
+            }
             if (buffer.includes(0)) {
                 continue;
             }
@@ -411,10 +450,15 @@ ${mcpSection}`;
             return;
         }
 
-        const entries = fs.readdirSync(root, { withFileTypes: true });
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(root, { withFileTypes: true });
+        } catch {
+            return;
+        }
 
         for (const entry of entries) {
-            if (entry.isDirectory() && this.ignoredDirectories.has(entry.name)) {
+            if (entry.isDirectory() && this.ignoredDirectories.has(entry.name.toLowerCase())) {
                 continue;
             }
 

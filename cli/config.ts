@@ -15,6 +15,7 @@ type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
     defaultModel?: string;
+    contextLength?: number;
     device?: string;
     debug?: boolean;
     historyMessages?: number;

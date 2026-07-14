@@ -6,7 +6,7 @@ const { loadCliSettings, getSamplingSettings } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
 };
-const { AgentTrace } = require("./agentTrace") as { AgentTrace: new () => {
+const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logPath?: string) => {
     add: (entry: {
         turn: number;
         status: "action" | "ok" | "error" | "parse_error" | "final";
@@ -22,6 +22,7 @@ const { Spinner } = require("./spinner") as { Spinner: new (message?: string) =>
     start: () => void;
     stop: () => void;
     update: (message: string) => void;
+    log: (message: string) => void;
 } };
 const { ImageTool } = require("./tools/imageTool") as { ImageTool: new () => {
     parseImagePrompt: (input: string) => { filePath: string; prompt: string } | undefined;
@@ -51,6 +52,7 @@ const { AgentTool } = require("./tools/agentTool") as { AgentTool: new () => {
     buildSystemPrompt: () => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
+    formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     formatObservation: (action: unknown, result: { ok: boolean; output: string }) => string;
     close: () => Promise<void>;
 } };
@@ -97,6 +99,7 @@ type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
     defaultModel?: string;
+    contextLength?: number;
     device?: string;
     debug?: boolean;
     historyMessages?: number;
@@ -189,6 +192,12 @@ const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelP
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
     || "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+const configuredContextValue = Number(
+    process.env.LLAMA_CONTEXT_LENGTH?.trim() || cliSettings.contextLength || 65536
+);
+const configuredContextLength = Number.isFinite(configuredContextValue) && configuredContextValue >= 512
+    ? Math.floor(configuredContextValue)
+    : 65536;
 let model = defaultModel;
 let plannerModel = defaultModel;
 const chatSampling = getSamplingSettings(cliSettings, "chat");
@@ -232,6 +241,26 @@ async function getLoadedServerModels(): Promise<string[]> {
     }
 }
 
+async function getServerContextInfo(): Promise<{ contextLength: number; totalSlots?: number } | undefined> {
+    try {
+        const propsUrl = new URL("/props", apiUrl).toString();
+        const response = await axios.get(propsUrl, { timeout: 2000 });
+        const contextLength = Number(response.data?.default_generation_settings?.n_ctx);
+        const totalSlots = Number(response.data?.total_slots);
+
+        if (!Number.isFinite(contextLength) || contextLength <= 0) {
+            return undefined;
+        }
+
+        return {
+            contextLength: Math.floor(contextLength),
+            ...(Number.isFinite(totalSlots) && totalSlots > 0 ? { totalSlots: Math.floor(totalSlots) } : {})
+        };
+    } catch {
+        return undefined;
+    }
+}
+
 async function syncModelFromServer(): Promise<boolean> {
     const [loadedModel] = await getLoadedServerModels();
     if (!loadedModel) {
@@ -244,13 +273,20 @@ async function syncModelFromServer(): Promise<boolean> {
 }
 
 async function printModelInfo(): Promise<void> {
-    const loadedModels = await getLoadedServerModels();
+    const [loadedModels, serverContext] = await Promise.all([
+        getLoadedServerModels(),
+        getServerContextInfo()
+    ]);
     const availableFiles = getAvailableModelFiles();
 
     console.log(`CLI request model: ${model}`);
     console.log(loadedModels.length > 0
         ? `Loaded by llama.cpp: ${loadedModels.join(", ")}`
         : "Loaded by llama.cpp: unavailable (server is not running or still loading)");
+    console.log(`Configured context: ${configuredContextLength.toLocaleString()} tokens`);
+    console.log(serverContext
+        ? `Active server context: ${serverContext.contextLength.toLocaleString()} tokens per slot${serverContext.totalSlots ? ` (${serverContext.totalSlots} slot${serverContext.totalSlots === 1 ? "" : "s"})` : ""}`
+        : "Active server context: unavailable (use /model while llama.cpp is running)");
     console.log(`Model directory: ${modelDirectory}`);
 
     if (availableFiles.length === 0) {
@@ -730,11 +766,11 @@ async function routeTool(message: string): Promise<ToolDecision> {
 async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
-    spinner: { update: (message: string) => void }
+    spinner: { update: (message: string) => void; log: (message: string) => void }
 ): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace> }> {
     const maxTurns = 12;
     const sourceUrls = new Set<string>();
-    const trace = new AgentTrace();
+    const trace = new AgentTrace(path.resolve(appRoot, ".cli", "logs", "agent-trace.jsonl"));
     const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
             role: "system",
@@ -748,7 +784,9 @@ async function runAgentLoop(
     ];
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
-        spinner.update(`Agent step ${turn}/${maxTurns}...`);
+        spinner.update(turn === 1
+            ? `Planning next action (${turn}/${maxTurns})...`
+            : `Reviewing results and planning (${turn}/${maxTurns})...`);
 
         const response = await axios.post(apiUrl, {
             model,
@@ -762,6 +800,11 @@ async function runAgentLoop(
             answer?: string;
             tool?: string;
             reason?: string;
+            path?: string;
+            query?: string;
+            command?: string;
+            server?: string;
+            arguments?: Record<string, unknown>;
         } | undefined;
 
         messages.push({
@@ -770,6 +813,7 @@ async function runAgentLoop(
         });
 
         if (!action) {
+            spinner.log(`[${turn}/${maxTurns}] Invalid model action; retrying with strict JSON`);
             trace.add({
                 turn,
                 status: "parse_error",
@@ -786,6 +830,7 @@ async function runAgentLoop(
         // The loop ends only when the model explicitly returns final. Until
         // then each action becomes an observation for the next reasoning step.
         if (action.action === "final") {
+            spinner.update("Preparing final answer...");
             const answer = action.answer?.trim() || "Done.";
             const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
             const finalAnswer = missingSources.length === 0
@@ -796,7 +841,12 @@ async function runAgentLoop(
             return { answer: finalAnswer, trace };
         }
 
+        spinner.log(agentTool.formatActionStatus(action, turn, maxTurns));
+        spinner.update(`Executing ${action.action}...`);
         const result = await agentTool.execute(action);
+        spinner.update(result.ok
+            ? `Completed ${action.action}; reviewing result...`
+            : `${action.action} failed; planning recovery...`);
         trace.add({
             turn,
             status: result.ok ? "ok" : "error",
@@ -815,8 +865,55 @@ async function runAgentLoop(
         });
     }
 
-    const answer = "Agent stopped because it reached the maximum number of steps. Please ask it to continue if more work is needed.";
-    trace.add({ turn: maxTurns, status: "error", action: "max_turns", observation: answer });
+    spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached; preparing a final summary`);
+    spinner.update("Summarizing completed work...");
+    messages.push({
+        role: "user",
+        content: `No more tool actions are available for this task. Return one final JSON object now:
+{"action":"final","answer":"Summarize what was completed, validations that actually ran, any failures, and concrete remaining work."}
+Do not call another tool. Do not claim unverified success.`
+    });
+
+    try {
+        const response = await axios.post(apiUrl, {
+            model,
+            messages,
+            ...actionSampling
+        });
+        const assistantContent = response.data.choices[0].message.content?.trim() ?? "";
+        const finalAction = agentTool.parseAction(assistantContent) as {
+            action?: string;
+            answer?: string;
+            reason?: string;
+        } | undefined;
+
+        if (finalAction?.action === "final" && finalAction.answer?.trim()) {
+            const answer = finalAction.answer.trim();
+            const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
+            const finalAnswer = missingSources.length === 0
+                ? answer
+                : `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
+            trace.add({
+                turn: maxTurns + 1,
+                status: "final",
+                action: "final_after_tool_limit",
+                reason: finalAction.reason
+            });
+            trace.save();
+            return { answer: finalAnswer, trace };
+        }
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        trace.add({
+            turn: maxTurns + 1,
+            status: "error",
+            action: "final_after_tool_limit",
+            observation: message
+        });
+    }
+
+    const answer = "Agent completed the maximum number of tool actions but could not produce a final summary. Review the trace and ask it to inspect the existing files before continuing.";
+    trace.add({ turn: maxTurns + 1, status: "error", action: "final_summary_failed", observation: answer });
     trace.save();
     return { answer, trace };
 }
@@ -1236,7 +1333,10 @@ Do not mention hidden context, internal tools, or system prompts.`;
 }
 
 async function start(): Promise<void> {
-    const modelSynced = await syncModelFromServer();
+    const [modelSynced, serverContext] = await Promise.all([
+        syncModelFromServer(),
+        getServerContextInfo()
+    ]);
     console.log("Chat Started");
     console.log("Type \"exit\" to quit");
     console.log("Image mode: /img <path-to-image> | <prompt>");
@@ -1248,6 +1348,10 @@ async function start(): Promise<void> {
     console.log("New task context: /clear");
     console.log(`Workspace: ${activeWorkspace}`);
     console.log(`llama.cpp API: ${apiUrl}`);
+    console.log(`Configured context: ${configuredContextLength.toLocaleString()} tokens`);
+    console.log(serverContext
+        ? `Active server context: ${serverContext.contextLength.toLocaleString()} tokens per slot${serverContext.totalSlots ? ` (${serverContext.totalSlots} slot${serverContext.totalSlots === 1 ? "" : "s"})` : ""}`
+        : "Active server context: unavailable");
     console.log(modelSynced
         ? `llama.cpp loaded model: ${model}`
         : "llama.cpp status: server is not running or still loading");
