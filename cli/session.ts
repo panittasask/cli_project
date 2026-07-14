@@ -71,13 +71,19 @@ class SessionTool {
         }
     }
 
-    getContextMessages(sessionId: string, maxMessages = 10): SessionMessage[] {
+    getContextMessages(sessionId: string, maxMessages = 10, afterTimestamp = 0): SessionMessage[] {
         const session = this.getSession(sessionId);
         if (!session) {
             return [];
         }
 
-        return session.messages.slice(-maxMessages);
+        if (maxMessages <= 0) {
+            return [];
+        }
+
+        return session.messages
+            .filter((message) => message.timestamp > afterTimestamp)
+            .slice(-maxMessages);
     }
 
     appendExchange(sessionId: string, userMessage: string, assistantMessage: string): void {

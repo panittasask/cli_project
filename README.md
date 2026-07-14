@@ -10,10 +10,11 @@ Run:
 npm run dev
 ```
 
-This lists the GGUF files in `D:\Model`, asks which model to use, starts
-`llama-server` in the background, waits until it is ready, and opens the CLI in
-the same terminal at the normal session-selection screen. Exiting the CLI also
-stops that background server. Logs are written to `.cli/logs/`.
+This reads paths from `.cli/settings.json`, lists the GGUF files in the configured
+model path, asks which model to use, starts `llama-server` in the background,
+waits until it is ready, and opens the CLI in the same terminal at the normal
+session-selection screen. Exiting the CLI also stops that background server.
+Logs are written to `.cli/logs/`.
 
 The separate two-terminal workflow below remains available when server logs
 need to stay visible.
@@ -31,7 +32,25 @@ need to stay visible.
    npm run dev:cli
    ```
 
-Defaults:
+Settings:
+
+```json
+{
+  "llamaCppPath": "D:\\llama.cpp\\llama-b9908-bin-win-sycl-x64",
+  "modelPath": "D:\\Model",
+  "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
+  "device": "CUDA0",
+  "debug": true,
+  "historyMessages": 6,
+  "sampling": {
+    "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
+    "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
+    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 4096 }
+  }
+}
+```
+
+Defaults if `.cli/settings.json` is missing:
 
 - llama.cpp directory: `D:\llama.cpp\llama-b9908-bin-win-sycl-x64`
 - API URL: `http://127.0.0.1:8080/v1/chat/completions`
@@ -41,9 +60,36 @@ Optional overrides:
 
 ```powershell
 $env:LLAMA_CPP_DIR = "D:\path\to\llama.cpp"
+$env:LLAMA_MODEL_DIR = "D:\path\to\models"
+$env:LLAMA_DEVICE = "CUDA0"
 $env:LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 $env:LLAMA_MODEL = "another-model.gguf"
 ```
+
+Sampling values can be overridden per profile with variables such as
+`LLAMA_CHAT_TEMPERATURE`, `LLAMA_PLANNER_MAX_TOKENS`, and
+`LLAMA_ACTION_TOP_K`. Set `CLI_DEBUG=1` to show the concise agent trace.
+
+Inside the CLI, `/debug on` displays each agent action, its short decision
+summary, and whether the tool succeeded. The full redacted trace is always
+appended to `.cli/logs/agent-trace.jsonl`; model-generated file content and
+common secret fields are omitted. This trace is an operational summary, not
+the model's private chain-of-thought. `/clear` starts a clean task context while
+keeping the saved session history on disk.
+
+To compare the loaded model without Agent history or tools, start
+`llama-server` and run:
+
+```powershell
+npm run baseline:model
+npm run baseline:agent
+```
+
+The first command tests the baseline questions and stores model, server
+properties, chat template information exposed by llama.cpp, sampling, and
+answers under `.cli/logs/baseline-model-*.json`. The second repeats the same
+agent action request five times and records JSON validity, tool selection
+stability, and concise-reason coverage under `.cli/logs/baseline-agent-*.json`.
 
 ## Changing models
 

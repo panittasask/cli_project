@@ -23,6 +23,21 @@
   - งานแก้ไฟล์ไม่มี validator ก่อนรายงานว่าสำเร็จ
   - `.gitignore` ปัจจุบันผิดและ `node_modules` ถูก track แล้ว 6,961 ไฟล์
 
+## สถานะล่าสุด (2026-07-15)
+
+- หัวข้อ 1 เสร็จแล้ว: แก้ `.gitignore` และนำ generated files ออกจาก Git index
+- หัวข้อ 2 เสร็จแล้ว: เพิ่ม `npm run baseline:model` และทดสอบ GGUF 4 ตัว
+  โดยพบว่า Qwen2.5-Coder-7B ตอบความรู้พื้นฐานผิดแม้ไม่มี Agent/history
+- หัวข้อ 3 เสร็จแล้ว: แยก sampling สำหรับ chat, planner และ agent action
+  พร้อม environment override; Qwythos-9B ผ่าน action probe ซ้ำ 5/5
+- หัวข้อ 4 ทำส่วนสำคัญแล้ว: เพิ่ม `/clear` และลด default history เหลือ 6 ข้อความ
+  โดยไม่ลบ session ถาวร; history summarization ยังไม่ได้ทำ
+- หัวข้อ 6 เสร็จแล้ว: เพิ่ม `/debug on|off`, decision summary, redacted JSONL trace
+  และ offline regression test
+- โมเดลแนะนำปัจจุบัน: `Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf`
+  เพราะ direct baseline ไม่แต่งคำตอบ Meme 67 และ agent protocol เลือก `read_file`
+  ถูกต้องคงที่ 5/5
+
 ## ลำดับงานพรุ่งนี้
 
 ### 1. แก้ Git hygiene ก่อน
