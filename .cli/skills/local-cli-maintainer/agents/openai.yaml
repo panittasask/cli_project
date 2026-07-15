@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local CLI Maintainer"
+  short_description: "Maintain and verify this local AI CLI"
+  default_prompt: "Use $local-cli-maintainer to safely improve and verify this CLI project."

@@ -50,6 +50,7 @@ function redact(value: unknown, key = ""): unknown {
 
 class AgentTrace {
     private readonly entries: TraceEntry[] = [];
+    private savedEntryCount = 0;
     private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
     constructor(private readonly logPath = path.resolve(process.cwd(), ".cli", "logs", "agent-trace.jsonl")) {}
@@ -63,13 +64,15 @@ class AgentTrace {
     }
 
     save(): void {
-        if (this.entries.length === 0) {
+        const unsavedEntries = this.entries.slice(this.savedEntryCount);
+        if (unsavedEntries.length === 0) {
             return;
         }
 
         fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
-        const lines = this.entries.map((entry) => JSON.stringify(redact(entry))).join("\n");
+        const lines = unsavedEntries.map((entry) => JSON.stringify(redact(entry))).join("\n");
         fs.appendFileSync(this.logPath, `${lines}\n`, "utf8");
+        this.savedEntryCount = this.entries.length;
     }
 
     print(): void {

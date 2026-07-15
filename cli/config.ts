@@ -19,6 +19,12 @@ type CliSettings = {
     device?: string;
     debug?: boolean;
     historyMessages?: number;
+    agent?: {
+        maxTurns?: number;
+        maxDurationMinutes?: number;
+        maxCompletionTokens?: number;
+        repeatLimit?: number;
+    };
     sampling?: {
         chat?: SamplingProfile;
         planner?: SamplingProfile;
@@ -86,7 +92,18 @@ function getSamplingSettings(settings: CliSettings, kind: SamplingKind): Samplin
     };
 }
 
+function getAgentGuardSettings(settings: CliSettings): { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number } {
+    const configured = settings.agent ?? {};
+    return {
+        maxTurns: Math.max(1, Math.floor(readNumber("CLI_AGENT_MAX_TURNS", configured.maxTurns ?? 12))),
+        maxDurationMs: Math.max(10_000, readNumber("CLI_AGENT_MAX_MINUTES", configured.maxDurationMinutes ?? 10) * 60_000),
+        maxCompletionTokens: Math.max(256, Math.floor(readNumber("CLI_AGENT_MAX_COMPLETION_TOKENS", configured.maxCompletionTokens ?? 16000))),
+        repeatLimit: Math.max(2, Math.floor(readNumber("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit ?? 2)))
+    };
+}
+
 module.exports = {
     loadCliSettings,
-    getSamplingSettings
+    getSamplingSettings,
+    getAgentGuardSettings
 };

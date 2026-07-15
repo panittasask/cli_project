@@ -2,18 +2,37 @@ import axios = require("axios");
 import readline = require("node:readline");
 import fs = require("node:fs");
 import path = require("node:path");
-const { LlamaClient } = require("./llamaClient") as { LlamaClient: new (apiUrl: string) => {
+const { LlamaClient } = require("./llamaClient") as { LlamaClient: new (apiUrl: string, timeoutMs?: number) => {
     post: (
         payload: Record<string, unknown>,
-        onRetry?: (attempt: number, errorCode: string) => void
+        onRetry?: (attempt: number, errorCode: string) => void,
+        signal?: AbortSignal
     ) => Promise<{ data: any }>;
     formatError: (error: unknown) => string;
     close: () => void;
 } };
-const { loadCliSettings, getSamplingSettings } = require("./config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
+    getAgentGuardSettings: (settings: CliSettings) => AgentGuardSettings;
 };
+type AgentGuardSettings = { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
+const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: AgentGuardSettings) => {
+    settings: AgentGuardSettings;
+    recordCompletionTokens: (tokens: number) => void;
+    checkBudget: (turn: number) => string | undefined;
+    registerAction: (action: Record<string, unknown>) => { status: "allow" | "replan" | "stop"; message?: string };
+    formatRemaining: () => string;
+} };
+const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpointStore: new (root: string) => {
+    checkpoint: (workspace: string, inputPath: string, nextContent: string) => { id: string; preview: string };
+    undoLatest: (workspace: string) => { ok: boolean; message: string };
+} };
+const { SkillLoader } = require("./skillLoader") as { SkillLoader: new () => {
+    discover: (workspace: string) => Array<{ name: string; description: string; body: string }>;
+    select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string; description: string; body: string }>;
+    formatPrompt: (skills: Array<{ name: string; description: string; body: string }>) => string;
+} };
 const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logPath?: string) => {
     add: (entry: {
         turn: number;
@@ -25,6 +44,50 @@ const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logPath?: s
     }) => void;
     save: () => void;
     print: () => void;
+} };
+const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog: new (logPath?: string) => {
+    append: (entry: {
+        turn: number;
+        maxTurns: number;
+        requestFormat: unknown;
+        rawContent: unknown;
+        reasoningContent?: unknown;
+        finishReason?: unknown;
+        parsedAction?: string | undefined;
+        parseError?: string | undefined;
+    }) => void;
+} };
+const { getAgentResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+    getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
+    getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string) => Record<string, unknown>;
+};
+const { StatusBar } = require("./statusBar") as { StatusBar: new (getState: () => {
+    model: string;
+    contextUsed: number;
+    contextLimit: number;
+    workspace: string;
+}) => {
+    start: () => void;
+    render: () => void;
+    suspend: () => void;
+    resume: () => void;
+    stop: () => void;
+} };
+const { formatSessionHistory } = require("./sessionHistory") as {
+    formatSessionHistory: (messages: Array<{ role: "user" | "assistant"; content: string }>, maxMessages?: number) => string;
+};
+type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
+const { classifyWorkflow, workflowInstructions } = require("./workflowRouter") as {
+    classifyWorkflow: (message: string) => { kind: WorkflowKind; reason: string };
+    workflowInstructions: (kind: WorkflowKind) => string;
+};
+const { selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
+    selectTaskContext: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, workflow: WorkflowKind, maxMessages?: number) => Array<{ role: "user" | "assistant"; content: string }>;
+    summarizeTaskContext: (messages: Array<{ role: "user" | "assistant"; content: string }>) => string;
+};
+const { WriteValidator } = require("./writeValidator") as { WriteValidator: new (workspace?: string) => {
+    exists: (inputPath: string) => boolean;
+    validate: (inputPath: string) => { ok: boolean; validator: string; output: string };
 } };
 const { Spinner } = require("./spinner") as { Spinner: new (message?: string) => {
     start: () => void;
@@ -57,8 +120,9 @@ const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => 
     } | undefined;
 } };
 const { AgentTool } = require("./tools/agentTool") as { AgentTool: new () => {
-    buildSystemPrompt: () => Promise<string>;
+    buildSystemPrompt: (workflowInstructions?: string) => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
+    explainParseFailure: (content: string | undefined | null) => string;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     formatObservation: (action: unknown, result: { ok: boolean; output: string }) => string;
@@ -125,6 +189,7 @@ type CliSettings = {
     device?: string;
     debug?: boolean;
     historyMessages?: number;
+    agent?: { maxTurns?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number };
     sampling?: Partial<Record<"chat" | "planner" | "action", Partial<SamplingSettings>>>;
 };
 
@@ -183,6 +248,8 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/model", description: "show loaded and available models" },
     { command: "/usage", description: "show session token usage" },
     { command: "/clear", description: "start a clean task context" },
+    { command: "/undo", description: "restore the latest file checkpoint" },
+    { command: "/skills", description: "show project-local skills" },
     { command: "/debug", description: "show or hide agent trace" },
     { command: "/debug on", description: "show agent trace" },
     { command: "/debug off", description: "hide agent trace" },
@@ -208,10 +275,24 @@ const rl = readline.createInterface({
         return [hits.length > 0 ? hits : slashCommands, trimmed];
     }
 });
+rl.on("SIGINT", () => {
+    if (activeRequestController) {
+        activeRequestController.abort();
+        activeRequestSpinner?.log("Cancelling active request... completed file writes remain available through /undo.");
+        return;
+    }
+    process.stdout.write("\nUse /exit to close the CLI.\n");
+    rl.setPrompt(promptLabel);
+    rl.prompt();
+});
 
 const apiUrl = process.env.LLAMA_API_URL?.trim()
     || "http://127.0.0.1:8080/v1/chat/completions";
-const llamaClient = new LlamaClient(apiUrl);
+const agentGuardSettings = getAgentGuardSettings(cliSettings);
+// The request-level Axios timeout must not fire before the user-visible Agent
+// wall-clock guard. The guard's AbortController remains the single source of
+// truth and produces the actionable timeout message.
+const llamaClient = new LlamaClient(apiUrl, agentGuardSettings.maxDurationMs + 5000);
 const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
@@ -240,6 +321,17 @@ const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
 const toolRouter = new ToolRouter();
 const agentTool = new AgentTool();
+const checkpointStore = new FileCheckpointStore(appRoot);
+const skillLoader = new SkillLoader();
+let activeRequestController: AbortController | undefined;
+let activeRequestSpinner: InstanceType<typeof Spinner> | undefined;
+let statusSessionId: string | undefined;
+const statusBar = new StatusBar(() => ({
+    model,
+    contextUsed: statusSessionId ? sessionTool.getUsage(statusSessionId).activeContextTokens : 0,
+    contextLimit: activeContextLength,
+    workspace: activeWorkspace
+}));
 
 function extractApiUsage(data: any): ApiUsage | undefined {
     const promptTokens = Number(data?.usage?.prompt_tokens);
@@ -258,11 +350,13 @@ function extractApiUsage(data: any): ApiUsage | undefined {
     return { promptTokens: safePrompt, completionTokens: safeCompletion, totalTokens };
 }
 
-function recordResponseUsage(sessionId: string, responseData: any): void {
+function recordResponseUsage(sessionId: string, responseData: any): ApiUsage | undefined {
     const usage = extractApiUsage(responseData);
     if (usage) {
         sessionTool.recordUsage(sessionId, usage);
+        statusBar.render();
     }
+    return usage;
 }
 
 function printSessionUsage(sessionId: string): void {
@@ -402,6 +496,8 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("                            Switch GGUF by restarting npm run llama");
     console.log("/usage                    Show session and active context token usage");
     console.log("/clear                    Start a new task context; keep session history");
+    console.log("/undo                     Restore the latest model file checkpoint");
+    console.log("/skills                   Show project-local skills");
     console.log("/debug [on|off]           Show status or toggle concise agent trace");
     console.log("/exit                     Exit the app");
     console.log();
@@ -608,7 +704,7 @@ function findUnknownSlashCommand(input: string): string | undefined {
 
     const lower = trimmed.toLowerCase();
 
-    if (lower === "/help" || lower === "/exit" || lower === "/planner" || lower === "/fast" || lower === "/agent") {
+    if (lower === "/help" || lower === "/exit" || lower === "/planner" || lower === "/fast" || lower === "/agent" || lower === "/undo" || lower === "/skills") {
         return undefined;
     }
 
@@ -787,13 +883,13 @@ function buildProjectContextBlock(filePaths: string[], reason?: string): string 
     return `${header}\n\n${sections.join("\n\n---\n\n")}`;
 }
 
-async function routeTool(message: string, sessionId: string): Promise<ToolDecision> {
+async function routeTool(message: string, sessionId: string, signal?: AbortSignal): Promise<ToolDecision> {
     try {
         const response = await llamaClient.post({
             model,
             messages: toolRouter.buildRouterMessages(message),
             ...actionSampling
-        });
+        }, undefined, signal);
         recordResponseUsage(sessionId, response.data);
 
         const decision = toolRouter.parseDecision(response.data.choices[0].message.content);
@@ -831,38 +927,73 @@ async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
     spinner: { update: (message: string) => void; log: (message: string) => void },
-    sessionId: string
+    sessionId: string,
+    signal: AbortSignal
 ): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace> }> {
-    const maxTurns = 12;
+    const guard = new AgentGuard(agentGuardSettings);
+    const maxTurns = guard.settings.maxTurns;
+    const workflow = classifyWorkflow(userMessage);
+    const agentResponseFormat = getAgentResponseFormat(workflow.kind);
+    const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage);
+    const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
+    const contextSummary = summarizeTaskContext(relevantHistory);
+    const writeValidator = new WriteValidator(activeWorkspace);
+    const availableSkills = skillLoader.discover(activeWorkspace);
+    const selectedSkills = skillLoader.select(userMessage, availableSkills);
+    const skillPrompt = skillLoader.formatPrompt(selectedSkills);
+    const readPaths = new Set<string>();
+    const validationFailures = new Set<string>();
+    const writtenPaths = new Set<string>();
+    let successfulMcpDiscovery = false;
+    let successfulMcpCall = false;
     const sourceUrls = new Set<string>();
     const trace = new AgentTrace(path.resolve(appRoot, ".cli", "logs", "agent-trace.jsonl"));
+    const responseLog = new AgentResponseLog(path.resolve(appRoot, ".cli", "logs", "agent-model-responses.jsonl"));
     const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
         {
             role: "system",
-            content: await agentTool.buildSystemPrompt()
+            content: await agentTool.buildSystemPrompt([
+                workflowInstructions(workflow.kind),
+                `Router decision: ${workflow.reason}`,
+                skillPrompt
+            ].filter(Boolean).join("\n\n"))
         },
-        ...historyForModel,
+        ...(contextSummary ? [{ role: "system" as const, content: `Relevant context from this session:\n${contextSummary}` }] : []),
         {
             role: "user",
             content: userMessage
         }
     ];
 
+    if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
+
     for (let turn = 1; turn <= maxTurns; turn += 1) {
+        const budgetError = guard.checkBudget(turn);
+        if (budgetError) {
+            const answer = `Agent stopped safely because its ${budgetError}. Review the trace or continue with a narrower request.`;
+            trace.add({ turn, status: "error", action: "budget_stop", observation: answer });
+            trace.save();
+            return { answer, trace };
+        }
+        const requestFormat = turn === 1 ? initialAgentResponseFormat : agentResponseFormat;
         spinner.update(turn === 1
-            ? `Planning next action (${turn}/${maxTurns})...`
-            : `Reviewing results and planning (${turn}/${maxTurns})...`);
+            ? `Planning next action (${turn}/${maxTurns}, ${guard.formatRemaining()})...`
+            : `Reviewing results (${turn}/${maxTurns}, ${guard.formatRemaining()})...`);
 
         const response = await llamaClient.post({
             model,
             messages,
+            response_format: requestFormat,
             ...actionSampling
         }, (_attempt, errorCode) => {
             spinner.update(`llama.cpp connection ${errorCode}; retrying...`);
-        });
-        recordResponseUsage(sessionId, response.data);
+        }, signal);
+        const responseUsage = recordResponseUsage(sessionId, response.data);
+        guard.recordCompletionTokens(responseUsage?.completionTokens ?? 0);
 
-        const assistantContent = response.data.choices[0].message.content?.trim() ?? "";
+        const choice = response.data.choices[0];
+        const rawAssistantContent = choice.message.content;
+        const assistantContent = typeof rawAssistantContent === "string" ? rawAssistantContent.trim() : "";
         const action = agentTool.parseAction(assistantContent) as {
             action?: string;
             answer?: string;
@@ -870,10 +1001,22 @@ async function runAgentLoop(
             reason?: string;
             path?: string;
             query?: string;
+            content?: string;
             command?: string;
             server?: string;
             arguments?: Record<string, unknown>;
         } | undefined;
+        const parseError = action ? undefined : agentTool.explainParseFailure(assistantContent);
+        responseLog.append({
+            turn,
+            maxTurns,
+            requestFormat,
+            rawContent: rawAssistantContent,
+            reasoningContent: choice.message.reasoning_content,
+            finishReason: choice.finish_reason,
+            parsedAction: action?.action,
+            parseError
+        });
 
         messages.push({
             role: "assistant",
@@ -881,16 +1024,17 @@ async function runAgentLoop(
         });
 
         if (!action) {
-            spinner.log(`[${turn}/${maxTurns}] Invalid model action; retrying with strict JSON`);
+            spinner.log(`[${turn}/${maxTurns}] Invalid model action (${parseError}); logged to .cli/logs/agent-model-responses.jsonl`);
             trace.add({
                 turn,
                 status: "parse_error",
-                action: "invalid_json",
+                action: "invalid_action",
                 observation: assistantContent.slice(0, 1000)
             });
+            trace.save();
             messages.push({
                 role: "user",
-                content: "Your last response was not valid JSON. Return one valid action object only."
+                content: "Your last response was not one supported action object. Return exactly one valid JSON object using an action from Available actions."
             });
             continue;
         }
@@ -898,6 +1042,22 @@ async function runAgentLoop(
         // The loop ends only when the model explicitly returns final. Until
         // then each action becomes an observation for the next reasoning step.
         if (action.action === "final") {
+            if (validationFailures.size > 0) {
+                const failed = Array.from(validationFailures).join(", ");
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: validation still failing for ${failed}`);
+                messages.push({ role: "user", content: `You cannot return final yet. Validation is failing for: ${failed}. Inspect the error, fix the file, and validate again.` });
+                continue;
+            }
+            if (workflow.kind === "web_research" && sourceUrls.size < 2) {
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: web research needs at least two relevant source URLs`);
+                messages.push({ role: "user", content: "You cannot return final yet. Web research requires at least two relevant source URLs from successful MCP observations. Refine the web query; do not use search_files." });
+                continue;
+            }
+            if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: MCP discovery and a successful tool call are required`);
+                messages.push({ role: "user", content: "You cannot claim MCP completion yet. Run mcp_list_tools and one relevant mcp_call_tool successfully after implementation." });
+                continue;
+            }
             spinner.update("Preparing final answer...");
             const answer = action.answer?.trim() || "Done.";
             const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
@@ -909,9 +1069,57 @@ async function runAgentLoop(
             return { answer: finalAnswer, trace };
         }
 
+        if (action.action === "write_file" && action.path && writeValidator.exists(action.path) && !readPaths.has(path.resolve(activeWorkspace, action.path).toLowerCase())) {
+            const output = `Blocked write: read the existing file first (${action.path}).`;
+            spinner.log(`[${turn}/${maxTurns}] ${output}`);
+            trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
+            trace.save();
+            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: "write_file", status: "error", output })}` });
+            continue;
+        }
+
+        const guardDecision = guard.registerAction(action as Record<string, unknown>);
+        if (guardDecision.status === "replan") {
+            spinner.log(`[${turn}/${maxTurns}] ${guardDecision.message}`);
+            trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: guardDecision.message });
+            trace.save();
+            messages.push({ role: "user", content: `Observation: ${guardDecision.message} Do not repeat the same action and arguments.` });
+            continue;
+        }
+        if (guardDecision.status === "stop") {
+            const answer = `${guardDecision.message} Agent stopped to avoid an unproductive loop. Review the trace or continue with a more specific request.`;
+            trace.add({ turn, status: "error", action: "repeat_stop", arguments: action, observation: answer });
+            trace.save();
+            return { answer, trace };
+        }
+
+        if (action.action === "write_file" && action.path && typeof action.content === "string") {
+            const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, action.content);
+            spinner.log(checkpoint.preview);
+            spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+        }
         spinner.log(agentTool.formatActionStatus(action, turn, maxTurns));
         spinner.update(`Executing ${action.action}...`);
-        const result = await agentTool.execute(action);
+        let result = await agentTool.execute(action);
+        if (action.action === "read_file" && result.ok && action.path) {
+            readPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
+        }
+        if (action.action === "write_file" && result.ok && action.path) {
+            const validation = writeValidator.validate(action.path);
+            result = {
+                ok: validation.ok,
+                output: `${result.output}\nValidator: ${validation.validator}\n${validation.output}`
+            };
+            if (validation.ok) validationFailures.delete(action.path);
+            else validationFailures.add(action.path);
+            writtenPaths.add(action.path);
+            if (workflow.kind === "mcp_creation") {
+                successfulMcpDiscovery = false;
+                successfulMcpCall = false;
+            }
+        }
+        if (action.action === "mcp_list_tools" && result.ok) successfulMcpDiscovery = true;
+        if (action.action === "mcp_call_tool" && result.ok) successfulMcpCall = true;
         spinner.update(result.ok
             ? `Completed ${action.action}; reviewing result...`
             : `${action.action} failed; planning recovery...`);
@@ -923,6 +1131,7 @@ async function runAgentLoop(
             arguments: action,
             observation: result.output
         });
+        trace.save();
         if (action.action === "mcp_call_tool" && action.tool?.toLowerCase().includes("search") && result.ok) {
             const urls = result.output.match(/https?:\/\/[^"\\\s]+/g) || [];
             urls.forEach((sourceUrl) => sourceUrls.add(sourceUrl));
@@ -946,17 +1155,31 @@ Do not call another tool. Do not claim unverified success.`
         const response = await llamaClient.post({
             model,
             messages,
+            response_format: agentResponseFormat,
             ...actionSampling
         }, (_attempt, errorCode) => {
             spinner.update(`llama.cpp connection ${errorCode}; retrying final summary...`);
-        });
-        recordResponseUsage(sessionId, response.data);
-        const assistantContent = response.data.choices[0].message.content?.trim() ?? "";
+        }, signal);
+        const responseUsage = recordResponseUsage(sessionId, response.data);
+        guard.recordCompletionTokens(responseUsage?.completionTokens ?? 0);
+        const choice = response.data.choices[0];
+        const rawAssistantContent = choice.message.content;
+        const assistantContent = typeof rawAssistantContent === "string" ? rawAssistantContent.trim() : "";
         const finalAction = agentTool.parseAction(assistantContent) as {
             action?: string;
             answer?: string;
             reason?: string;
         } | undefined;
+        responseLog.append({
+            turn: maxTurns + 1,
+            maxTurns,
+            requestFormat: agentResponseFormat,
+            rawContent: rawAssistantContent,
+            reasoningContent: choice.message.reasoning_content,
+            finishReason: choice.finish_reason,
+            parsedAction: finalAction?.action,
+            parseError: finalAction ? undefined : agentTool.explainParseFailure(assistantContent)
+        });
 
         if (finalAction?.action === "final" && finalAction.answer?.trim()) {
             const answer = finalAction.answer.trim();
@@ -990,6 +1213,7 @@ Do not call another tool. Do not claim unverified success.`
 }
 
 function ask(activeSession: ChatSession, runMode: RunMode): void {
+    statusBar.resume();
     const spinner = new Spinner("Thinking...");
 
     if (!slashKeypressListenerAttached) {
@@ -1000,6 +1224,11 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
         }
 
         process.stdin.on("keypress", (_str: string, key: readline.Key) => {
+            if (key?.ctrl && key.name === "c" && activeRequestController) {
+                activeRequestController.abort();
+                activeRequestSpinner?.log("Cancelling active request... completed file writes remain available through /undo.");
+                return;
+            }
             if (key && (key.name === "return" || key.name === "enter")) {
                 // Let the rl.question callback erase the panel via clearScreenDown
                 // once readline has emitted its newline.
@@ -1014,12 +1243,14 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
     rl.question("You: ", async (message: string) => {
         const trimmed = message.trim();
         clearSlashSuggestionsBelow();
+        statusBar.suspend();
         const modeCommand = parseModeCommand(trimmed);
         const modelCommand = parseModelCommand(trimmed);
         const workspaceCommand = parseWorkspaceCommand(trimmed);
         const unknownSlashCommand = findUnknownSlashCommand(trimmed);
 
         if (trimmed.toLowerCase() === "exit" || trimmed.toLowerCase() === "/exit") {
+            statusBar.stop();
             await agentTool.close();
             llamaClient.close();
             rl.close();
@@ -1035,7 +1266,26 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
         if (trimmed.toLowerCase() === "/clear") {
             contextStartedAt = Date.now();
             sessionTool.resetActiveContextUsage(activeSession.id);
+            statusBar.render();
             console.log("Task context cleared. Saved session history was kept.");
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/undo") {
+            const result = checkpointStore.undoLatest(activeWorkspace);
+            console.log(result.ok ? `Undo: ${result.message}` : result.message);
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/skills") {
+            const skills = skillLoader.discover(activeWorkspace);
+            console.log("Project-local skills:");
+            if (skills.length === 0) console.log("  None. Add .cli/skills/<name>/SKILL.md");
+            else skills.forEach((skill) => console.log(`  $${skill.name} — ${skill.description}`));
             console.log();
             ask(activeSession, runMode);
             return;
@@ -1096,6 +1346,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             try {
                 await agentTool.close();
                 const nextWorkspace = changeWorkspace(workspaceCommand.workspace);
+                statusBar.render();
                 console.log(`Workspace switched to: ${nextWorkspace}`);
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
@@ -1154,6 +1405,12 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             return;
         }
 
+        const requestController = new AbortController();
+        const requestBudgetTimer = setTimeout(() => {
+            requestController.abort(new Error(`Request wall-clock budget reached (${Math.round(agentGuardSettings.maxDurationMs / 60000)} minutes).`));
+        }, agentGuardSettings.maxDurationMs);
+        activeRequestController = requestController;
+        activeRequestSpinner = spinner;
         try {
             const imagePrompt = imageTool.parseImagePrompt(trimmed);
             const explicitReadPrompt = readFileTool.parseReadFilePrompt(trimmed);
@@ -1169,7 +1426,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             const historyForModel = toModelMessages(sessionHistory);
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const result = await runAgentLoop(trimmed, historyForModel, spinner, activeSession.id);
+                const result = await runAgentLoop(trimmed, historyForModel, spinner, activeSession.id, requestController.signal);
                 spinner.stop();
                 if (debugEnabled) {
                     result.trace.print();
@@ -1184,7 +1441,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             }
 
             if (!imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const decision = await routeTool(trimmed, activeSession.id);
+                const decision = await routeTool(trimmed, activeSession.id, requestController.signal);
                 requestedContextFiles = decision.contextFiles;
                 contextReason = decision.contextReason;
 
@@ -1261,7 +1518,7 @@ User Prompt: ${plannerInput}`
                         }
                     ],
                     ...plannerSampling
-                });
+                }, undefined, requestController.signal);
                 recordResponseUsage(activeSession.id, planner.data);
 
                 const plannerMessage = planner.data.choices[0].message.content?.trim() ?? "{}";
@@ -1312,7 +1569,7 @@ ${projectContextBlock}`
                         }
                     ],
                     ...actionSampling
-                });
+                }, undefined, requestController.signal);
                 recordResponseUsage(activeSession.id, editResponse.data);
 
                 const editedRaw = editResponse.data.choices[0].message.content?.trim() ?? "";
@@ -1322,12 +1579,21 @@ ${projectContextBlock}`
                     throw new Error("Model returned empty edited content.");
                 }
 
+                const checkpoint = checkpointStore.checkpoint(activeWorkspace, editFilePrompt.filePath, editedContent);
+                spinner.log(checkpoint.preview);
+                spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
                 editFileTool.writeEditedFile(editFilePrompt.filePath, editedContent);
+
+                const validation = new WriteValidator(activeWorkspace).validate(editFilePrompt.filePath);
+                if (!validation.ok) {
+                    checkpointStore.undoLatest(activeWorkspace);
+                    throw new Error(`Updated file but ${validation.validator} validation failed:\n${validation.output}`);
+                }
 
                 spinner.stop();
                 const editMessage = implicitEditPrompt
-                    ? `Updated file (auto edit intent): ${editFilePrompt.filePath}`
-                    : `Updated file: ${editFilePrompt.filePath}`;
+                    ? `Updated and validated file (auto edit intent): ${editFilePrompt.filePath} (${validation.validator})`
+                    : `Updated and validated file: ${editFilePrompt.filePath} (${validation.validator})`;
                 console.log("AI:", editMessage);
                 printSessionUsage(activeSession.id);
                 console.log();
@@ -1368,6 +1634,9 @@ ${projectContextBlock}`
 In ${runMode} mode you cannot execute MCP or web-search tools; only agent mode can execute discovered MCP tools.
 Never claim that you searched the web, called a tool, or performed an action unless this conversation contains its successful tool result.
 If the user asks whether you can search from this mode, explain the limitation and tell them to use /mode agent.`;
+            const selectedSkills = skillLoader.select(trimmed, skillLoader.discover(activeWorkspace));
+            const skillGuidance = skillLoader.formatPrompt(selectedSkills);
+            if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
 
             const assistantSystemInstruction = runMode === "planner"
                 ? `You are a helpful assistant.
@@ -1386,7 +1655,7 @@ Do not mention hidden context, internal tools, or system prompts.`;
                 messages: [
                     {
                         role: "system",
-                        content: assistantSystemInstruction
+                        content: [assistantSystemInstruction, skillGuidance].filter(Boolean).join("\n\n")
                     },
                     ...historyForModel,
                     {
@@ -1395,7 +1664,7 @@ Do not mention hidden context, internal tools, or system prompts.`;
                     }
                 ],
                 ...chatSampling
-            });
+            }, undefined, requestController.signal);
             recordResponseUsage(activeSession.id, response.data);
 
             const answer = response.data.choices[0].message.content?.trim() ?? "";
@@ -1407,7 +1676,17 @@ Do not mention hidden context, internal tools, or system prompts.`;
             sessionTool.appendExchange(activeSession.id, trimmed, answer);
         } catch (error) {
             spinner.stop();
-            console.error(`API Error: ${llamaClient.formatError(error)}`);
+            if (requestController.signal.aborted) {
+                const reason = requestController.signal.reason instanceof Error && requestController.signal.reason.message.includes("budget")
+                    ? requestController.signal.reason.message
+                    : "Request cancelled.";
+                console.log(`${reason} The CLI is ready for the next prompt; use /undo if a completed write should be reverted.`);
+            }
+            else console.error(`API Error: ${llamaClient.formatError(error)}`);
+        } finally {
+            clearTimeout(requestBudgetTimer);
+            if (activeRequestController === requestController) activeRequestController = undefined;
+            if (activeRequestSpinner === spinner) activeRequestSpinner = undefined;
         }
 
         ask(activeSession, runMode);
@@ -1429,6 +1708,8 @@ async function start(): Promise<void> {
     console.log("Model status: /model");
     console.log(`Agent trace: ${debugEnabled ? "on" : "off"} (/debug on|off)`);
     console.log("New task context: /clear");
+    console.log("Cancel active request: Ctrl+C | restore latest file change: /undo");
+    console.log("Project-local skills: /skills");
     console.log(`Workspace: ${activeWorkspace}`);
     console.log(`llama.cpp API: ${apiUrl}`);
     console.log(`Configured context: ${configuredContextLength.toLocaleString()} tokens`);
@@ -1444,6 +1725,11 @@ async function start(): Promise<void> {
 
     const activeSession = await sessionTool.selectSession(rl);
     console.log(`Session: ${activeSession.title}`);
+    console.log(formatSessionHistory(
+        sessionTool.getContextMessages(activeSession.id, historyMessageLimit),
+        historyMessageLimit
+    ));
+    console.log();
     printSessionUsage(activeSession.id);
     console.log();
 
@@ -1452,12 +1738,17 @@ async function start(): Promise<void> {
     console.log(`Current model: ${model}`);
     console.log();
 
+    statusSessionId = activeSession.id;
+    statusBar.start();
     ask(activeSession, initialMode);
 }
 
 start().catch((error) => {
+    statusBar.stop();
     console.error(`Failed to start chat: ${llamaClient.formatError(error)}`);
     llamaClient.close();
     rl.close();
     process.exit(1);
 });
+
+process.once("exit", () => statusBar.stop());

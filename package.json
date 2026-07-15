@@ -10,8 +10,12 @@
     "llama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-llama.ps1",
     "baseline:model": "tsx scripts/baseline-model.ts",
     "baseline:agent": "tsx scripts/baseline-agent.ts",
+    "benchmark:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark-hardware.ps1",
     "test:agent": "tsx scripts/test-agent.ts",
     "test:mcp": "tsx scripts/test-mcp.ts",
+    "test:web": "tsx scripts/smoke-web.ts",
+    "test:regression": "tsx scripts/test-regression.ts",
+    "test": "npm run test:agent && npm run test:regression && npm run test:mcp && npx tsc --noEmit",
     "run test": "npm test"
   },
   "keywords": [],

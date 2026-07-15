@@ -30,10 +30,18 @@
   โดยพบว่า Qwen2.5-Coder-7B ตอบความรู้พื้นฐานผิดแม้ไม่มี Agent/history
 - หัวข้อ 3 เสร็จแล้ว: แยก sampling สำหรับ chat, planner และ agent action
   พร้อม environment override; Qwythos-9B ผ่าน action probe ซ้ำ 5/5
-- หัวข้อ 4 ทำส่วนสำคัญแล้ว: เพิ่ม `/clear` และลด default history เหลือ 6 ข้อความ
-  โดยไม่ลบ session ถาวร; history summarization ยังไม่ได้ทำ
+- หัวข้อ 4 เสร็จแล้ว: เพิ่ม `/clear`, ลด default history เหลือ 6 ข้อความ
+  และเลือกเฉพาะ history ที่เกี่ยวข้องมาย่อเป็น task context
+- หัวข้อ 5 เสร็จแล้ว: แยก deterministic workflow router และ system prompt สำหรับ
+  general, web research, coding และ MCP creation
 - หัวข้อ 6 เสร็จแล้ว: เพิ่ม `/debug on|off`, decision summary, redacted JSONL trace
   และ offline regression test
+- หัวข้อ 7 เสร็จแล้ว: บังคับอ่าน existing file ก่อนเขียน, เพิ่ม validator สำหรับ
+  JSON, TypeScript และ `.gitignore` และห้าม final ขณะ validation ยังล้มเหลว
+- หัวข้อ 8 เสร็จแล้ว: เพิ่ม query rewrite, relevance scoring, retry, เกณฑ์หลักฐาน
+  อย่างน้อย 2 URL และ `open_web_page` ที่ป้องกัน private-network SSRF
+- หัวข้อ 9 เสร็จแล้ว: `npm test` ครอบคลุม agent, context/router, validator,
+  web relevance, MCP discovery/tool call และ TypeScript typecheck
 - โมเดลแนะนำปัจจุบัน: `Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf`
   เพราะ direct baseline ไม่แต่งคำตอบ Meme 67 และ agent protocol เลือก `read_file`
   ถูกต้องคงที่ 5/5
@@ -180,3 +188,9 @@ npm run dev
 
 เริ่มจากหัวข้อ 1 และทำทีละหัวข้อ ห้ามแก้หลาย subsystem พร้อมกัน เพราะจะระบุ
 ไม่ได้ว่าคุณภาพดีขึ้นจากการเปลี่ยนส่วนใด
+
+## ผลการดำเนินงาน
+
+หัวข้อ 1-9 ดำเนินการครบแล้ว ณ 2026-07-15 โดยใช้ `npm test` เป็นคำสั่งตรวจรวม
+ส่วน live model probes ยังแยกเป็น `npm run baseline:model` และ
+`npm run baseline:agent` เพื่อให้ regression suite หลักรวดเร็วและทำซ้ำได้แน่นอน

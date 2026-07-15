@@ -75,13 +75,15 @@ class AgentTool {
     ]);
     private readonly mcpTool = new McpTool();
 
-    async buildSystemPrompt(): Promise<string> {
+    async buildSystemPrompt(workflowInstructions = ""): Promise<string> {
         const mcpSection = await this.mcpTool.buildPromptSection();
         // The model is controlled through a small JSON protocol so the CLI can
         // safely decide which local capability to execute on each agent turn.
         return `You are a helpful local CLI assistant and coding agent running inside a user's project workspace.
 You may have a natural conversation, inspect files, search code, edit files, run safe verification commands, and call only the MCP tools listed below.
 Work in small steps. Use tools until you have enough evidence, then return final.
+
+${workflowInstructions}
 
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
 For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. Use the user's language when practical. This is a decision summary, not private chain-of-thought.
@@ -94,8 +96,7 @@ Available actions:
 {"action":"run_command","command":"safe read-only or verification command","reason":"brief rationale"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
-Discovered MCP tools may also be called directly using their input schema, for example:
-{"action":"search_web","query":"focused query","maxResults":5}
+Call discovered MCP tools through mcp_call_tool using the exact configured server and tool names.
 {"action":"final","answer":"final answer to the user"}
 
 Rules:
@@ -104,10 +105,10 @@ Rules:
 - For current, niche, or external information, call a relevant MCP search tool before answering. Base the answer on its observation and include the returned source URLs.
 - If a required tool is unavailable or its call fails, say so plainly. Do not fabricate results and do not pretend that telling the user to search is equivalent to searching.
 - Prefer reading relevant files before editing.
+- If the user names an exact file path, act on that path directly instead of listing the workspace to look for it.
 - Preserve existing style and dependencies unless the user asks otherwise.
 - For write_file, provide the full final file content.
-- When creating an MCP server, place it in mcp/servers/<server-name>, register it in .cli/mcp.json, discover it with mcp_list_tools, and prove it works with mcp_call_tool.
-- Never claim an MCP server works until mcp_list_tools and at least one relevant mcp_call_tool succeed.
+- Use write_file to create files and parent directories. run_command is only for read-only inspection or verification; never use mkdir, New-Item, redirection, or shell commands to create files.
 - Do not run destructive commands.
 - Answer the final user in Thai unless the user asks for another language.
 
@@ -120,27 +121,19 @@ ${mcpSection}`;
         }
 
         const raw = content.trim();
-        // Some local models add surrounding prose, so we recover the first JSON
-        // object instead of assuming the response is perfectly clean.
-        const start = raw.indexOf("{");
-        const end = raw.lastIndexOf("}");
+        // Local models sometimes wrap an action in prose or emit more than one
+        // object. Parse balanced objects independently so one extra object does
+        // not make the whole response invalid.
+        const parsed = this.extractJsonObjects(raw).find((candidate) => {
+            const action = typeof candidate.action === "string" ? candidate.action : "";
+            return this.isSupportedAction(action, candidate);
+        });
 
-        if (start === -1 || end === -1 || end <= start) {
+        if (!parsed) {
             return undefined;
         }
 
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(raw.slice(start, end + 1));
-        } catch {
-            return undefined;
-        }
-
-        if (typeof parsed !== "object" || parsed === null) {
-            return undefined;
-        }
-
-        const data = parsed as Record<string, unknown>;
+        const data = parsed;
         const action = typeof data.action === "string" ? data.action : "";
         const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
 
@@ -217,6 +210,94 @@ ${mcpSection}`;
         }
 
         return undefined;
+    }
+
+    explainParseFailure(content: string | undefined | null): string {
+        if (!content?.trim()) {
+            return "empty model content";
+        }
+
+        const objects = this.extractJsonObjects(content.trim());
+        if (objects.length === 0) {
+            return "no valid JSON object found in model content";
+        }
+
+        const actions = objects
+            .map((candidate) => typeof candidate.action === "string" ? candidate.action : "")
+            .filter(Boolean);
+        if (actions.length === 0) {
+            return "valid JSON object is missing a string action field";
+        }
+
+        const unsupportedActions = actions.filter((action, index) => (
+            actions.indexOf(action) === index
+            && !objects.some((candidate) => candidate.action === action && this.isSupportedAction(action, candidate))
+        ));
+
+        return unsupportedActions.length > 0
+            ? `unsupported action: ${unsupportedActions.join(", ")}`
+            : "model content did not produce one supported action";
+    }
+
+    private extractJsonObjects(raw: string): Array<Record<string, unknown>> {
+        const objects: Array<Record<string, unknown>> = [];
+
+        for (let start = raw.indexOf("{"); start !== -1; start = raw.indexOf("{", start + 1)) {
+            let depth = 0;
+            let inString = false;
+            let escaped = false;
+
+            for (let index = start; index < raw.length; index += 1) {
+                const character = raw[index];
+
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (character === "\\") {
+                        escaped = true;
+                    } else if (character === '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (character === '"') {
+                    inString = true;
+                } else if (character === "{") {
+                    depth += 1;
+                } else if (character === "}") {
+                    depth -= 1;
+                    if (depth === 0) {
+                        try {
+                            const parsed = JSON.parse(raw.slice(start, index + 1)) as unknown;
+                            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                                objects.push(parsed as Record<string, unknown>);
+                            }
+                        } catch {
+                            // Try the next opening brace; a later object may be valid.
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        return objects;
+    }
+
+    private isSupportedAction(action: string, data: Record<string, unknown>): boolean {
+        const builtInActions = new Set([
+            "final",
+            "list_files",
+            "search_files",
+            "read_file",
+            "write_file",
+            "run_command",
+            "mcp_list_tools",
+            "mcp_call_tool"
+        ]);
+
+        return builtInActions.has(action) || Boolean(this.mcpTool.resolveDirectCall(action, data));
     }
 
     async execute(action: AgentAction): Promise<AgentToolResult> {
@@ -435,6 +516,10 @@ ${mcpSection}`;
             /\bcp\b/,
             /\bren\b/,
             /\brename\b/,
+            /\bmkdir\b/,
+            /\bmd\s+/,
+            /\bnew-item\b/,
+            /(^|[^<])>(?!>)/,
             /\bsetx\b/,
             /\bgit\s+reset\b/,
             /\bgit\s+checkout\b/,
