@@ -1,4 +1,7 @@
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "llama-device.ps1")
+$appRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Set-Location -LiteralPath $appRoot
 
 function Get-CliSettings {
     $settingsPath = Join-Path $PSScriptRoot "..\.cli\settings.json"
@@ -11,9 +14,9 @@ function Get-CliSettings {
 
 $settings = Get-CliSettings
 
-$llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b9908-bin-win-sycl-x64" }
+$llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b10012-bin-win-sycl-x64" }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($settings.modelPath) { $settings.modelPath } else { "D:\Model" }
-$llamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "" }
+$requestedLlamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "auto" }
 $contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 65536 }
 $parsedContextLength = 0
 if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
@@ -50,6 +53,9 @@ try {
 if ($portInUse) {
     throw "Port 8080 is already in use. Stop the existing server before using npm run dev."
 }
+
+$llamaDevice = Resolve-LlamaDevice -ServerExecutable $serverExecutable -RequestedDevice $requestedLlamaDevice
+$runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
 
 $models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
 if ($models.Count -eq 0) {
@@ -95,6 +101,8 @@ Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyCont
 $serverArguments = @(
     "-m", ('"{0}"' -f $selectedModel.FullName),
     "-c", $parsedContextLength.ToString(),
+    "-b", $runtimeProfile.BatchSize.ToString(),
+    "-ub", $runtimeProfile.UBatchSize.ToString(),
     "-np", "1",
     "-fa", "auto",
     "--host", "127.0.0.1",
@@ -112,6 +120,7 @@ Write-Host ("llama.cpp configured context: {0:N0} tokens" -f $parsedContextLengt
 if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
     Write-Host "llama.cpp device: $llamaDevice"
 }
+Write-Host "llama.cpp profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
 Write-Host "Server logs: $stdoutLog"
 
 $serverProcess = Start-Process `

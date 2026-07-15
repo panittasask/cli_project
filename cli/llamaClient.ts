@@ -11,19 +11,20 @@ class LlamaClient {
         private readonly timeoutMs = 300000
     ) {}
 
-    async post(payload: Record<string, unknown>, onRetry?: RetryCallback) {
+    async post(payload: Record<string, unknown>, onRetry?: RetryCallback, signal?: AbortSignal) {
         let lastError: unknown;
 
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
                 return await axios.post(this.apiUrl, payload, {
                     timeout: this.timeoutMs,
+                    ...(signal ? { signal } : {}),
                     httpAgent: this.agent,
                     headers: { Connection: "close" }
                 });
             } catch (error) {
                 lastError = error;
-                if (attempt > 0 || !this.isRetryable(error) || !(await this.isServerHealthy())) {
+                if (signal?.aborted || attempt > 0 || !this.isRetryable(error) || !(await this.isServerHealthy())) {
                     throw error;
                 }
 

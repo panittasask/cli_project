@@ -1,11 +1,17 @@
 {
-  "llamaCppPath": "G:\\llama.cpp",
-  "modelPath": "G:\\Model",
+  "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
+  "modelPath": "D:\\Model",
   "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
   "contextLength": 65536,
-  "device": "CUDA0",
+  "device": "auto",
   "debug": true,
   "historyMessages": 6,
+  "agent": {
+    "maxTurns": 12,
+    "maxDurationMinutes": 10,
+    "maxCompletionTokens": 16000,
+    "repeatLimit": 2
+  },
   "sampling": {
     "chat": {
       "temperature": 0.6,

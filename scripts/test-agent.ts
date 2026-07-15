@@ -9,9 +9,24 @@ const { loadCliSettings, getSamplingSettings } = require("../cli/config") as {
 };
 const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () => {
     parseAction: (content: string) => { action?: string; reason?: string } | undefined;
+    explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
+    execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
     close: () => Promise<void>;
 } };
+const { AgentResponseLog } = require("../cli/agentResponseLog") as { AgentResponseLog: new (logPath?: string) => {
+    append: (entry: Record<string, unknown>) => void;
+} };
+const { formatStatusBar } = require("../cli/statusBar") as {
+    formatStatusBar: (state: { model: string; contextUsed: number; contextLimit: number; workspace: string }, columns: number) => string;
+};
+const { formatElapsedTime, formatSpinnerLine } = require("../cli/spinner") as {
+    formatElapsedTime: (milliseconds: number) => string;
+    formatSpinnerLine: (frame: string, message: string, stepMilliseconds: number, totalMilliseconds: number, columns?: number) => string;
+};
+const { formatSessionHistory } = require("../cli/sessionHistory") as {
+    formatSessionHistory: (messages: Array<{ role: "user" | "assistant"; content: string }>, maxMessages?: number) => string;
+};
 const { AgentTrace } = require("../cli/agentTrace") as { AgentTrace: new (logPath?: string) => {
     add: (entry: Record<string, unknown>) => void;
     save: () => void;
@@ -33,11 +48,34 @@ const { SessionTool } = require("../cli/session") as { SessionTool: new (storage
 const { LlamaClient } = require("../cli/llamaClient") as { LlamaClient: new (apiUrl: string, timeoutMs?: number) => {
     post: (
         payload: Record<string, unknown>,
-        onRetry?: (attempt: number, errorCode: string) => void
+        onRetry?: (attempt: number, errorCode: string) => void,
+        signal?: AbortSignal
     ) => Promise<{ data: { choices: Array<{ message: { content: string } }> } }>;
     formatError: (error: unknown) => string;
     close: () => void;
 } };
+
+async function testRequestCancellation(): Promise<void> {
+    const server = http.createServer((_request, _response) => {
+        // Deliberately leave the request pending until AbortController cancels it.
+    });
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const client = new LlamaClient(`http://127.0.0.1:${address.port}/v1/chat/completions`, 5000);
+    const controller = new AbortController();
+    const pending = client.post({ model: "test" }, undefined, controller.signal);
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => {
+        const code = (error as { code?: string }).code;
+        return code === "ERR_CANCELED";
+    });
+    client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+}
 
 async function testConnectionResetRetry(): Promise<void> {
     let completionRequests = 0;
@@ -92,6 +130,7 @@ async function testConnectionResetRetry(): Promise<void> {
 
 async function main(): Promise<void> {
     await testConnectionResetRetry();
+    await testRequestCancellation();
 
     const settings = loadCliSettings(path.resolve(__dirname, ".."));
     assert.equal(settings.contextLength, 65536);
@@ -107,6 +146,49 @@ async function main(): Promise<void> {
     }));
     assert.equal(action?.action, "read_file");
     assert.equal(action?.reason, "Inspect the project documentation.");
+    assert.equal(agent.parseAction([
+        "I will inspect the project.",
+        JSON.stringify({ note: "not an action" }),
+        "```json",
+        JSON.stringify({
+            action: "read_file",
+            path: "package.json",
+            reason: "Inspect package metadata."
+        }),
+        "```"
+    ].join("\n"))?.action, "read_file");
+    assert.equal(agent.parseAction('{"action":"read_file","path":"README.md","reason":"brace } inside a string"}')?.action, "read_file");
+    assert.equal(agent.parseAction('{"action":"unknown_action"}'), undefined);
+    assert.equal(agent.explainParseFailure("plain text summary"), "no valid JSON object found in model content");
+    assert.equal(agent.explainParseFailure('{"action":"unknown_action"}'), "unsupported action: unknown_action");
+    assert.equal(formatStatusBar({
+        model: "model.gguf",
+        contextUsed: 1200,
+        contextLimit: 65536,
+        workspace: "D:\\work"
+    }, 120).length, 120);
+    assert.equal(formatStatusBar({
+        model: "very-long-model-name.gguf",
+        contextUsed: 1200,
+        contextLimit: 65536,
+        workspace: "D:\\very-long-workspace"
+    }, 30).length, 30);
+    assert.equal(formatElapsedTime(0), "00:00");
+    assert.equal(formatElapsedTime(65_000), "01:05");
+    assert.equal(formatElapsedTime(3_661_000), "01:01:01");
+    const spinnerLine = formatSpinnerLine("⠹", "Reviewing results and planning (9/12)...", 98_000, 434_000, 80);
+    assert.ok(spinnerLine.includes("step 01:38 | total 07:14"));
+    assert.ok(spinnerLine.length <= 79);
+    const renderedHistory = formatSessionHistory(Array.from({ length: 8 }, (_, index) => ({
+        role: index % 2 === 0 ? "user" as const : "assistant" as const,
+        content: `message ${index + 1}${index === 7 ? "\nsecond line" : ""}`
+    })), 6);
+    assert.ok(renderedHistory.includes("Recent session history (6 messages)"));
+    assert.ok(!renderedHistory.includes("message 1"));
+    assert.ok(!renderedHistory.includes("message 2"));
+    assert.ok(renderedHistory.includes("message 3"));
+    assert.ok(renderedHistory.includes("AI: message 8\n    second line"));
+    assert.equal(formatSessionHistory([], 6), "No previous messages in this session.");
     assert.equal(
         agent.formatActionStatus({
             action: "read_file",
@@ -120,6 +202,9 @@ async function main(): Promise<void> {
         command: "tool --token=secret-value",
         reason: "Verify the command"
     }, 2, 12).includes("secret-value"));
+    const unixMkdir = await agent.execute({ action: "run_command", command: "mkdir -p LoginPage" });
+    assert.equal(unixMkdir.ok, false);
+    assert.match(unixMkdir.output, /Blocked unsafe command/);
     await agent.close();
 
     const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cli-agent-test-"));
@@ -169,6 +254,19 @@ async function main(): Promise<void> {
         assert.deepEqual(session.getContextMessages("keep"), []);
 
         const tracePath = path.join(tempDirectory, "trace.jsonl");
+        const responseLogPath = path.join(tempDirectory, "responses.jsonl");
+        const responseLog = new AgentResponseLog(responseLogPath);
+        responseLog.append({
+            turn: 1,
+            maxTurns: 12,
+            requestFormat: { type: "json_object" },
+            rawContent: "plain model content",
+            parseError: "no valid JSON object found in model content"
+        });
+        const loggedResponse = JSON.parse(fs.readFileSync(responseLogPath, "utf8"));
+        assert.equal(loggedResponse.accepted, false);
+        assert.equal(loggedResponse.rawContent, "plain model content");
+        assert.equal(loggedResponse.parseError, "no valid JSON object found in model content");
         const trace = new AgentTrace(tracePath);
         trace.add({
             turn: 1,
@@ -178,7 +276,16 @@ async function main(): Promise<void> {
             observation: "token=secret-value"
         });
         trace.save();
+        trace.add({
+            turn: 2,
+            status: "parse_error",
+            action: "invalid_json",
+            observation: "second entry"
+        });
+        trace.save();
+        trace.save();
         const savedTrace = fs.readFileSync(tracePath, "utf8");
+        assert.equal(savedTrace.trim().split(/\r?\n/).length, 2);
         assert.ok(savedTrace.includes("[REDACTED]"));
         assert.ok(savedTrace.includes("[content omitted:"));
         assert.ok(!savedTrace.includes("secret-value"));

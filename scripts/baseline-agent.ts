@@ -6,10 +6,15 @@ const { loadCliSettings, getSamplingSettings } = require("../cli/config") as {
     getSamplingSettings: (settings: Record<string, unknown>, kind: "action") => Record<string, number>;
 };
 const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () => {
-    buildSystemPrompt: () => Promise<string>;
+    buildSystemPrompt: (instructions?: string) => Promise<string>;
     parseAction: (content: string) => { action?: string; reason?: string } | undefined;
     close: () => Promise<void>;
 } };
+const { classifyWorkflow, workflowInstructions } = require("../cli/workflowRouter") as {
+    classifyWorkflow: (message: string) => { kind: "general" | "web_research" | "coding" | "mcp_creation" };
+    workflowInstructions: (kind: "general" | "web_research" | "coding" | "mcp_creation") => string;
+};
+const { getInitialAgentResponseFormat } = require("../cli/agentProtocol") as { getInitialAgentResponseFormat: (workflow: "general" | "web_research" | "coding" | "mcp_creation", message: string) => Record<string, unknown> };
 
 const appRoot = path.resolve(__dirname, "..");
 const settings = loadCliSettings(appRoot);
@@ -30,7 +35,10 @@ async function main(): Promise<void> {
 
     const agent = new AgentTool();
     try {
-        const systemPrompt = await agent.buildSystemPrompt();
+        const prompt = "Read README.md before explaining what this project does.";
+        const workflow = classifyWorkflow(prompt);
+        const systemPrompt = await agent.buildSystemPrompt(workflowInstructions(workflow.kind));
+        const responseFormat = getInitialAgentResponseFormat(workflow.kind, prompt);
         const results: Array<{
             attempt: number;
             valid: boolean;
@@ -45,8 +53,9 @@ async function main(): Promise<void> {
                 model,
                 messages: [
                     { role: "system", content: systemPrompt },
-                    { role: "user", content: "Read README.md before explaining what this project does." }
+                    { role: "user", content: prompt }
                 ],
+                response_format: responseFormat,
                 ...sampling
             }, { timeout: 120000 });
             const raw = response.data?.choices?.[0]?.message?.content?.trim() ?? "";
@@ -64,7 +73,7 @@ async function main(): Promise<void> {
         const report = {
             generatedAt: new Date().toISOString(),
             model,
-            prompt: "Read README.md before explaining what this project does.",
+            prompt,
             sampling,
             attempts,
             validJsonActions: results.filter((result) => result.valid).length,

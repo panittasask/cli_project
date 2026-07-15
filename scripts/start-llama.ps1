@@ -1,4 +1,7 @@
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "llama-device.ps1")
+$appRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Set-Location -LiteralPath $appRoot
 
 function Get-CliSettings {
     $settingsPath = Join-Path $PSScriptRoot "..\.cli\settings.json"
@@ -10,9 +13,9 @@ function Get-CliSettings {
 }
 
 $settings = Get-CliSettings
-$llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b9908-bin-win-sycl-x64" }
+$llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b10012-bin-win-sycl-x64" }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($settings.modelPath) { $settings.modelPath } else { "D:\Model" }
-$llamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "" }
+$requestedLlamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "auto" }
 $contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 65536 }
 $parsedContextLength = 0
 if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
@@ -24,6 +27,9 @@ $launcher = Join-Path $llamaDirectory "llama-server.exe"
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "llama-server executable not found: $launcher"
 }
+
+$llamaDevice = Resolve-LlamaDevice -ServerExecutable $launcher -RequestedDevice $requestedLlamaDevice
+$runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
 
 $models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
 if ($models.Count -eq 0) {
@@ -60,7 +66,7 @@ if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 
 }
 
 $selectedModel = $models[$selectedNumber - 1]
-$serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080")
+$serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080")
 if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
     $serverArguments += @("--device", $llamaDevice, "-ngl", "all")
 }
@@ -68,6 +74,7 @@ if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
 Write-Host "Starting llama.cpp from: $llamaDirectory"
 Write-Host "Model: $($selectedModel.Name)"
 Write-Host "Device: $(if ($llamaDevice) { $llamaDevice } else { 'auto' })"
+Write-Host "Runtime profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
 Write-Host ("Configured context: {0:N0} tokens" -f $parsedContextLength)
 Write-Host "The CLI will connect to: http://127.0.0.1:8080"
 Write-Host ""
