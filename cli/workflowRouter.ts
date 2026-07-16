@@ -1,4 +1,5 @@
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
+type VerificationRequirement = "none" | "command" | "runtime";
 
 type WorkflowDecision = {
     kind: WorkflowKind;
@@ -25,12 +26,25 @@ const codingPatterns = [
     /\b(html|css|web\s?page|website|login\s?page|modal|component)\b/i,
     /(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|เวิร์กสเปซ|คอนฟิก|แก้บั๊ก|รีแฟกเตอร์|รันเทส|ทดสอบ|คอมไพล์|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์)/i,
     /(หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล)/i,
-    /(?:^|\s)[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml)(?:\s|$)/i
+    /\b(swagger|openapi|api|endpoint|router|server|framework)\b/i,
+    /(?:^|\s)[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go)(?:\s|$)/i
 ];
 
 const workspaceMutationPatterns = [
-    /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|organize|rearrange|polish|improve|style)\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style)\b/i,
-    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง)/i
+    /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|swagger|openapi|api|endpoint|router|server|framework)\b/i,
+    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|swagger|openapi|api|endpoint|router|server|framework)/i
+];
+
+const runtimeVerificationPatterns = [
+    /\b(swagger|openapi|api|endpoint|server|localhost|url|web\s?page|website)\b[\s\S]*\b(open|opens|run|runs|work|works|working|reachable|responds?)\b/i,
+    /\b(open|opens|run|runs|work|works|working|reachable|responds?)\b[\s\S]*\b(swagger|openapi|api|endpoint|server|localhost|url|web\s?page|website)\b/i,
+    /(swagger|openapi|api|endpoint|server|localhost|หน้าเว็บ|เว็บไซต์)[\s\S]*(เปิด|รัน|ทำงาน|ใช้งาน|เข้า|ตอบกลับ)[\s\S]*(ได้|สำเร็จ|ผ่าน)/i,
+    /(เปิด|รัน|ทำให้)[\s\S]*(swagger|openapi|api|endpoint|server|localhost|หน้าเว็บ|เว็บไซต์)[\s\S]*(ได้|ทำงาน|ใช้งาน)/i
+];
+
+const commandVerificationPatterns = [
+    /\b(until|pass(?:es|ed)?|test(?:s|ed|ing)?|builds?|compiles?|lint|typecheck|verify|verification)\b/i,
+    /(จนกว่า|ให้เสร็จ|ให้ผ่าน|ทดสอบ|รันเทส|คอมไพล์|บิลด์|ตรวจสอบ)[\s\S]*(ผ่าน|สำเร็จ|ได้)?/i
 ];
 
 function matchesAny(message: string, patterns: RegExp[]): boolean {
@@ -93,6 +107,42 @@ function requiresWorkspaceWriteWithHistory(
     return false;
 }
 
+function verificationRequirement(message: string): VerificationRequirement {
+    const clean = message.trim();
+    if (matchesAny(clean, runtimeVerificationPatterns)) return "runtime";
+    if (matchesAny(clean, commandVerificationPatterns)) return "command";
+    return "none";
+}
+
+function verificationRequirementWithHistory(
+    message: string,
+    history: Array<{ role: "user" | "assistant"; content: string }>,
+    continuation: boolean
+): VerificationRequirement {
+    const direct = verificationRequirement(message);
+    if (direct === "runtime" || !continuation) return direct;
+    let inheritedCommand = false;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const previous = history[index];
+        if (previous?.role !== "user") continue;
+        const inherited = verificationRequirement(previous.content);
+        if (inherited === "runtime") return "runtime";
+        if (inherited === "command") inheritedCommand = true;
+    }
+    if (direct === "command" || inheritedCommand) return "command";
+    return "none";
+}
+
+function commandSatisfiesVerification(command: string, requirement: VerificationRequirement): boolean {
+    if (requirement === "none") return true;
+    const clean = command.toLowerCase();
+    if (requirement === "runtime") {
+        return /invoke-webrequest|invoke-restmethod|\bcurl(?:\.exe)?\b|\bwget(?:\.exe)?\b|https?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)/i.test(clean)
+            || /\b(playwright|cypress|selenium|test:e2e|e2e:test)\b/i.test(clean);
+    }
+    return /\b(test|check|verify|lint|typecheck|tsc|build|compile|go\s+test|go\s+build|cargo\s+test|pytest|unittest|dotnet\s+test|mvn\s+test|gradle\s+test)\b/i.test(clean);
+}
+
 function workflowInstructions(kind: WorkflowKind): string {
     if (kind === "web_research") {
         return `Workflow: web research.
@@ -122,4 +172,13 @@ function workflowInstructions(kind: WorkflowKind): string {
 - Do not search local files for general knowledge or use them as a substitute for web research.`;
 }
 
-module.exports = { classifyWorkflow, classifyWorkflowWithHistory, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, workflowInstructions };
+module.exports = {
+    classifyWorkflow,
+    classifyWorkflowWithHistory,
+    requiresWorkspaceWrite,
+    requiresWorkspaceWriteWithHistory,
+    verificationRequirement,
+    verificationRequirementWithHistory,
+    commandSatisfiesVerification,
+    workflowInstructions
+};

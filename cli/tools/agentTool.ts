@@ -89,7 +89,8 @@ class AgentTool {
         const mcpSection = await this.mcpTool.buildPromptSection();
         const runtimeSection = process.platform === "win32"
             ? `Runtime platform: Windows. run_command executes Windows PowerShell.
-Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.`
+Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.
+Do not wrap commands in another powershell.exe invocation. Do not use Bash separators such as && or a bare & to background a process.`
             : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
         // The model is controlled through a small JSON protocol so the CLI can
         // safely decide which local capability to execute on each agent turn.
@@ -130,6 +131,8 @@ Rules:
 - Verify file contents with read_file or search_files instead of shell pipelines whenever possible.
 - Never assume a localhost server is running or that a workspace file is available over HTTP. Call a local URL only after a successful observation confirms that exact server and port are running.
 - If a verification command fails, recover with an OS-compatible command or a relevant read_file/search_files action before reporting verified success.
+- Treat phrases such as "until it works", "จนกว่าจะผ่าน", and "ให้ใช้งานได้" as completion criteria, not requests for advice. Keep using actions until the requested observable result is verified.
+- A successful build proves compilation only. For runtime behavior such as a URL, endpoint, server, or Swagger UI, probe the actual local behavior before returning final.
 - Do not run destructive commands.
 - Answer the final user in Thai unless the user asks for another language.
 
