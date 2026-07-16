@@ -20,7 +20,13 @@ At session selection, use `D` to delete one saved session or `C` to clear all
 saved sessions. Both paths require confirmation. `/clear` inside a session only
 starts a clean model context and does not delete saved session data.
 After selecting a session, the CLI prints its six most recent saved messages so
-the visible terminal history matches the context restored for the next prompt.
+the visible terminal history matches the bounded context restored for each next
+prompt. The model decides whether that recent context is relevant; the current
+request has priority, and `/clear` is the explicit boundary that excludes it.
+Each session also saves its workspace and restores it before accepting input.
+`--workspace` overrides and updates the saved value, while `/workspace <path>`
+switches and saves it interactively. Legacy sessions without this field, or a
+session whose directory is unavailable, prompt for a valid workspace first.
 
 The separate two-terminal workflow below remains available when server logs
 need to stay visible.
@@ -49,7 +55,7 @@ Settings:
   "device": "auto",
   "debug": true,
   "historyMessages": 6,
-  "agent": { "maxTurns": 12, "maxDurationMinutes": 10, "maxCompletionTokens": 16000, "repeatLimit": 2 },
+  "agent": { "maxTurns": 12, "maxSegments": 3, "maxDurationMinutes": 10, "maxCompletionTokens": 16000, "repeatLimit": 2 },
   "sampling": {
     "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
     "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
@@ -85,7 +91,7 @@ Sampling values can be overridden per profile with variables such as
 `LLAMA_CHAT_TEMPERATURE`, `LLAMA_PLANNER_MAX_TOKENS`, and
 `LLAMA_ACTION_TOP_K`. Set `CLI_DEBUG=1` to show the concise agent trace.
 Agent loop limits live under `agent` in settings and can be overridden with
-`CLI_AGENT_MAX_TURNS`, `CLI_AGENT_MAX_MINUTES`,
+`CLI_AGENT_MAX_TURNS`, `CLI_AGENT_MAX_SEGMENTS`, `CLI_AGENT_MAX_MINUTES`,
 `CLI_AGENT_MAX_COMPLETION_TOKENS`, and `CLI_AGENT_REPEAT_LIMIT`.
 The HTTP client timeout is kept slightly above the wall-clock budget so the
 user-visible Agent guard, rather than a generic five-minute Axios timeout,
@@ -97,6 +103,18 @@ CUDA uses batch/ubatch `1024/512`, while SYCL and Vulkan use `512/256`.
 `npm run benchmark:hardware` for an opt-in llama-bench run; startup never
 benchmarks automatically.
 
+Both llama.cpp launchers detect model filenames containing a standalone `MTP`
+token. When the configured llama.cpp build advertises `draft-mtp` support, the
+launcher automatically adds `--spec-type draft-mtp --spec-draft-n-max 6` and
+prints the selected speculative-decoding mode. Normal models remain unchanged;
+set `LLAMA_MTP=off` to disable MTP temporarily for comparison or troubleshooting.
+
+`npm start` checks port 8080 before probing devices or loading a model. If a
+healthy `llama-server` process is already listening, the CLI reuses it instead
+of starting another copy. A different process on that port is rejected. The
+launcher owns the server for the CLI run, so entering `exit` or `/exit` stops
+the server whether it was newly started or reused.
+
 `contextLength` is the context requested from llama.cpp with `-c`; it is not
 automatically inferred from text such as `1M` in a model filename. The startup
 screen shows the configured value, and `/model` shows both that value and the
@@ -104,34 +122,50 @@ active per-slot context reported by llama.cpp. The server may lower the active
 value when automatic VRAM fitting requires it.
 
 Inside the CLI, `/debug on` displays each agent action, its short decision
-summary, and whether the tool succeeded. The full redacted trace is always
-appended to `.cli/logs/agent-trace.jsonl`; model-generated file content and
+summary, and whether the tool succeeded. The full redacted trace is rotated
+daily as `.cli/logs/agent-trace-YYYY-MM-DD.jsonl`; model-generated file content and
 common secret fields are omitted. This trace is an operational summary, not
 the model's private chain-of-thought. `/clear` starts a clean task context while
 keeping the saved session history on disk.
 
-Agent mode also writes every raw model message to
-`.cli/logs/agent-model-responses.jsonl`, including the requested response
+Agent mode also writes every raw model message to daily files named
+`.cli/logs/agent-model-responses-YYYY-MM-DD.jsonl`, including the requested response
 format, finish reason, parsed action, and parse failure reason. This local file
 is ignored by Git and can contain model-generated content from the active task.
-In an interactive terminal, a status banner immediately above each input prompt
+In an interactive terminal, a fixed status banner stays on the bottom row and
 shows the loaded model, current context usage and limit, and active workspace.
-It does not use a fixed terminal scroll region, so agent output and final answers
-cannot overlap or be hidden by the banner.
+Agent output, spinners, and the input prompt use the reserved scroll region
+above it, and the normal terminal region is restored when the CLI exits.
 
-Agent requests are classified as general conversation, web research, coding,
-or MCP creation before the model acts. Only relevant recent session messages
-are summarized into the active task context, so an unrelated question does not
-inherit coding or search instructions from an earlier task. Existing files
-must be read before an agent write. JSON, TypeScript, and `.gitignore` changes
-receive automatic validation, and a failed validation blocks a final success
-response.
+Agent requests are classified as general, web research, coding, or MCP creation
+before the model acts. Classification selects specialized instructions but does
+not prevent a general request from using local file tools: the model can choose
+read, search, write, command, or final actions from the request and relevant
+session context. Web and MCP workflows remain restricted to their relevant
+tools. Existing files must be read before an agent write. JSON, TypeScript, and
+`.gitignore` changes receive automatic validation, and a failed validation
+blocks a final success response.
+
+Existing files are normally changed with an exact `edit_file` replacement so
+the model sends only the old and new snippet instead of reproducing a large
+file inside one JSON response. The replacement must match exactly once and gets
+the same diff checkpoint, undo support, and validation as a full write. If a
+full-file response reaches the completion limit, the truncated response is
+omitted from active context and the next turn is constrained to a smaller action.
+
+On Windows, agent verification commands run explicitly in PowerShell and the
+model receives matching platform guidance. File-content checks should use
+`read_file` or `search_files`; the agent must not assume a localhost server is
+running. A failed verification command blocks verified success until a relevant
+file read/search or an OS-compatible command succeeds.
 
 During a running request, `Ctrl+C` cancels that request without closing the
-CLI. Agent turns show remaining wall-clock budget and stop when time, turn,
-completion-token, or repeated-action limits are reached. Model-generated writes
-show a compact diff preview and save a checkpoint first. Run `/undo` to restore
-the most recent checkpoint for the active workspace.
+CLI. `maxTurns` is a soft per-segment limit: unfinished work is compacted into
+file, validation, verification, source, and recent-event state, then continues
+automatically for up to `maxSegments`. Wall-clock and completion-token budgets
+remain global hard limits across segments. Model-generated writes show a compact
+diff preview and save a checkpoint first. Run `/undo` to restore the most recent
+checkpoint for the active workspace.
 
 Project-local skills live at `.cli/skills/<name>/SKILL.md` with required `name`
 and `description` frontmatter. Run `/skills` to list them, invoke one explicitly

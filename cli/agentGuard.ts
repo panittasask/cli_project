@@ -1,6 +1,6 @@
 import crypto = require("node:crypto");
 
-type GuardSettings = { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
+type GuardSettings = { maxTurns: number; maxSegments?: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
 type GuardDecision = { status: "allow" | "replan" | "stop"; message?: string };
 
 class AgentGuard {
@@ -38,6 +38,11 @@ class AgentGuard {
             return { status: "stop", message: `Stopped identical action after ${count} consecutive attempts.` };
         }
         return { status: "allow" };
+    }
+
+    resetActionHistory(): void {
+        this.lastActionSignature = undefined;
+        this.consecutiveActionCount = 0;
     }
 
     formatRemaining(now = Date.now()): string {

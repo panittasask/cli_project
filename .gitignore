@@ -2,7 +2,6 @@
 node_modules/
 
 # Runtime state
-.cli-sessions.json
 .cli/logs/
 .cli/checkpoints.json
 
