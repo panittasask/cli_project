@@ -21,6 +21,7 @@ interface SessionUsage {
 interface ChatSession {
     id: string;
     title: string;
+    workspace?: string;
     createdAt: number;
     updatedAt: number;
     messages: SessionMessage[];
@@ -44,7 +45,7 @@ class SessionTool {
         this.storagePath = storagePath ?? path.resolve(process.cwd(), ".cli-sessions.json");
     }
 
-    async selectSession(rl: readline.Interface): Promise<ChatSession> {
+    async selectSession(rl: readline.Interface, workspace: string): Promise<ChatSession> {
         while (true) {
             const store = this.loadStore();
             this.printMenu(store.sessions);
@@ -53,7 +54,7 @@ class SessionTool {
             if (/^n$/i.test(rawChoice)) {
                 const rawTitle = (await this.prompt(rl, "Session name (optional): ")).trim();
                 const title = rawTitle.length > 0 ? rawTitle : this.defaultSessionTitle();
-                const created = this.createSession(title);
+                const created = this.createSession(title, workspace);
                 console.log(`Using new session: ${created.title}`);
                 console.log();
                 return created;
@@ -146,6 +147,24 @@ class SessionTool {
             .slice(-maxMessages);
     }
 
+    resumeSession(sessionId: string): ChatSession | undefined {
+        if (!this.getSession(sessionId)) return undefined;
+        this.touchSession(sessionId);
+        return this.getSession(sessionId);
+    }
+
+    setWorkspace(sessionId: string, workspace: string): boolean {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        if (!session) return false;
+
+        session.workspace = path.resolve(workspace);
+        session.updatedAt = Date.now();
+        this.enforceLimits(store);
+        this.saveStore(store);
+        return true;
+    }
+
     deleteSession(sessionId: string): boolean {
         const store = this.loadStore();
         const nextSessions = store.sessions.filter((session) => session.id !== sessionId);
@@ -230,12 +249,13 @@ class SessionTool {
         this.saveStore(store);
     }
 
-    private createSession(title: string): ChatSession {
+    private createSession(title: string, workspace: string): ChatSession {
         const store = this.loadStore();
         const now = Date.now();
         const session: ChatSession = {
             id: this.newSessionId(now),
             title: title.trim().slice(0, 60) || this.defaultSessionTitle(),
+            workspace: path.resolve(workspace),
             createdAt: now,
             updatedAt: now,
             messages: []
@@ -284,6 +304,7 @@ class SessionTool {
                     ? `, ${usage.totalTokens.toLocaleString()} tokens`
                     : "";
                 console.log(`${index + 1}. ${session.title} (${session.messages.length} msgs${tokenSummary}, updated ${when})`);
+                console.log(`   Workspace: ${session.workspace ?? "not saved (legacy session)"}`);
             });
         }
 
@@ -366,7 +387,7 @@ class SessionTool {
     private loadStore(): SessionStore {
         if (!fs.existsSync(this.storagePath)) {
             return {
-                version: 1,
+                version: 2,
                 sessions: []
             };
         }
@@ -380,12 +401,12 @@ class SessionTool {
             }
 
             return {
-                version: 1,
+                version: 2,
                 sessions: parsed.sessions
             };
         } catch {
             return {
-                version: 1,
+                version: 2,
                 sessions: []
             };
         }

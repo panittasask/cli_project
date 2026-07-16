@@ -37,6 +37,12 @@ type AgentAction = (
         content: string;
     }
     | {
+        action: "edit_file";
+        path: string;
+        old_text: string;
+        new_text: string;
+    }
+    | {
         action: "run_command";
         command: string;
     }
@@ -77,11 +83,17 @@ class AgentTool {
 
     async buildSystemPrompt(workflowInstructions = ""): Promise<string> {
         const mcpSection = await this.mcpTool.buildPromptSection();
+        const runtimeSection = process.platform === "win32"
+            ? `Runtime platform: Windows. run_command executes Windows PowerShell.
+Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.`
+            : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
         // The model is controlled through a small JSON protocol so the CLI can
         // safely decide which local capability to execute on each agent turn.
         return `You are a helpful local CLI assistant and coding agent running inside a user's project workspace.
 You may have a natural conversation, inspect files, search code, edit files, run safe verification commands, and call only the MCP tools listed below.
 Work in small steps. Use tools until you have enough evidence, then return final.
+
+${runtimeSection}
 
 ${workflowInstructions}
 
@@ -93,6 +105,7 @@ Available actions:
 {"action":"search_files","query":"text or regex","path":"optional relative path","reason":"brief rationale"}
 {"action":"read_file","path":"relative path","reason":"brief rationale"}
 {"action":"write_file","path":"relative path","content":"full updated file content","reason":"brief rationale"}
+{"action":"edit_file","path":"relative path","old_text":"exact existing text","new_text":"replacement text","reason":"brief rationale"}
 {"action":"run_command","command":"safe read-only or verification command","reason":"brief rationale"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
@@ -107,8 +120,12 @@ Rules:
 - Prefer reading relevant files before editing.
 - If the user names an exact file path, act on that path directly instead of listing the workspace to look for it.
 - Preserve existing style and dependencies unless the user asks otherwise.
-- For write_file, provide the full final file content.
+- Prefer edit_file for an existing file: old_text must match exactly once, and new_text contains only its replacement.
+- Use write_file for new files or when a complete replacement is genuinely necessary. For write_file, provide the full final file content.
 - Use write_file to create files and parent directories. run_command is only for read-only inspection or verification; never use mkdir, New-Item, redirection, or shell commands to create files.
+- Verify file contents with read_file or search_files instead of shell pipelines whenever possible.
+- Never assume a localhost server is running or that a workspace file is available over HTTP. Call a local URL only after a successful observation confirms that exact server and port are running.
+- If a verification command fails, recover with an OS-compatible command or a relevant read_file/search_files action before reporting verified success.
 - Do not run destructive commands.
 - Answer the final user in Thai unless the user asks for another language.
 
@@ -169,6 +186,16 @@ ${mcpSection}`;
                 action,
                 path: typeof data.path === "string" ? data.path : "",
                 content: typeof data.content === "string" ? data.content : "",
+                reason
+            };
+        }
+
+        if (action === "edit_file") {
+            return {
+                action,
+                path: typeof data.path === "string" ? data.path : "",
+                old_text: typeof data.old_text === "string" ? data.old_text : "",
+                new_text: typeof data.new_text === "string" ? data.new_text : "",
                 reason
             };
         }
@@ -292,6 +319,7 @@ ${mcpSection}`;
             "search_files",
             "read_file",
             "write_file",
+            "edit_file",
             "run_command",
             "mcp_list_tools",
             "mcp_call_tool"
@@ -341,6 +369,15 @@ ${mcpSection}`;
                 return { ok: true, output: `Wrote ${action.path}` };
             }
 
+            if (action.action === "edit_file") {
+                const prepared = this.prepareEdit(action.path, action.old_text, action.new_text);
+                if (!prepared.ok || prepared.content === undefined) {
+                    return { ok: false, output: prepared.output };
+                }
+                this.writeFile(action.path, prepared.content);
+                return { ok: true, output: `Edited ${action.path} with one exact replacement` };
+            }
+
             if (action.action === "mcp_list_tools") {
                 return { ok: true, output: await this.mcpTool.listTools(action.server) };
             }
@@ -367,6 +404,27 @@ ${mcpSection}`;
         await this.mcpTool.close();
     }
 
+    prepareEdit(inputPath: string, oldText: string, newText: string): { ok: boolean; output: string; content?: string } {
+        if (!inputPath.trim()) return { ok: false, output: "Missing file path." };
+        if (!oldText) return { ok: false, output: "edit_file old_text must not be empty." };
+
+        const resolved = this.resolveInsideWorkspace(inputPath);
+        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+            return { ok: false, output: `File not found: ${inputPath}` };
+        }
+        const current = fs.readFileSync(resolved, "utf8");
+        const matchCount = current.split(oldText).length - 1;
+        if (matchCount !== 1) {
+            return {
+                ok: false,
+                output: matchCount === 0
+                    ? `edit_file old_text was not found in ${inputPath}. Read the file again and use an exact match.`
+                    : `edit_file old_text matched ${matchCount} locations in ${inputPath}; provide more surrounding text so it matches exactly once.`
+            };
+        }
+        return { ok: true, output: "Exact replacement prepared.", content: current.replace(oldText, newText) };
+    }
+
     formatActionStatus(action: AgentAction, turn: number, maxTurns: number): string {
         const clean = (value: string | undefined, maxChars = 100): string => {
             const redacted = (value ?? "")
@@ -381,6 +439,7 @@ ${mcpSection}`;
             if (action.action === "search_files") return `Searching files: ${clean(action.query)}`;
             if (action.action === "read_file") return `Reading file: ${clean(action.path)}`;
             if (action.action === "write_file") return `Writing file: ${clean(action.path)}`;
+            if (action.action === "edit_file") return `Editing file: ${clean(action.path)}`;
             if (action.action === "run_command") return `Running check: ${clean(action.command)}`;
             if (action.action === "mcp_list_tools") return `Discovering MCP tools${action.server ? `: ${clean(action.server)}` : ""}`;
             if (action.action === "mcp_call_tool") return `Calling tool: ${clean(`${action.server}.${action.tool}`)}`;
@@ -488,7 +547,27 @@ ${mcpSection}`;
             throw new Error(`Blocked unsafe command: ${command}`);
         }
 
-        const output = childProcess.execSync(command, {
+        if (process.platform === "win32" && /\b(grep|sed|awk)\b/i.test(command)) {
+            throw new Error("Unsupported Unix command on Windows PowerShell. Use Select-String or a built-in file action instead.");
+        }
+
+        const output = process.platform === "win32"
+            ? childProcess.execFileSync("powershell.exe", [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command
+            ], {
+                cwd: process.cwd(),
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: 30000,
+                windowsHide: true
+            })
+            : childProcess.execSync(command, {
             cwd: process.cwd(),
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],

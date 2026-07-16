@@ -17,9 +17,16 @@ const mcpPatterns = [
 ];
 
 const codingPatterns = [
-    /\b(file|folder|code|repo|project|workspace|typescript|javascript|json|readme|git|npm|test|build|config|function|class|bug|refactor)\b/i,
-    /(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|เวิร์กสเปซ|คอนฟิก|แก้บั๊ก|รีแฟกเตอร์|รันเทส|ทดสอบ|คอมไพล์)/i,
+    /\b(file|folder|code|repo|project|workspace|typescript|javascript|json|readme|git|npm|test|build|config|function|class|bug|refactor|button|form|register|ui|ux|layout|spacing|style)\b/i,
+    /\b(html|css|web\s?page|website|login\s?page|modal|component)\b/i,
+    /(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|เวิร์กสเปซ|คอนฟิก|แก้บั๊ก|รีแฟกเตอร์|รันเทส|ทดสอบ|คอมไพล์|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์)/i,
+    /(หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล)/i,
     /(?:^|\s)[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml)(?:\s|$)/i
+];
+
+const workspaceMutationPatterns = [
+    /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|organize|rearrange|polish|improve|style)\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style)\b/i,
+    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง)/i
 ];
 
 function matchesAny(message: string, patterns: RegExp[]): boolean {
@@ -37,7 +44,49 @@ function classifyWorkflow(message: string): WorkflowDecision {
     if (matchesAny(clean, codingPatterns)) {
         return { kind: "coding", reason: "The request concerns project files, code, or verification." };
     }
-    return { kind: "general", reason: "The request can be answered as a normal conversation." };
+    return { kind: "general", reason: "No specialized web or MCP workflow was detected; decide from the request and session context whether local file tools are needed." };
+}
+
+function classifyWorkflowWithHistory(
+    message: string,
+    history: Array<{ role: "user" | "assistant"; content: string }>,
+    continuation: boolean
+): WorkflowDecision {
+    const direct = classifyWorkflow(message);
+    if (direct.kind !== "general" || !continuation) return direct;
+
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const previous = history[index];
+        if (previous?.role !== "user") continue;
+        const inherited = classifyWorkflow(previous.content);
+        if (inherited.kind !== "general") {
+            return {
+                kind: inherited.kind,
+                reason: `Continuation of previous ${inherited.kind} request.`
+            };
+        }
+    }
+
+    return direct;
+}
+
+function requiresWorkspaceWrite(message: string): boolean {
+    return matchesAny(message.trim(), workspaceMutationPatterns);
+}
+
+function requiresWorkspaceWriteWithHistory(
+    message: string,
+    history: Array<{ role: "user" | "assistant"; content: string }>,
+    continuation: boolean
+): boolean {
+    if (requiresWorkspaceWrite(message)) return true;
+    if (!continuation) return false;
+
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const previous = history[index];
+        if (previous?.role === "user") return requiresWorkspaceWrite(previous.content);
+    }
+    return false;
 }
 
 function workflowInstructions(kind: WorkflowKind): string {
@@ -62,10 +111,11 @@ function workflowInstructions(kind: WorkflowKind): string {
 - Discover the completed server with mcp_list_tools and call at least one relevant tool with mcp_call_tool before claiming success.
 - Never claim an MCP server works until both checks succeed.`;
     }
-    return `Workflow: general conversation.
-- Answer naturally without using project or MCP tools unless the request clearly requires evidence.
-- Do not search local files for general knowledge or web questions.
-- Return final as soon as the question can be answered accurately.`;
+    return `Workflow: general agent request.
+- Decide from the current request and relevant session context whether local workspace tools are needed.
+- For ordinary conversation, return final without calling tools.
+- For workspace inspection or changes, use list_files, search_files, read_file, write_file, or run_command as needed.
+- Do not search local files for general knowledge or use them as a substitute for web research.`;
 }
 
-module.exports = { classifyWorkflow, workflowInstructions };
+module.exports = { classifyWorkflow, classifyWorkflowWithHistory, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, workflowInstructions };

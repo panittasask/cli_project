@@ -29,14 +29,6 @@ $stdoutLog = Join-Path $logDirectory "llama-server.log"
 $stderrLog = Join-Path $logDirectory "llama-server-error.log"
 $healthUrl = "http://127.0.0.1:8080/health"
 
-if (-not (Test-Path -LiteralPath $serverExecutable -PathType Leaf)) {
-    throw "llama-server.exe not found: $serverExecutable"
-}
-
-if (-not (Test-Path -LiteralPath $modelDirectory -PathType Container)) {
-    throw "Model directory not found: $modelDirectory"
-}
-
 $portCheck = [System.Net.Sockets.TcpClient]::new()
 $portInUse = $false
 try {
@@ -50,87 +42,90 @@ try {
     $portCheck.Dispose()
 }
 
+$serverProcess = $null
+$serverWasReused = $false
+
 if ($portInUse) {
-    throw "Port 8080 is already in use. Stop the existing server before using npm run dev."
-}
-
-$llamaDevice = Resolve-LlamaDevice -ServerExecutable $serverExecutable -RequestedDevice $requestedLlamaDevice
-$runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
-
-$models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
-if ($models.Count -eq 0) {
-    throw "No .gguf models found in: $modelDirectory"
-}
-
-$defaultModelName = if ($env:LLAMA_MODEL) { $env:LLAMA_MODEL } elseif ($settings.defaultModel) { $settings.defaultModel } else { "" }
-$defaultModelIndex = 0
-for ($index = 0; $index -lt $models.Count; $index += 1) {
-    if ($models[$index].Name -ieq $defaultModelName) {
-        $defaultModelIndex = $index
-        break
+    $listener = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    $runningProcess = if ($listener) { Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue } else { $null }
+    if (-not $runningProcess -or $runningProcess.ProcessName -ne "llama-server") {
+        $owner = if ($runningProcess) { "$($runningProcess.ProcessName) (PID $($runningProcess.Id))" } else { "an unknown process" }
+        throw "Port 8080 is already used by $owner, not llama-server. Stop that process or configure another port."
     }
+
+    $serverProcess = $runningProcess
+    $serverWasReused = $true
+    Write-Host "Reusing llama-server already listening on port 8080 (PID $($serverProcess.Id))."
+} else {
+    if (-not (Test-Path -LiteralPath $serverExecutable -PathType Leaf)) {
+        throw "llama-server.exe not found: $serverExecutable"
+    }
+    if (-not (Test-Path -LiteralPath $modelDirectory -PathType Container)) {
+        throw "Model directory not found: $modelDirectory"
+    }
+
+    $llamaDevice = Resolve-LlamaDevice -ServerExecutable $serverExecutable -RequestedDevice $requestedLlamaDevice
+    $runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
+    $models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
+    if ($models.Count -eq 0) { throw "No .gguf models found in: $modelDirectory" }
+
+    $defaultModelName = if ($env:LLAMA_MODEL) { $env:LLAMA_MODEL } elseif ($settings.defaultModel) { $settings.defaultModel } else { "" }
+    $defaultModelIndex = 0
+    for ($index = 0; $index -lt $models.Count; $index += 1) {
+        if ($models[$index].Name -ieq $defaultModelName) { $defaultModelIndex = $index; break }
+    }
+
+    Write-Host ""
+    Write-Host "Available models"
+    Write-Host "================"
+    Write-Host ("Context length: {0:N0} tokens" -f $parsedContextLength)
+    for ($index = 0; $index -lt $models.Count; $index += 1) {
+        $sizeGb = [Math]::Round($models[$index].Length / 1GB, 2)
+        $marker = if ($index -eq $defaultModelIndex) { " *" } else { "" }
+        Write-Host ("[{0}] {1} ({2} GB){3}" -f ($index + 1), $models[$index].Name, $sizeGb, $marker)
+    }
+
+    Write-Host ""
+    $defaultNumber = $defaultModelIndex + 1
+    $choice = Read-Host "Select model [1-$($models.Count)] (default $defaultNumber)"
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultNumber.ToString() }
+    $selectedNumber = 0
+    if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 1 -or $selectedNumber -gt $models.Count) {
+        throw "Invalid model selection: $choice"
+    }
+
+    $selectedModel = $models[$selectedNumber - 1]
+    $env:LLAMA_MODEL = $selectedModel.Name
+    $speculativeProfile = Get-LlamaSpeculativeProfile -ServerExecutable $serverExecutable -ModelPath $selectedModel.FullName
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
+
+    $serverArguments = @(
+        "-m", ('"{0}"' -f $selectedModel.FullName), "-c", $parsedContextLength.ToString(),
+        "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(),
+        "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) { $serverArguments += @("--device", $llamaDevice, "-ngl", "all") }
+    $serverArguments += @($speculativeProfile.Arguments)
+
+    Write-Host ""
+    Write-Host "Starting llama.cpp with: $($selectedModel.Name)"
+    Write-Host "llama.cpp path: $llamaDirectory"
+    Write-Host ("llama.cpp configured context: {0:N0} tokens" -f $parsedContextLength)
+    if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) { Write-Host "llama.cpp device: $llamaDevice" }
+    Write-Host "llama.cpp profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
+    Write-Host "llama.cpp speculative decoding: $($speculativeProfile.Description)"
+    Write-Host "Server logs: $stdoutLog"
+
+    $serverProcess = Start-Process `
+        -FilePath $serverExecutable `
+        -ArgumentList $serverArguments `
+        -WorkingDirectory $llamaDirectory `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -WindowStyle Hidden `
+        -PassThru
 }
-
-Write-Host ""
-Write-Host "Available models"
-Write-Host "================"
-Write-Host ("Context length: {0:N0} tokens" -f $parsedContextLength)
-for ($index = 0; $index -lt $models.Count; $index += 1) {
-    $sizeGb = [Math]::Round($models[$index].Length / 1GB, 2)
-    $marker = if ($index -eq $defaultModelIndex) { " *" } else { "" }
-    Write-Host ("[{0}] {1} ({2} GB){3}" -f ($index + 1), $models[$index].Name, $sizeGb, $marker)
-}
-
-Write-Host ""
-$defaultNumber = $defaultModelIndex + 1
-$choice = Read-Host "Select model [1-$($models.Count)] (default $defaultNumber)"
-if ([string]::IsNullOrWhiteSpace($choice)) {
-    $choice = $defaultNumber.ToString()
-}
-$selectedNumber = 0
-if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 1 -or $selectedNumber -gt $models.Count) {
-    throw "Invalid model selection: $choice"
-}
-
-$selectedModel = $models[$selectedNumber - 1]
-$env:LLAMA_MODEL = $selectedModel.Name
-
-New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
-
-$serverArguments = @(
-    "-m", ('"{0}"' -f $selectedModel.FullName),
-    "-c", $parsedContextLength.ToString(),
-    "-b", $runtimeProfile.BatchSize.ToString(),
-    "-ub", $runtimeProfile.UBatchSize.ToString(),
-    "-np", "1",
-    "-fa", "auto",
-    "--host", "127.0.0.1",
-    "--port", "8080"
-)
-
-if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
-    $serverArguments += @("--device", $llamaDevice, "-ngl", "all")
-}
-
-Write-Host ""
-Write-Host "Starting llama.cpp with: $($selectedModel.Name)"
-Write-Host "llama.cpp path: $llamaDirectory"
-Write-Host ("llama.cpp configured context: {0:N0} tokens" -f $parsedContextLength)
-if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
-    Write-Host "llama.cpp device: $llamaDevice"
-}
-Write-Host "llama.cpp profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
-Write-Host "Server logs: $stdoutLog"
-
-$serverProcess = Start-Process `
-    -FilePath $serverExecutable `
-    -ArgumentList $serverArguments `
-    -WorkingDirectory $llamaDirectory `
-    -RedirectStandardOutput $stdoutLog `
-    -RedirectStandardError $stderrLog `
-    -WindowStyle Hidden `
-    -PassThru
 
 try {
     $ready = $false
@@ -140,10 +135,10 @@ try {
     while ((Get-Date) -lt $deadline) {
         $serverProcess.Refresh()
         if ($serverProcess.HasExited) {
-            $errorOutput = if (Test-Path -LiteralPath $stderrLog) {
+            $errorOutput = if (-not $serverWasReused -and (Test-Path -LiteralPath $stderrLog)) {
                 (Get-Content -LiteralPath $stderrLog -Tail 30) -join [Environment]::NewLine
             } else {
-                "No server error log was produced."
+                "The reused llama-server process exited."
             }
             throw "llama-server stopped during startup.`n$errorOutput"
         }
@@ -175,7 +170,7 @@ try {
     }
 } finally {
     if ($serverProcess -and -not $serverProcess.HasExited) {
-        Write-Host "Stopping llama.cpp..."
+        Write-Host $(if ($serverWasReused) { "Stopping reused llama.cpp..." } else { "Stopping llama.cpp..." })
         Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
         $serverProcess.WaitForExit(5000) | Out-Null
     }

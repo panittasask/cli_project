@@ -1,5 +1,8 @@
 import fs = require("node:fs");
 import path = require("node:path");
+const { resolveJsonlLogPath } = require("./dailyLog") as {
+    resolveJsonlLogPath: (target: string | { directory: string; basename: string }, date?: Date) => string;
+};
 
 type TraceEntry = {
     taskId: string;
@@ -26,7 +29,7 @@ function redact(value: unknown, key = ""): unknown {
     }
 
     if (typeof value === "string") {
-        if (key === "content") {
+        if (key === "content" || key === "old_text" || key === "new_text") {
             return `[content omitted: ${value.length} chars]`;
         }
         return redactText(value.length > 4000 ? `${value.slice(0, 4000)}...[truncated]` : value);
@@ -53,7 +56,10 @@ class AgentTrace {
     private savedEntryCount = 0;
     private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
-    constructor(private readonly logPath = path.resolve(process.cwd(), ".cli", "logs", "agent-trace.jsonl")) {}
+    constructor(private readonly logTarget: string | { directory: string; basename: string } = {
+        directory: path.resolve(process.cwd(), ".cli", "logs"),
+        basename: "agent-trace"
+    }) {}
 
     add(entry: Omit<TraceEntry, "taskId" | "timestamp">): void {
         this.entries.push({
@@ -69,9 +75,18 @@ class AgentTrace {
             return;
         }
 
-        fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
-        const lines = unsavedEntries.map((entry) => JSON.stringify(redact(entry))).join("\n");
-        fs.appendFileSync(this.logPath, `${lines}\n`, "utf8");
+        const entriesByPath = new Map<string, TraceEntry[]>();
+        for (const entry of unsavedEntries) {
+            const logPath = resolveJsonlLogPath(this.logTarget, new Date(entry.timestamp));
+            const entries = entriesByPath.get(logPath) ?? [];
+            entries.push(entry);
+            entriesByPath.set(logPath, entries);
+        }
+        for (const [logPath, entries] of entriesByPath) {
+            fs.mkdirSync(path.dirname(logPath), { recursive: true });
+            const lines = entries.map((entry) => JSON.stringify(redact(entry))).join("\n");
+            fs.appendFileSync(logPath, `${lines}\n`, "utf8");
+        }
         this.savedEntryCount = this.entries.length;
     }
 

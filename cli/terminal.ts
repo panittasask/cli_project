@@ -16,12 +16,13 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require(
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
     getAgentGuardSettings: (settings: CliSettings) => AgentGuardSettings;
 };
-type AgentGuardSettings = { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
+type AgentGuardSettings = { maxTurns: number; maxSegments: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
 const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: AgentGuardSettings) => {
     settings: AgentGuardSettings;
     recordCompletionTokens: (tokens: number) => void;
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: "allow" | "replan" | "stop"; message?: string };
+    resetActionHistory: () => void;
     formatRemaining: () => string;
 } };
 const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpointStore: new (root: string) => {
@@ -33,7 +34,7 @@ const { SkillLoader } = require("./skillLoader") as { SkillLoader: new () => {
     select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string; description: string; body: string }>;
     formatPrompt: (skills: Array<{ name: string; description: string; body: string }>) => string;
 } };
-const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logPath?: string) => {
+const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }) => {
     add: (entry: {
         turn: number;
         status: "action" | "ok" | "error" | "parse_error" | "final";
@@ -45,7 +46,7 @@ const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logPath?: s
     save: () => void;
     print: () => void;
 } };
-const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog: new (logPath?: string) => {
+const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog: new (logTarget?: string | { directory: string; basename: string }) => {
     append: (entry: {
         turn: number;
         maxTurns: number;
@@ -57,9 +58,29 @@ const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog
         parseError?: string | undefined;
     }) => void;
 } };
-const { getAgentResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { resolveJsonlLogPath } = require("./dailyLog") as {
+    resolveJsonlLogPath: (target: string | { directory: string; basename: string }, date?: Date) => string;
+};
+const { buildCompactedAgentMessages } = require("./agentCompaction") as {
+    buildCompactedAgentMessages: (
+        systemContent: string,
+        originalRequest: string,
+        state: {
+            segment: number;
+            maxSegments: number;
+            writtenPaths: string[];
+            validationFailures: string[];
+            unresolvedVerificationFailure?: string;
+            sourceUrls: string[];
+            recentEvents: string[];
+        }
+    ) => Array<{ role: "system" | "user"; content: string }>;
+};
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+    buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
-    getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string) => Record<string, unknown>;
+    getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string) => Record<string, unknown>;
+    getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string, requiresWrite?: boolean) => Record<string, unknown>;
 };
 const { StatusBar } = require("./statusBar") as { StatusBar: new (getState: () => {
     model: string;
@@ -77,11 +98,13 @@ const { formatSessionHistory } = require("./sessionHistory") as {
     formatSessionHistory: (messages: Array<{ role: "user" | "assistant"; content: string }>, maxMessages?: number) => string;
 };
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
-const { classifyWorkflow, workflowInstructions } = require("./workflowRouter") as {
-    classifyWorkflow: (message: string) => { kind: WorkflowKind; reason: string };
+const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, workflowInstructions } = require("./workflowRouter") as {
+    classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: WorkflowKind; reason: string };
+    requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     workflowInstructions: (kind: WorkflowKind) => string;
 };
-const { selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
+const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
+    isContinuationRequest: (message: string) => boolean;
     selectTaskContext: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, workflow: WorkflowKind, maxMessages?: number) => Array<{ role: "user" | "assistant"; content: string }>;
     summarizeTaskContext: (messages: Array<{ role: "user" | "assistant"; content: string }>) => string;
 };
@@ -124,12 +147,15 @@ const { AgentTool } = require("./tools/agentTool") as { AgentTool: new () => {
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
+    prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string };
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     formatObservation: (action: unknown, result: { ok: boolean; output: string }) => string;
     close: () => Promise<void>;
 } };
-const { SessionTool } = require("./session") as { SessionTool: new () => {
-    selectSession: (rl: readline.Interface) => Promise<{ id: string; title: string }>;
+const { SessionTool } = require("./session") as { SessionTool: new (storagePath?: string) => {
+    selectSession: (rl: readline.Interface, workspace: string) => Promise<{ id: string; title: string; workspace?: string }>;
+    resumeSession: (sessionId: string) => { id: string; title: string; workspace?: string } | undefined;
+    setWorkspace: (sessionId: string, workspace: string) => boolean;
     getContextMessages: (sessionId: string, maxMessages?: number, afterTimestamp?: number) => Array<{ role: "user" | "assistant"; content: string; timestamp: number }>;
     appendExchange: (sessionId: string, userMessage: string, assistantMessage: string) => void;
     recordUsage: (sessionId: string, usage: ApiUsage) => void;
@@ -140,6 +166,7 @@ const { SessionTool } = require("./session") as { SessionTool: new () => {
 type ChatSession = {
     id: string;
     title: string;
+    workspace?: string;
 };
 
 type SessionMessage = {
@@ -189,7 +216,7 @@ type CliSettings = {
     device?: string;
     debug?: boolean;
     historyMessages?: number;
-    agent?: { maxTurns?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number };
+    agent?: { maxTurns?: number; maxSegments?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number };
     sampling?: Partial<Record<"chat" | "planner" | "action", Partial<SamplingSettings>>>;
 };
 
@@ -228,8 +255,16 @@ function initializeWorkspaceFromArgs(): string {
     return resolvedWorkspace;
 }
 
+function getArgumentValue(...names: string[]): string | undefined {
+    const args = process.argv.slice(2);
+    const index = args.findIndex((item) => names.includes(item));
+    return index >= 0 ? args[index + 1] : undefined;
+}
+
 const cliSettings = loadCliSettings();
 let activeWorkspace = initializeWorkspaceFromArgs();
+const workspaceWasExplicitlyRequested = getArgumentValue("--workspace", "--cwd") !== undefined;
+const requestedSessionId = getArgumentValue("--session");
 const promptLabel = "You: ";
 const maxVisibleSlashSuggestions = 5;
 const slashCommandOptions: SlashCommandOption[] = [
@@ -315,7 +350,10 @@ let debugEnabled = process.env.CLI_DEBUG
     ? /^(1|true|on|yes)$/i.test(process.env.CLI_DEBUG.trim())
     : cliSettings.debug === true;
 
-const sessionTool = new SessionTool();
+// Sessions belong to the CLI installation, not to whichever workspace the
+// agent is currently inspecting. This also keeps --workspace startup and the
+// interactive /workspace command consistent.
+const sessionTool = new SessionTool(path.resolve(appRoot, ".cli-sessions.json"));
 const imageTool = new ImageTool();
 const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
@@ -591,6 +629,7 @@ function clearSlashSuggestionsBelow(): void {
     // the first panel line, so clearing from cursor to end of screen removes it.
     if (renderedSlashSuggestionCount > 0 && process.stdout.isTTY) {
         readline.clearScreenDown(process.stdout);
+        statusBar.render();
     }
 
     slashMenuVisible = false;
@@ -663,6 +702,49 @@ function changeWorkspace(workspace: string): string {
     process.chdir(resolvedWorkspace);
     activeWorkspace = resolvedWorkspace;
     return activeWorkspace;
+}
+
+function promptText(question: string): Promise<string> {
+    return new Promise((resolve) => rl.question(question, (answer) => resolve(answer.trim())));
+}
+
+async function restoreSessionWorkspace(activeSession: ChatSession): Promise<void> {
+    if (workspaceWasExplicitlyRequested) {
+        sessionTool.setWorkspace(activeSession.id, activeWorkspace);
+        activeSession.workspace = activeWorkspace;
+        console.log(`Session workspace overridden and saved: ${activeWorkspace}`);
+        return;
+    }
+
+    if (activeSession.workspace) {
+        try {
+            const restored = changeWorkspace(activeSession.workspace);
+            console.log(`Restored session workspace: ${restored}`);
+            return;
+        } catch {
+            console.log(`Saved session workspace is unavailable: ${activeSession.workspace}`);
+        }
+    } else {
+        console.log("This legacy session has no saved workspace.");
+    }
+
+    while (true) {
+        const rawWorkspace = await promptText(`Workspace path (Enter to use ${activeWorkspace}, or /exit): `);
+        if (/^\/?exit$/i.test(rawWorkspace)) {
+            throw new Error("Workspace selection cancelled.");
+        }
+
+        try {
+            const restored = changeWorkspace(rawWorkspace || activeWorkspace);
+            sessionTool.setWorkspace(activeSession.id, restored);
+            activeSession.workspace = restored;
+            console.log(`Session workspace saved: ${restored}`);
+            return;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.log(`Workspace error: ${message}`);
+        }
+    }
 }
 
 function parseModeCommand(input: string): RunMode | "show" | undefined {
@@ -931,10 +1013,14 @@ async function runAgentLoop(
     signal: AbortSignal
 ): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace> }> {
     const guard = new AgentGuard(agentGuardSettings);
-    const maxTurns = guard.settings.maxTurns;
-    const workflow = classifyWorkflow(userMessage);
+    const maxTurnsPerSegment = guard.settings.maxTurns;
+    const maxSegments = agentGuardSettings.maxSegments;
+    const maxTurns = maxTurnsPerSegment * maxSegments;
+    const continuation = isContinuationRequest(userMessage);
+    const workflow = classifyWorkflowWithHistory(userMessage, historyForModel, continuation);
+    const mustWrite = requiresWorkspaceWriteWithHistory(userMessage, historyForModel, continuation);
     const agentResponseFormat = getAgentResponseFormat(workflow.kind);
-    const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage);
+    const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage, mustWrite);
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
     const contextSummary = summarizeTaskContext(relevantHistory);
     const writeValidator = new WriteValidator(activeWorkspace);
@@ -943,42 +1029,62 @@ async function runAgentLoop(
     const skillPrompt = skillLoader.formatPrompt(selectedSkills);
     const readPaths = new Set<string>();
     const validationFailures = new Set<string>();
+    let unresolvedVerificationFailure: string | undefined;
     const writtenPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
     const sourceUrls = new Set<string>();
-    const trace = new AgentTrace(path.resolve(appRoot, ".cli", "logs", "agent-trace.jsonl"));
-    const responseLog = new AgentResponseLog(path.resolve(appRoot, ".cli", "logs", "agent-model-responses.jsonl"));
-    const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-        {
-            role: "system",
-            content: await agentTool.buildSystemPrompt([
-                workflowInstructions(workflow.kind),
-                `Router decision: ${workflow.reason}`,
-                skillPrompt
-            ].filter(Boolean).join("\n\n"))
-        },
-        ...(contextSummary ? [{ role: "system" as const, content: `Relevant context from this session:\n${contextSummary}` }] : []),
-        {
-            role: "user",
-            content: userMessage
-        }
-    ];
+    const logDirectory = path.resolve(appRoot, ".cli", "logs");
+    const traceTarget = { directory: logDirectory, basename: "agent-trace" };
+    const responseTarget = { directory: logDirectory, basename: "agent-model-responses" };
+    const trace = new AgentTrace(traceTarget);
+    const responseLog = new AgentResponseLog(responseTarget);
+    const responseLogDisplayPath = path.relative(appRoot, resolveJsonlLogPath(responseTarget));
+    const systemPrompt = await agentTool.buildSystemPrompt([
+        workflowInstructions(workflow.kind),
+        `Router decision: ${workflow.reason}`,
+        skillPrompt
+    ].filter(Boolean).join("\n\n"));
+    let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
+    let recoveryResponseFormat: Record<string, unknown> | undefined;
+    let segmentEvents: string[] = [];
 
     if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
-        const budgetError = guard.checkBudget(turn);
+        const segmentTurn = (turn - 1) % maxTurnsPerSegment + 1;
+        const segment = Math.floor((turn - 1) / maxTurnsPerSegment) + 1;
+        if (segmentTurn === 1 && segment > 1) {
+            messages = buildCompactedAgentMessages(systemPrompt, userMessage, {
+                segment,
+                maxSegments,
+                writtenPaths: Array.from(writtenPaths),
+                validationFailures: Array.from(validationFailures),
+                ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {}),
+                sourceUrls: Array.from(sourceUrls),
+                recentEvents: segmentEvents
+            });
+            segmentEvents = [];
+            readPaths.clear();
+            recoveryResponseFormat = undefined;
+            guard.resetActionHistory();
+            spinner.log(`Compacted agent context; continuing segment ${segment}/${maxSegments}.`);
+            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${segment}/${maxSegments}` });
+            trace.save();
+        }
+        const budgetError = guard.checkBudget(segmentTurn);
         if (budgetError) {
             const answer = `Agent stopped safely because its ${budgetError}. Review the trace or continue with a narrower request.`;
             trace.add({ turn, status: "error", action: "budget_stop", observation: answer });
             trace.save();
             return { answer, trace };
         }
-        const requestFormat = turn === 1 ? initialAgentResponseFormat : agentResponseFormat;
+        const requestFormat = recoveryResponseFormat
+            ?? (turn === 1 ? initialAgentResponseFormat : agentResponseFormat);
+        recoveryResponseFormat = undefined;
         spinner.update(turn === 1
-            ? `Planning next action (${turn}/${maxTurns}, ${guard.formatRemaining()})...`
-            : `Reviewing results (${turn}/${maxTurns}, ${guard.formatRemaining()})...`);
+            ? `Planning next action (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`
+            : `Reviewing results (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`);
 
         const response = await llamaClient.post({
             model,
@@ -1002,6 +1108,8 @@ async function runAgentLoop(
             path?: string;
             query?: string;
             content?: string;
+            old_text?: string;
+            new_text?: string;
             command?: string;
             server?: string;
             arguments?: Record<string, unknown>;
@@ -1020,11 +1128,14 @@ async function runAgentLoop(
 
         messages.push({
             role: "assistant",
-            content: assistantContent
+            content: !action && choice.finish_reason === "length"
+                ? "[Truncated model response omitted; use a smaller action.]"
+                : assistantContent
         });
 
         if (!action) {
-            spinner.log(`[${turn}/${maxTurns}] Invalid model action (${parseError}); logged to .cli/logs/agent-model-responses.jsonl`);
+            segmentEvents.push(`Turn ${segmentTurn}: invalid model action (${parseError ?? "unknown parse error"})`);
+            spinner.log(`[${turn}/${maxTurns}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
             trace.add({
                 turn,
                 status: "parse_error",
@@ -1032,20 +1143,41 @@ async function runAgentLoop(
                 observation: assistantContent.slice(0, 1000)
             });
             trace.save();
-            messages.push({
-                role: "user",
-                content: "Your last response was not one supported action object. Return exactly one valid JSON object using an action from Available actions."
-            });
+            if (choice.finish_reason === "length") {
+                recoveryResponseFormat = getAgentRecoveryResponseFormat(workflow.kind, "write_file");
+                messages.push({
+                    role: "user",
+                    content: "Your response reached the completion limit and was cut off. Do not resend the full file. For an existing file, use edit_file with a small exact old_text/new_text replacement. Read the file again first if needed."
+                });
+            } else {
+                messages.push({
+                    role: "user",
+                    content: "Your last response was not one supported action object. Return exactly one valid JSON object using an action from Available actions."
+                });
+            }
             continue;
         }
 
         // The loop ends only when the model explicitly returns final. Until
         // then each action becomes an observation for the next reasoning step.
         if (action.action === "final") {
+            if (mustWrite && writtenPaths.size === 0) {
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: this request requires a successful file write`);
+                messages.push({ role: "user", content: "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final." });
+                continue;
+            }
             if (validationFailures.size > 0) {
                 const failed = Array.from(validationFailures).join(", ");
                 spinner.log(`[${turn}/${maxTurns}] Final blocked: validation still failing for ${failed}`);
                 messages.push({ role: "user", content: `You cannot return final yet. Validation is failing for: ${failed}. Inspect the error, fix the file, and validate again.` });
+                continue;
+            }
+            if (unresolvedVerificationFailure) {
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: the latest verification command failed`);
+                messages.push({
+                    role: "user",
+                    content: `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Use read_file or search_files to verify the changed file, or run an OS-compatible verification command. Do not assume a localhost server exists.`
+                });
                 continue;
             }
             if (workflow.kind === "web_research" && sourceUrls.size < 2) {
@@ -1069,12 +1201,13 @@ async function runAgentLoop(
             return { answer: finalAnswer, trace };
         }
 
-        if (action.action === "write_file" && action.path && writeValidator.exists(action.path) && !readPaths.has(path.resolve(activeWorkspace, action.path).toLowerCase())) {
+        if ((action.action === "write_file" || action.action === "edit_file") && action.path
+            && writeValidator.exists(action.path) && !readPaths.has(path.resolve(activeWorkspace, action.path).toLowerCase())) {
             const output = `Blocked write: read the existing file first (${action.path}).`;
             spinner.log(`[${turn}/${maxTurns}] ${output}`);
             trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
             trace.save();
-            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: "write_file", status: "error", output })}` });
+            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
             continue;
         }
 
@@ -1083,7 +1216,14 @@ async function runAgentLoop(
             spinner.log(`[${turn}/${maxTurns}] ${guardDecision.message}`);
             trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: guardDecision.message });
             trace.save();
-            messages.push({ role: "user", content: `Observation: ${guardDecision.message} Do not repeat the same action and arguments.` });
+            recoveryResponseFormat = getAgentRecoveryResponseFormat(workflow.kind, action.action ?? "unknown");
+            const completedWrites = writtenPaths.size > 0
+                ? ` Successful writes so far: ${Array.from(writtenPaths).join(", ")}.`
+                : "";
+            messages.push({
+                role: "user",
+                content: `Observation: ${guardDecision.message} The repeated ${action.action} action is unavailable for your next response; use the observation already in context.${completedWrites} Choose a different action that makes progress, or return final if the request is complete.`
+            });
             continue;
         }
         if (guardDecision.status === "stop") {
@@ -1098,13 +1238,21 @@ async function runAgentLoop(
             spinner.log(checkpoint.preview);
             spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
         }
-        spinner.log(agentTool.formatActionStatus(action, turn, maxTurns));
+        if (action.action === "edit_file" && action.path && typeof action.old_text === "string" && typeof action.new_text === "string") {
+            const prepared = agentTool.prepareEdit(action.path, action.old_text, action.new_text);
+            if (prepared.ok && prepared.content !== undefined) {
+                const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, prepared.content);
+                spinner.log(checkpoint.preview);
+                spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+            }
+        }
+        spinner.log(agentTool.formatActionStatus(action, segmentTurn, maxTurnsPerSegment));
         spinner.update(`Executing ${action.action}...`);
         let result = await agentTool.execute(action);
         if (action.action === "read_file" && result.ok && action.path) {
             readPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
         }
-        if (action.action === "write_file" && result.ok && action.path) {
+        if ((action.action === "write_file" || action.action === "edit_file") && result.ok && action.path) {
             const validation = writeValidator.validate(action.path);
             result = {
                 ok: validation.ok,
@@ -1120,6 +1268,12 @@ async function runAgentLoop(
         }
         if (action.action === "mcp_list_tools" && result.ok) successfulMcpDiscovery = true;
         if (action.action === "mcp_call_tool" && result.ok) successfulMcpCall = true;
+        if (action.action === "run_command" && !result.ok) {
+            unresolvedVerificationFailure = result.output.slice(0, 500);
+        } else if (unresolvedVerificationFailure && result.ok
+            && (action.action === "read_file" || action.action === "search_files" || action.action === "run_command")) {
+            unresolvedVerificationFailure = undefined;
+        }
         spinner.update(result.ok
             ? `Completed ${action.action}; reviewing result...`
             : `${action.action} failed; planning recovery...`);
@@ -1132,6 +1286,8 @@ async function runAgentLoop(
             observation: result.output
         });
         trace.save();
+        const eventTarget = action.path || action.command || action.tool || "";
+        segmentEvents.push(`${action.action} [${result.ok ? "ok" : "error"}]${eventTarget ? ` ${eventTarget}` : ""}: ${result.output.replace(/\s+/g, " ").slice(0, 240)}`);
         if (action.action === "mcp_call_tool" && action.tool?.toLowerCase().includes("search") && result.ok) {
             const urls = result.output.match(/https?:\/\/[^"\\\s]+/g) || [];
             urls.forEach((sourceUrl) => sourceUrls.add(sourceUrl));
@@ -1243,7 +1399,6 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
     rl.question("You: ", async (message: string) => {
         const trimmed = message.trim();
         clearSlashSuggestionsBelow();
-        statusBar.suspend();
         const modeCommand = parseModeCommand(trimmed);
         const modelCommand = parseModelCommand(trimmed);
         const workspaceCommand = parseWorkspaceCommand(trimmed);
@@ -1346,6 +1501,8 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             try {
                 await agentTool.close();
                 const nextWorkspace = changeWorkspace(workspaceCommand.workspace);
+                sessionTool.setWorkspace(activeSession.id, nextWorkspace);
+                activeSession.workspace = nextWorkspace;
                 statusBar.render();
                 console.log(`Workspace switched to: ${nextWorkspace}`);
             } catch (error) {
@@ -1723,7 +1880,13 @@ async function start(): Promise<void> {
     console.log("Tip: type / to see inline command suggestions");
     console.log();
 
-    const activeSession = await sessionTool.selectSession(rl);
+    const activeSession = requestedSessionId
+        ? sessionTool.resumeSession(requestedSessionId)
+        : await sessionTool.selectSession(rl, activeWorkspace);
+    if (!activeSession) {
+        throw new Error(`Session not found: ${requestedSessionId}`);
+    }
+    await restoreSessionWorkspace(activeSession);
     console.log(`Session: ${activeSession.title}`);
     console.log(formatSessionHistory(
         sessionTool.getContextMessages(activeSession.id, historyMessageLimit),

@@ -68,3 +68,45 @@ function Get-LlamaRuntimeProfile {
     if ($batchSize -lt 1 -or $uBatchSize -lt 1 -or $uBatchSize -gt $batchSize) { throw "Invalid runtime batch profile: batch=$batchSize ubatch=$uBatchSize" }
     return [pscustomobject]@{ Backend = $backend; Device = $Device; BatchSize = $batchSize; UBatchSize = $uBatchSize }
 }
+
+function Get-LlamaSpeculativeProfile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerExecutable,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ModelPath
+    )
+
+    $modelName = [IO.Path]::GetFileName($ModelPath)
+    $isMtpModel = $modelName -match '(?i)(?:^|[-_.])MTP(?:[-_.]|$)'
+    $mtpDisabled = $env:LLAMA_MTP -match '^(?i:0|false|off|no)$'
+    if (-not $isMtpModel) {
+        return [pscustomobject]@{ Enabled = $false; Arguments = @(); Description = "off (normal model)" }
+    }
+    if ($mtpDisabled) {
+        return [pscustomobject]@{ Enabled = $false; Arguments = @(); Description = "off (LLAMA_MTP override)" }
+    }
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        $helpText = (@(& $ServerExecutable --help 2>&1) | ForEach-Object { $_.ToString() }) -join "`n"
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    if ($helpText -notmatch '(?m)--spec-type[^\r\n]*draft-mtp') {
+        return [pscustomobject]@{
+            Enabled = $false
+            Arguments = @()
+            Description = "off (MTP model detected, but this llama.cpp build does not support draft-mtp)"
+        }
+    }
+
+    return [pscustomobject]@{
+        Enabled = $true
+        Arguments = @("--spec-type", "draft-mtp", "--spec-draft-n-max", "6")
+        Description = "draft-mtp (auto, draft max 6)"
+    }
+}

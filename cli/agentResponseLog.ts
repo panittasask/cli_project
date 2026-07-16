@@ -1,5 +1,8 @@
 import fs = require("node:fs");
 import path = require("node:path");
+const { resolveJsonlLogPath } = require("./dailyLog") as {
+    resolveJsonlLogPath: (target: string | { directory: string; basename: string }, date?: Date) => string;
+};
 
 type AgentResponseLogEntry = {
     turn: number;
@@ -16,14 +19,19 @@ class AgentResponseLog {
     private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
     constructor(
-        private readonly logPath = path.resolve(process.cwd(), ".cli", "logs", "agent-model-responses.jsonl")
+        private readonly logTarget: string | { directory: string; basename: string } = {
+            directory: path.resolve(process.cwd(), ".cli", "logs"),
+            basename: "agent-model-responses"
+        }
     ) {}
 
     append(entry: AgentResponseLogEntry): void {
-        fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
-        fs.appendFileSync(this.logPath, `${JSON.stringify({
+        const now = new Date();
+        const logPath = resolveJsonlLogPath(this.logTarget, now);
+        fs.mkdirSync(path.dirname(logPath), { recursive: true });
+        fs.appendFileSync(logPath, `${JSON.stringify({
             taskId: this.taskId,
-            timestamp: new Date().toISOString(),
+            timestamp: now.toISOString(),
             accepted: Boolean(entry.parsedAction),
             ...entry,
             rawContent: entry.rawContent ?? null,
