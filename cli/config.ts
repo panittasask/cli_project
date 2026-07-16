@@ -55,7 +55,7 @@ const defaults: Record<SamplingKind, SamplingSettings> = {
         top_p: 0.9,
         top_k: 20,
         repeat_penalty: 1.05,
-        max_tokens: 4096
+        max_tokens: 2048
     }
 };
 
@@ -97,9 +97,9 @@ function getAgentGuardSettings(settings: CliSettings): { maxTurns: number; maxSe
     const configured = settings.agent ?? {};
     return {
         maxTurns: Math.max(1, Math.floor(readNumber("CLI_AGENT_MAX_TURNS", configured.maxTurns ?? 12))),
-        maxSegments: Math.max(1, Math.floor(readNumber("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments ?? 3))),
-        maxDurationMs: Math.max(10_000, readNumber("CLI_AGENT_MAX_MINUTES", configured.maxDurationMinutes ?? 10) * 60_000),
-        maxCompletionTokens: Math.max(256, Math.floor(readNumber("CLI_AGENT_MAX_COMPLETION_TOKENS", configured.maxCompletionTokens ?? 16000))),
+        maxSegments: Math.max(1, Math.floor(readNumber("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments ?? 1))),
+        maxDurationMs: Math.max(10_000, readNumber("CLI_AGENT_MAX_MINUTES", configured.maxDurationMinutes ?? 8) * 60_000),
+        maxCompletionTokens: Math.max(256, Math.floor(readNumber("CLI_AGENT_MAX_COMPLETION_TOKENS", configured.maxCompletionTokens ?? 8000))),
         repeatLimit: Math.max(2, Math.floor(readNumber("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit ?? 2)))
     };
 }

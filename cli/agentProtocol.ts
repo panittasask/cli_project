@@ -34,7 +34,7 @@ const variants: Record<string, Record<string, unknown>> = {
     },
     run_command: {
         type: "object",
-        properties: { action: { const: "run_command" }, command: stringProperty, reason: stringProperty },
+        properties: { action: { const: "run_command" }, command: stringProperty, workdir: stringProperty, reason: stringProperty },
         required: ["action", "command", "reason"], additionalProperties: false
     },
     mcp_list_tools: {

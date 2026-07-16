@@ -42,9 +42,18 @@
   อย่างน้อย 2 URL และ `open_web_page` ที่ป้องกัน private-network SSRF
 - หัวข้อ 9 เสร็จแล้ว: `npm test` ครอบคลุม agent, context/router, validator,
   web relevance, MCP discovery/tool call และ TypeScript typecheck
-- โมเดลแนะนำปัจจุบัน: `Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf`
-  เพราะ direct baseline ไม่แต่งคำตอบ Meme 67 และ agent protocol เลือก `read_file`
-  ถูกต้องคงที่ 5/5
+- ผล baseline เดิมเลือก `Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf`
+  สำหรับคำถามทั่วไป แต่ผล trace งาน Go/Swagger วันที่ 2026-07-16 พบลูปยาวและ
+  แก้ compilation error ซ้ำ จึงเปลี่ยนค่าเริ่มต้นงาน agent เป็น
+  `qwen2.5-coder-14b-instruct-q4_k_m.gguf` ตั้งแต่ 2026-07-17
+- เพิ่ม deterministic completion profile สำหรับ Go API, React และ Swagger หลัง
+  trace พบว่าโมเดลรายงาน basic scaffold ว่าเสร็จ: workspace ว่างมี observation
+  ชัดเจน, full-stack ต้องมี artifacts/integration และผ่าน Go/Node checks แยกกัน,
+  Swagger creation ต้องผ่าน runtime probe และ blocked final ถูกบันทึกลง trace
+- ขยาย profile รองรับการเปลี่ยน React/Angular โดยสืบทอด backend เดิมและตรวจ
+  framework เก่าที่ต้องลบ; เพิ่ม timeout install/scaffold เป็น 180 วินาทีหลังพบ
+  `npm install`/`ng new` สร้างไฟล์สำเร็จแต่ parent ถูกตัดที่ 30 วินาที และปิดทาง
+  `final_after_tool_limit` ไม่ให้ข้าม completion gates
 
 ## ลำดับงานพรุ่งนี้
 

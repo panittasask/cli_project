@@ -74,6 +74,50 @@ const { AgentResponseLog } = require("../cli/agentResponseLog") as {
         append: (entry: Record<string, unknown>) => void;
     };
 };
+const {
+    answerDefersRequiredWork,
+    evaluateProjectCompletion,
+    formatIncompleteTaskAnswer,
+    formatProjectCompletionPrompt,
+    inferProjectCompletionRequirement,
+    inferProjectCompletionRequirementWithHistory,
+    projectChecksAffectedByPath,
+    projectChecksForCommand
+} = require("../cli/projectCompletion") as {
+    answerDefersRequiredWork: (answer: string) => boolean;
+    evaluateProjectCompletion: (workspace: string, requirement: Record<string, unknown>) => string[];
+    formatIncompleteTaskAnswer: (reasons: string[], writtenPaths: string[]) => string;
+    formatProjectCompletionPrompt: (requirement: Record<string, unknown>) => string;
+    inferProjectCompletionRequirement: (message: string) => ({
+        label: string;
+        requireGoModule: boolean;
+        requireGoJsonApi: boolean;
+        requireReactApp: boolean;
+        requireAngularApp: boolean;
+        forbidReactArtifacts: boolean;
+        forbidAngularArtifacts: boolean;
+        requireFrontendApiCall: boolean;
+        requireSwagger: boolean;
+        requiredChecks: string[];
+    } | undefined);
+    inferProjectCompletionRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => ({
+        label: string;
+        requireGoModule: boolean;
+        requireReactApp: boolean;
+        requireAngularApp: boolean;
+        forbidReactArtifacts: boolean;
+        forbidAngularArtifacts: boolean;
+        requireFrontendApiCall: boolean;
+        requiredChecks: string[];
+    } | undefined);
+    projectChecksAffectedByPath: (filePath: string) => string[];
+    projectChecksForCommand: (command: string) => string[];
+};
+const { commandCreatesWorkspaceFiles, commandTimeoutMs, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
+    commandCreatesWorkspaceFiles: (command: string) => boolean;
+    commandTimeoutMs: (command: string) => number;
+    resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
+};
 
 async function main(): Promise<void> {
     const startScript = fs.readFileSync(path.resolve(__dirname, "start.ps1"), "utf8");
@@ -115,6 +159,15 @@ async function main(): Promise<void> {
     ], true), true);
     assert.equal(requiresWorkspaceWrite("file ถูกสร้างไว้ที่ไหน"), false);
     assert.equal(verificationRequirement(swaggerUntilWorking), "runtime");
+    const fullStackPrompt = "create a golang restfull api with react website show dashboard about employee";
+    assert.equal(classifyWorkflow(fullStackPrompt).kind, "coding");
+    assert.equal(requiresWorkspaceWrite(fullStackPrompt), true);
+    assert.equal(verificationRequirement(fullStackPrompt), "command");
+    assert.equal(verificationRequirement("create a Go API with Swagger UI"), "runtime");
+    const angularSwitchPrompt = "เปลี่ยนเป็นไปใช้ angular แทนได้ไหมถ้างั้น ลบ react ทิ้งไปก่อนแล้วสร้าง dashboard โดยใช้ angular แทน";
+    assert.equal(classifyWorkflow(angularSwitchPrompt).kind, "coding");
+    assert.equal(requiresWorkspaceWrite(angularSwitchPrompt), true);
+    assert.equal(verificationRequirement(angularSwitchPrompt), "command");
     assert.equal(verificationRequirement("แก้ TypeScript จนกว่า npm test จะผ่าน"), "command");
     assert.equal(verificationRequirement("อธิบายว่า Swagger คืออะไร"), "none");
     assert.equal(verificationRequirementWithHistory("ทำงานต่อให้เสร็จ", [
@@ -125,6 +178,70 @@ async function main(): Promise<void> {
     assert.equal(commandSatisfiesVerification("Invoke-WebRequest http://localhost:3000/swagger", "runtime"), true);
     assert.equal(commandSatisfiesVerification("npm test", "command"), true);
     assert.match(workflowInstructions("web_research"), /Never use search_files/);
+    const fullStackRequirement = inferProjectCompletionRequirement(fullStackPrompt);
+    assert.ok(fullStackRequirement);
+    assert.equal(fullStackRequirement.label, "Go API + React app");
+    assert.deepEqual(fullStackRequirement.requiredChecks, ["go", "node"]);
+    assert.equal(fullStackRequirement.requireFrontendApiCall, true);
+    assert.ok(inferProjectCompletionRequirement("สร้าง go lang rest full api และ react web ui ให้เชื่อมต่อกัน"));
+    assert.match(formatProjectCompletionPrompt(fullStackRequirement), /frontend API call/);
+    assert.equal(answerDefersRequiredWork("I created a basic scaffold. You can expand it with additional functionality."), true);
+    assert.equal(answerDefersRequiredWork("Implemented the employee dashboard and both builds pass."), false);
+    assert.deepEqual(projectChecksForCommand("go test ./...; npm run build"), ["go", "node"]);
+    assert.deepEqual(projectChecksForCommand("ng build"), ["node"]);
+    assert.deepEqual(projectChecksAffectedByPath("api/main.go"), ["go"]);
+    assert.deepEqual(projectChecksAffectedByPath("frontend/src/App.jsx"), ["node"]);
+    assert.ok(inferProjectCompletionRequirementWithHistory("ทำงานต่อให้เสร็จ", [
+        { role: "user", content: fullStackPrompt },
+        { role: "assistant", content: "ยังไม่เสร็จ" }
+    ], true));
+    assert.equal(isContinuationRequest(angularSwitchPrompt), true);
+    const angularSwitchRequirement = inferProjectCompletionRequirementWithHistory(angularSwitchPrompt, [
+        { role: "user", content: fullStackPrompt },
+        { role: "assistant", content: "React ยังติดตั้งไม่เสร็จ" }
+    ], true);
+    assert.ok(angularSwitchRequirement);
+    assert.equal(angularSwitchRequirement.label, "Go API + Angular app");
+    assert.equal(angularSwitchRequirement.requireGoModule, true);
+    assert.equal(angularSwitchRequirement.requireReactApp, false);
+    assert.equal(angularSwitchRequirement.requireAngularApp, true);
+    assert.equal(angularSwitchRequirement.forbidReactArtifacts, true);
+    assert.equal(angularSwitchRequirement.requireFrontendApiCall, true);
+    assert.deepEqual(angularSwitchRequirement.requiredChecks, ["go", "node"]);
+    const continuedAngularRequirement = inferProjectCompletionRequirementWithHistory("ทำงานต่อให้เสร็จ", [
+        { role: "user", content: fullStackPrompt },
+        { role: "assistant", content: "React ติดตั้งไม่สำเร็จ" },
+        { role: "user", content: angularSwitchPrompt },
+        { role: "assistant", content: "Angular CLI timeout" }
+    ], true);
+    assert.ok(continuedAngularRequirement);
+    assert.equal(continuedAngularRequirement.label, "Go API + Angular app");
+    assert.equal(continuedAngularRequirement.forbidReactArtifacts, true);
+    assert.equal(commandTimeoutMs("npm install"), 180_000);
+    assert.equal(commandTimeoutMs("npx @angular/cli new dashboard --routing=true"), 180_000);
+    assert.equal(commandTimeoutMs("go build ./..."), 30_000);
+    assert.equal(commandCreatesWorkspaceFiles("npx @angular/cli new dashboard --routing=true"), true);
+    assert.equal(commandCreatesWorkspaceFiles("npm run build"), false);
+    const nestedAngularWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-angular-workdir-"));
+    try {
+        fs.mkdirSync(path.join(nestedAngularWorkspace, "dashboard"));
+        fs.writeFileSync(path.join(nestedAngularWorkspace, "dashboard", "angular.json"), "{}", "utf8");
+        assert.deepEqual(resolveCommandWorkdir(nestedAngularWorkspace, "ng build --configuration production"), {
+            workdir: "dashboard",
+            autoSelected: true
+        });
+        assert.deepEqual(resolveCommandWorkdir(nestedAngularWorkspace, "go build ./..."), {
+            workdir: ".",
+            autoSelected: false
+        });
+        assert.deepEqual(resolveCommandWorkdir(nestedAngularWorkspace, "ng build", "custom"), {
+            workdir: "custom",
+            autoSelected: false
+        });
+    } finally {
+        fs.rmSync(nestedAngularWorkspace, { recursive: true, force: true });
+    }
+    assert.match(formatIncompleteTaskAnswer(["node check not passed"], ["main.go"]), /ก่อนงานเสร็จ/);
     const webActions = getAgentResponseFormat("web_research").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(webActions.includes("mcp_call_tool"));
     assert.ok(webActions.includes("read_file"));
@@ -174,6 +291,22 @@ async function main(): Promise<void> {
     assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "verify again" }).status, "replan");
     progressGuard.resetActionHistory();
     assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "new segment" }).status, "allow");
+    const semanticGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
+    assert.equal(semanticGuard.registerAction({
+        action: "run_command",
+        command: "powershell.exe -NoLogo -NoProfile -Command \"go test ./...\"",
+        workdir: "go"
+    }).status, "allow");
+    assert.equal(semanticGuard.registerAction({ action: "read_file", path: "go/go.mod" }).status, "allow");
+    assert.equal(semanticGuard.registerAction({
+        action: "run_command",
+        command: "go   test   ./...",
+        workdir: ".\\go"
+    }).status, "replan");
+    const repeatedWriteGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
+    const repeatedWrite = { action: "write_file", path: "same.txt", content: "same" };
+    assert.equal(repeatedWriteGuard.registerAction(repeatedWrite).status, "allow");
+    assert.equal(repeatedWriteGuard.registerAction(repeatedWrite).status, "replan");
     const compacted = buildCompactedAgentMessages("system", "แก้ login.html", {
         segment: 2,
         maxSegments: 3,
@@ -271,6 +404,47 @@ async function main(): Promise<void> {
         assert.match(loader.formatPrompt(skills), /Always run the release validator/);
     } finally {
         fs.rmSync(temp, { recursive: true, force: true });
+    }
+
+    const completionWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-project-completion-"));
+    try {
+        const requirement = inferProjectCompletionRequirement(fullStackPrompt);
+        assert.ok(requirement);
+        assert.ok(evaluateProjectCompletion(completionWorkspace, requirement).includes("Go module manifest (go.mod)"));
+
+        fs.mkdirSync(path.join(completionWorkspace, "api"), { recursive: true });
+        fs.mkdirSync(path.join(completionWorkspace, "frontend", "src"), { recursive: true });
+        fs.writeFileSync(path.join(completionWorkspace, "api", "go.mod"), "module employee-api\n\ngo 1.23\n", "utf8");
+        fs.writeFileSync(path.join(completionWorkspace, "api", "main.go"), [
+            "package main",
+            "import (\"encoding/json\"; \"net/http\")",
+            "func main() { http.HandleFunc(\"/employees\", func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode([]string{}) }); http.ListenAndServe(\":8080\", nil) }"
+        ].join("\n"), "utf8");
+        fs.writeFileSync(path.join(completionWorkspace, "frontend", "package.json"), JSON.stringify({
+            scripts: { build: "vite build" },
+            dependencies: { react: "latest" },
+            devDependencies: { vite: "latest" }
+        }), "utf8");
+        fs.writeFileSync(path.join(completionWorkspace, "frontend", "src", "App.jsx"), "export function App(){ fetch('/employees'); return <main>Employees</main> }", "utf8");
+        assert.deepEqual(evaluateProjectCompletion(completionWorkspace, requirement), []);
+
+        fs.rmSync(path.join(completionWorkspace, "frontend"), { recursive: true, force: true });
+
+        fs.mkdirSync(path.join(completionWorkspace, "dashboard", "src", "app"), { recursive: true });
+        fs.writeFileSync(path.join(completionWorkspace, "dashboard", "package.json"), JSON.stringify({
+            scripts: { build: "ng build" },
+            dependencies: { "@angular/core": "latest", "@angular/common": "latest" },
+            devDependencies: { "@angular/cli": "latest" }
+        }), "utf8");
+        fs.writeFileSync(path.join(completionWorkspace, "dashboard", "angular.json"), "{}", "utf8");
+        fs.writeFileSync(
+            path.join(completionWorkspace, "dashboard", "src", "app", "app.ts"),
+            "import { HttpClient } from '@angular/common/http'; export class App { constructor(http: HttpClient) { http.get('/api/employees').subscribe(); } }",
+            "utf8"
+        );
+        assert.deepEqual(evaluateProjectCompletion(completionWorkspace, angularSwitchRequirement), []);
+    } finally {
+        fs.rmSync(completionWorkspace, { recursive: true, force: true });
     }
 
     const pipeline = await import("../mcp/servers/web-search/searchPipeline.mjs") as {

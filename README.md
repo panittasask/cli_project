@@ -50,16 +50,16 @@ Settings:
 {
   "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
-  "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
-  "contextLength": 65536,
+  "defaultModel": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+  "contextLength": 16384,
   "device": "auto",
   "debug": true,
   "historyMessages": 6,
-  "agent": { "maxTurns": 12, "maxSegments": 3, "maxDurationMinutes": 10, "maxCompletionTokens": 16000, "repeatLimit": 2 },
+  "agent": { "maxTurns": 12, "maxSegments": 1, "maxDurationMinutes": 8, "maxCompletionTokens": 8000, "repeatLimit": 2 },
   "sampling": {
     "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
     "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
-    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 4096 }
+    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 2048 }
   }
 }
 ```
@@ -68,7 +68,7 @@ Defaults if `.cli/settings.json` is missing:
 
 - llama.cpp directory: `D:\llama.cpp\llama-b10012-bin-win-sycl-x64`
 - API URL: `http://127.0.0.1:8080/v1/chat/completions`
-- model: `qwen2.5-coder-7b-instruct-q4_k_m.gguf`
+- model: `qwen2.5-coder-14b-instruct-q4_k_m.gguf`
 
 Optional overrides:
 
@@ -148,6 +148,20 @@ Existing files must be read before an agent write. JSON, TypeScript, and
 `.gitignore` changes receive automatic validation, and a failed validation
 blocks a final success response.
 
+Creation requests for Go APIs, React or Angular applications, and Swagger/OpenAPI also
+receive a deterministic project-completion profile. A Go API profile requires a
+module manifest, server startup, an HTTP route, structured JSON, and a successful
+Go test/build/vet command. A React profile requires a React package, source under
+`src/`, a real build script/tool dependency, and a successful frontend check.
+Angular profiles similarly require `angular.json`, Angular source and CLI build
+setup. Framework replacement requests inherit the existing backend requirement,
+reject leftover source/dependencies from the removed framework, and require a
+frontend API call through `fetch`, `axios`, or Angular `HttpClient`.
+Swagger/OpenAPI creation requires an integration/spec artifact plus a
+successful runtime probe. A model response that describes only a starter
+scaffold or defers required work is rejected. Every rejected final attempt is
+written to the agent trace as `final_blocked`.
+
 Existing files are normally changed with an exact `edit_file` replacement so
 the model sends only the old and new snippet instead of reproducing a large
 file inside one JSON response. The replacement must match exactly once and gets
@@ -156,7 +170,12 @@ full-file response reaches the completion limit, the truncated response is
 omitted from active context and the next turn is constrained to a smaller action.
 
 On Windows, agent verification commands run explicitly in PowerShell and the
-model receives matching platform guidance. File-content checks should use
+model receives matching platform guidance. `run_command.workdir` selects a
+relative workspace directory without `Set-Location`; redundant model-generated
+`powershell.exe -Command` wrappers are removed before execution. Ordinary checks
+have a 30-second timeout, while dependency installation and recognized project
+scaffolding receive 180 seconds so a completed install is not reported as a false
+timeout. File-content checks should use
 `read_file` or `search_files`; the agent must not assume a localhost server is
 running. A failed verification command blocks verified success until a relevant
 file read/search or an OS-compatible command succeeds.
@@ -164,11 +183,16 @@ file read/search or an OS-compatible command succeeds.
 During a running request, `Ctrl+C` cancels that request without closing the
 CLI. `maxTurns` is a soft per-segment limit: unfinished work is compacted into
 file, validation, verification, source, and recent-event state, then continues
-automatically for up to `maxSegments`. Wall-clock and completion-token budgets
-remain global hard limits across segments. Model-generated writes show a compact
+automatically for up to `maxSegments` (one by default). Equivalent file reads,
+listings, searches, and normalized commands are counted across intervening
+inspection actions until a file mutation starts a new progress window. Wall-clock
+and completion-token budgets remain global hard limits across segments. Model-generated writes show a compact
 diff preview and save a checkpoint first. Run `/undo` to restore the most recent
 checkpoint for the active workspace. After each request, the CLI keeps the
 spinner's total duration as a persistent `Completed in` or `Stopped after` line.
+If the tool-action limit is reached while any artifact, project check, runtime
+probe, or validation remains incomplete, the CLI now returns a deterministic
+incomplete status and never asks the model to summarize the task as completed.
 
 Project-local skills live at `.cli/skills/<name>/SKILL.md` with required `name`
 and `description` frontmatter. Run `/skills` to list them, invoke one explicitly

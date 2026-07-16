@@ -22,7 +22,7 @@ const mcpPatterns = [
 ];
 
 const codingPatterns = [
-    /\b(file|folder|code|repo|project|workspace|typescript|javascript|json|readme|git|npm|test|build|config|function|class|bug|refactor|button|form|register|ui|ux|layout|spacing|style)\b/i,
+    /\b(file|folder|code|repo|project|workspace|typescript|javascript|json|readme|git|npm|test|build|config|function|class|bug|refactor|button|form|register|ui|ux|layout|spacing|style|frontend|dashboard|react|angular)\b/i,
     /\b(html|css|web\s?page|website|login\s?page|modal|component)\b/i,
     /(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|เวิร์กสเปซ|คอนฟิก|แก้บั๊ก|รีแฟกเตอร์|รันเทส|ทดสอบ|คอมไพล์|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์)/i,
     /(หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล)/i,
@@ -31,8 +31,8 @@ const codingPatterns = [
 ];
 
 const workspaceMutationPatterns = [
-    /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|swagger|openapi|api|endpoint|router|server|framework)\b/i,
-    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|swagger|openapi|api|endpoint|router|server|framework)/i
+    /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|replace|switch|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)\b/i,
+    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|เปลี่ยน|แทนที่|ลบ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)/i
 ];
 
 const runtimeVerificationPatterns = [
@@ -44,7 +44,15 @@ const runtimeVerificationPatterns = [
 
 const commandVerificationPatterns = [
     /\b(until|pass(?:es|ed)?|test(?:s|ed|ing)?|builds?|compiles?|lint|typecheck|verify|verification)\b/i,
-    /(จนกว่า|ให้เสร็จ|ให้ผ่าน|ทดสอบ|รันเทส|คอมไพล์|บิลด์|ตรวจสอบ)[\s\S]*(ผ่าน|สำเร็จ|ได้)?/i
+    /(จนกว่า|ให้เสร็จ|ให้ผ่าน|ทดสอบ|รันเทส|คอมไพล์|บิลด์|ตรวจสอบ)[\s\S]*(ผ่าน|สำเร็จ|ได้)?/i,
+    /\b(create|build|generate|scaffold|implement|make|replace|switch)\b[\s\S]*\b(golang|go\s*lang|go\s+(?:api|server|backend)|react|angular|full[ -]?stack)\b/i,
+    /(สร้าง|เขียน|ทำ|เพิ่ม|เปลี่ยน)[\s\S]*(golang|go\s*lang|ภาษา\s*go|react|angular|ฟูลสแต็ก)/i
+];
+
+const scaffoldRuntimeVerificationPatterns = [
+    /\b(create|build|generate|implement|add|fix)\b[\s\S]*\b(swagger|openapi)\b/i,
+    /\b(swagger|openapi)\b[\s\S]*\b(create|build|generate|implement|add|fix)\b/i,
+    /(สร้าง|เพิ่ม|ทำ|แก้)[\s\S]*(swagger|openapi)/i
 ];
 
 function matchesAny(message: string, patterns: RegExp[]): boolean {
@@ -109,6 +117,7 @@ function requiresWorkspaceWriteWithHistory(
 
 function verificationRequirement(message: string): VerificationRequirement {
     const clean = message.trim();
+    if (matchesAny(clean, scaffoldRuntimeVerificationPatterns)) return "runtime";
     if (matchesAny(clean, runtimeVerificationPatterns)) return "runtime";
     if (matchesAny(clean, commandVerificationPatterns)) return "command";
     return "none";

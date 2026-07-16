@@ -1,6 +1,11 @@
 import childProcess = require("node:child_process");
 import fs = require("node:fs");
 import path = require("node:path");
+const { commandTimeoutMs, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
+    commandTimeoutMs: (command: string) => number;
+    resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
+    unwrapWindowsPowerShellCommand: (command: string) => string;
+};
 const { McpTool } = require("./mcpTool") as { McpTool: new (configRoot?: string) => {
     buildPromptSection: () => Promise<string>;
     listTools: (serverName?: string) => Promise<string>;
@@ -45,6 +50,7 @@ type AgentAction = (
     | {
         action: "run_command";
         command: string;
+        workdir?: string;
     }
     | {
         action: "mcp_list_tools";
@@ -90,6 +96,9 @@ class AgentTool {
         const runtimeSection = process.platform === "win32"
             ? `Runtime platform: Windows. run_command executes Windows PowerShell.
 Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.
+Set run_command.workdir to a relative workspace directory instead of using Set-Location or cd.
+If workdir is omitted for an Angular workspace command and exactly one angular.json exists, the runner selects that directory automatically.
+Dependency installation and project scaffolding may run for up to three minutes. After a real timeout, inspect files before retrying because the command may have created partial output.
 Do not wrap commands in another powershell.exe invocation. Do not use Bash separators such as && or a bare & to background a process.`
             : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
         // The model is controlled through a small JSON protocol so the CLI can
@@ -111,7 +120,7 @@ Available actions:
 {"action":"read_file","path":"relative path","reason":"brief rationale"}
 {"action":"write_file","path":"relative path","content":"full updated file content","reason":"brief rationale"}
 {"action":"edit_file","path":"relative path","old_text":"exact existing text","new_text":"replacement text","reason":"brief rationale"}
-{"action":"run_command","command":"safe read-only or verification command","reason":"brief rationale"}
+{"action":"run_command","command":"safe read-only or verification command","workdir":"optional relative directory","reason":"brief rationale"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
 Call discovered MCP tools through mcp_call_tool using the exact configured server and tool names.
@@ -208,9 +217,11 @@ ${mcpSection}`;
         }
 
         if (action === "run_command") {
+            const workdir = typeof data.workdir === "string" ? data.workdir : undefined;
             return {
                 action,
                 command: typeof data.command === "string" ? data.command : "",
+                ...(workdir ? { workdir } : {}),
                 reason
             };
         }
@@ -400,7 +411,7 @@ ${mcpSection}`;
                 return { ok: false, output: "Missing command." };
             }
 
-            return { ok: true, output: this.runCommand(action.command) };
+            return { ok: true, output: this.runCommand(action.command, action.workdir) };
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return { ok: false, output: message };
@@ -447,7 +458,10 @@ ${mcpSection}`;
             if (action.action === "read_file") return `Reading file: ${clean(action.path)}`;
             if (action.action === "write_file") return `Writing file: ${clean(action.path)}`;
             if (action.action === "edit_file") return `Editing file: ${clean(action.path)}`;
-            if (action.action === "run_command") return `Running check: ${clean(action.command)}`;
+            if (action.action === "run_command") {
+                const location = action.workdir ? ` in ${clean(action.workdir)}` : "";
+                return `Running check${location}: ${clean(action.command)}`;
+            }
             if (action.action === "mcp_list_tools") return `Discovering MCP tools${action.server ? `: ${clean(action.server)}` : ""}`;
             if (action.action === "mcp_call_tool") return `Calling tool: ${clean(`${action.server}.${action.tool}`)}`;
             return "Preparing final answer";
@@ -485,7 +499,7 @@ ${mcpSection}`;
 
         const limited = files.slice(0, this.maxListedFiles);
         const suffix = files.length > limited.length ? `\n[Truncated: ${files.length - limited.length} more files]` : "";
-        return `${limited.join("\n")}${suffix}`;
+        return limited.length > 0 ? `${limited.join("\n")}${suffix}` : "[Workspace is empty]";
     }
 
     private searchFiles(query: string, inputPath?: string): string {
@@ -549,40 +563,66 @@ ${mcpSection}`;
         fs.writeFileSync(resolved, content, "utf8");
     }
 
-    private runCommand(command: string): string {
-        if (!this.isSafeCommand(command)) {
-            throw new Error(`Blocked unsafe command: ${command}`);
+    private runCommand(command: string, workdir?: string): string {
+        const normalizedCommand = process.platform === "win32"
+            ? unwrapWindowsPowerShellCommand(command)
+            : command.trim();
+        if (process.platform === "win32" && /^(?:powershell|pwsh)(?:\.exe)?\b/i.test(normalizedCommand)) {
+            throw new Error("Unsupported nested PowerShell command. Pass the command body directly.");
+        }
+        if (!this.isSafeCommand(normalizedCommand)) {
+            throw new Error(`Blocked unsafe command: ${normalizedCommand}`);
         }
 
-        if (process.platform === "win32" && /\b(grep|sed|awk)\b/i.test(command)) {
+        if (process.platform === "win32" && /\b(grep|sed|awk)\b/i.test(normalizedCommand)) {
             throw new Error("Unsupported Unix command on Windows PowerShell. Use Select-String or a built-in file action instead.");
         }
 
-        const output = process.platform === "win32"
-            ? childProcess.execFileSync("powershell.exe", [
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command
-            ], {
-                cwd: process.cwd(),
-                encoding: "utf8",
-                stdio: ["ignore", "pipe", "pipe"],
-                timeout: 30000,
-                windowsHide: true
-            })
-            : childProcess.execSync(command, {
-            cwd: process.cwd(),
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "pipe"],
-            timeout: 30000,
-            windowsHide: true
-        });
+        const workdirResolution = resolveCommandWorkdir(process.cwd(), normalizedCommand, workdir);
+        const commandCwd = this.resolveInsideWorkspace(workdirResolution.workdir);
+        if (!fs.existsSync(commandCwd) || !fs.statSync(commandCwd).isDirectory()) {
+            throw new Error(`Command workdir is not a directory: ${workdirResolution.workdir}`);
+        }
 
-        return output.trim() || "[Command completed with no output]";
+        const timeout = commandTimeoutMs(normalizedCommand);
+        let output = "";
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+            try {
+                output = process.platform === "win32"
+                    ? childProcess.execFileSync("powershell.exe", [
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        normalizedCommand
+                    ], {
+                        cwd: commandCwd,
+                        encoding: "utf8",
+                        stdio: ["ignore", "pipe", "pipe"],
+                        timeout,
+                        windowsHide: true
+                    })
+                    : childProcess.execSync(normalizedCommand, {
+                        cwd: commandCwd,
+                        encoding: "utf8",
+                        stdio: ["ignore", "pipe", "pipe"],
+                        timeout,
+                        windowsHide: true
+                    });
+                break;
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (attempt < 2 && (code === "EPERM" || code === "EBUSY")) continue;
+                throw error;
+            }
+        }
+
+        const commandOutput = output.trim() || "[Command completed with no output]";
+        return workdirResolution.autoSelected
+            ? `${commandOutput}\n[Auto-selected workdir: ${workdirResolution.workdir}]`
+            : commandOutput;
     }
 
     private isSafeCommand(command: string): boolean {
@@ -605,12 +645,18 @@ ${mcpSection}`;
             /\bmkdir\b/,
             /\bmd\s+/,
             /\bnew-item\b/,
+            /\bremove-item\b/,
+            /\bclear-content\b/,
+            /\bset-content\b/,
+            /\badd-content\b/,
+            /\bout-file\b/,
             /(^|[^<])>(?!>)/,
             /\bsetx\b/,
             /\bgit\s+reset\b/,
             /\bgit\s+checkout\b/,
             /\bgit\s+clean\b/,
-            /\bnpm\s+publish\b/
+            /\bnpm\s+publish\b/,
+            /\bnpm(?:\.cmd)?\s+audit\s+fix\b[^\r\n]*--force\b/
         ];
 
         return !blockedPatterns.some((pattern) => pattern.test(lower));

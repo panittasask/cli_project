@@ -3,12 +3,19 @@ import fs = require("node:fs");
 import http = require("node:http");
 import os = require("node:os");
 import path = require("node:path");
-const { loadCliSettings, getSamplingSettings } = require("../cli/config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require("../cli/config") as {
     loadCliSettings: (root?: string) => Record<string, unknown>;
     getSamplingSettings: (settings: Record<string, unknown>, kind: "action") => Record<string, number>;
+    getAgentGuardSettings: (settings: Record<string, unknown>) => {
+        maxTurns: number;
+        maxSegments: number;
+        maxDurationMs: number;
+        maxCompletionTokens: number;
+        repeatLimit: number;
+    };
 };
 const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () => {
-    parseAction: (content: string) => { action?: string; reason?: string; path?: string; old_text?: string; new_text?: string } | undefined;
+    parseAction: (content: string) => { action?: string; reason?: string; path?: string; old_text?: string; new_text?: string; workdir?: string } | undefined;
     explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
@@ -146,7 +153,22 @@ async function main(): Promise<void> {
     assert.ok(typeof configuredContextLength === "number" && configuredContextLength > 0);
     const actionSampling = getSamplingSettings(settings, "action");
     assert.equal(actionSampling.temperature, 0.1);
-    assert.equal(actionSampling.max_tokens, 4096);
+    assert.equal(actionSampling.max_tokens, 2048);
+    assert.deepEqual(getAgentGuardSettings({
+        agent: {
+            maxTurns: 12,
+            maxSegments: 1,
+            maxDurationMinutes: 8,
+            maxCompletionTokens: 8000,
+            repeatLimit: 2
+        }
+    }), {
+        maxTurns: 12,
+        maxSegments: 1,
+        maxDurationMs: 480_000,
+        maxCompletionTokens: 8000,
+        repeatLimit: 2
+    });
 
     const agent = new AgentTool();
     const action = agent.parseAction(JSON.stringify({
@@ -177,6 +199,14 @@ async function main(): Promise<void> {
     }));
     assert.equal(editAction?.action, "edit_file");
     assert.equal(editAction?.old_text, "margin-top: 15px");
+    const commandAction = agent.parseAction(JSON.stringify({
+        action: "run_command",
+        command: "go test ./...",
+        workdir: "go",
+        reason: "Run Go tests in the module directory."
+    }));
+    assert.equal(commandAction?.action, "run_command");
+    assert.equal(commandAction?.workdir, "go");
     assert.equal(agent.parseAction('{"action":"unknown_action"}'), undefined);
     assert.equal(agent.explainParseFailure("plain text summary"), "no valid JSON object found in model content");
     assert.equal(agent.explainParseFailure('{"action":"unknown_action"}'), "unsupported action: unknown_action");
@@ -242,19 +272,60 @@ async function main(): Promise<void> {
     const unixMkdir = await agent.execute({ action: "run_command", command: "mkdir -p LoginPage" });
     assert.equal(unixMkdir.ok, false);
     assert.match(unixMkdir.output, /Blocked unsafe command/);
+    const forcedAudit = await agent.execute({ action: "run_command", command: "npm audit fix --force" });
+    assert.equal(forcedAudit.ok, false);
+    assert.match(forcedAudit.output, /Blocked unsafe command/);
     if (process.platform === "win32") {
         const powershellCheck = await agent.execute({ action: "run_command", command: "Write-Output 'powershell-ok'" });
         assert.equal(powershellCheck.ok, true);
         assert.match(powershellCheck.output, /powershell-ok/);
+        const wrappedPowershellCheck = await agent.execute({
+            action: "run_command",
+            command: "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'normalized-ok'\""
+        });
+        assert.equal(wrappedPowershellCheck.ok, true);
+        assert.match(wrappedPowershellCheck.output, /normalized-ok/);
+        const encodedPowershellCheck = await agent.execute({
+            action: "run_command",
+            command: "powershell.exe -EncodedCommand blocked"
+        });
+        assert.equal(encodedPowershellCheck.ok, false);
+        assert.match(encodedPowershellCheck.output, /Unsupported nested PowerShell/);
         const unixCheck = await agent.execute({ action: "run_command", command: "grep margin-top login.html" });
         assert.equal(unixCheck.ok, false);
         assert.match(unixCheck.output, /Unsupported Unix command/);
+        const destructiveCheck = await agent.execute({ action: "run_command", command: "Remove-Item stale.exe" });
+        assert.equal(destructiveCheck.ok, false);
+        assert.match(destructiveCheck.output, /Blocked unsafe command/);
     }
     const editDirectory = fs.mkdtempSync(path.join(process.cwd(), ".agent-edit-test-"));
     try {
         const editPath = path.join(editDirectory, "sample.html");
         fs.writeFileSync(editPath, ".button { margin-top: 15px; }", "utf8");
         const relativeEditPath = path.relative(process.cwd(), editPath);
+        const relativeWorkdir = path.relative(process.cwd(), editDirectory);
+        const emptyDirectory = path.join(editDirectory, "empty");
+        fs.mkdirSync(emptyDirectory);
+        const emptyListResult = await agent.execute({
+            action: "list_files",
+            path: path.relative(process.cwd(), emptyDirectory)
+        });
+        assert.equal(emptyListResult.ok, true);
+        assert.equal(emptyListResult.output, "[Workspace is empty]");
+        const workdirResult = await agent.execute({
+            action: "run_command",
+            command: process.platform === "win32" ? "(Get-Location).Path" : "pwd",
+            workdir: relativeWorkdir
+        });
+        assert.equal(workdirResult.ok, true);
+        assert.equal(path.resolve(workdirResult.output.trim()), path.resolve(editDirectory));
+        const outsideWorkdir = await agent.execute({
+            action: "run_command",
+            command: process.platform === "win32" ? "Write-Output blocked" : "printf blocked",
+            workdir: ".."
+        });
+        assert.equal(outsideWorkdir.ok, false);
+        assert.match(outsideWorkdir.output, /outside workspace/);
         const preparedEdit = agent.prepareEdit(relativeEditPath, "margin-top: 15px", "margin-top: 25px");
         assert.equal(preparedEdit.ok, true);
         const editResult = await agent.execute({
