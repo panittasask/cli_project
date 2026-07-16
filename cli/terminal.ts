@@ -25,6 +25,9 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     resetActionHistory: () => void;
     formatRemaining: () => string;
 } };
+const { commandCreatesWorkspaceFiles } = require("./commandNormalizer") as {
+    commandCreatesWorkspaceFiles: (command: string) => boolean;
+};
 const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpointStore: new (root: string) => {
     checkpoint: (workspace: string, inputPath: string, nextContent: string) => { id: string; preview: string };
     undoLatest: (workspace: string) => { ok: boolean; message: string };
@@ -103,12 +106,46 @@ const { formatSessionHistory } = require("./sessionHistory") as {
 };
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 type VerificationRequirement = "none" | "command" | "runtime";
+type ProjectCheck = "go" | "node";
+type ProjectCompletionRequirement = {
+    label: string;
+    requireGoModule: boolean;
+    requireGoJsonApi: boolean;
+    requireReactApp: boolean;
+    requireAngularApp: boolean;
+    forbidReactArtifacts: boolean;
+    forbidAngularArtifacts: boolean;
+    requireFrontendApiCall: boolean;
+    requireSwagger: boolean;
+    requiredChecks: ProjectCheck[];
+};
 const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, verificationRequirementWithHistory, commandSatisfiesVerification, workflowInstructions } = require("./workflowRouter") as {
     classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: WorkflowKind; reason: string };
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     verificationRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => VerificationRequirement;
     commandSatisfiesVerification: (command: string, requirement: VerificationRequirement) => boolean;
     workflowInstructions: (kind: WorkflowKind) => string;
+};
+const {
+    answerDefersRequiredWork,
+    evaluateProjectCompletion,
+    formatIncompleteTaskAnswer,
+    formatProjectCompletionPrompt,
+    inferProjectCompletionRequirementWithHistory,
+    projectChecksAffectedByPath,
+    projectChecksForCommand
+} = require("./projectCompletion") as {
+    answerDefersRequiredWork: (answer: string) => boolean;
+    evaluateProjectCompletion: (workspace: string, requirement: ProjectCompletionRequirement) => string[];
+    formatIncompleteTaskAnswer: (reasons: string[], writtenPaths: string[]) => string;
+    formatProjectCompletionPrompt: (requirement: ProjectCompletionRequirement) => string;
+    inferProjectCompletionRequirementWithHistory: (
+        message: string,
+        history: Array<{ role: "user" | "assistant"; content: string }>,
+        continuation: boolean
+    ) => ProjectCompletionRequirement | undefined;
+    projectChecksAffectedByPath: (filePath: string) => ProjectCheck[];
+    projectChecksForCommand: (command: string) => ProjectCheck[];
 };
 const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
     isContinuationRequest: (message: string) => boolean;
@@ -338,13 +375,13 @@ const llamaClient = new LlamaClient(apiUrl, agentGuardSettings.maxDurationMs + 5
 const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
-    || "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+    || "qwen2.5-coder-14b-instruct-q4_k_m.gguf";
 const configuredContextValue = Number(
-    process.env.LLAMA_CONTEXT_LENGTH?.trim() || cliSettings.contextLength || 65536
+    process.env.LLAMA_CONTEXT_LENGTH?.trim() || cliSettings.contextLength || 16384
 );
 const configuredContextLength = Number.isFinite(configuredContextValue) && configuredContextValue >= 512
     ? Math.floor(configuredContextValue)
-    : 65536;
+    : 16384;
 let activeContextLength = configuredContextLength;
 let model = defaultModel;
 let plannerModel = defaultModel;
@@ -1027,6 +1064,7 @@ async function runAgentLoop(
     const workflow = classifyWorkflowWithHistory(userMessage, historyForModel, continuation);
     const mustWrite = requiresWorkspaceWriteWithHistory(userMessage, historyForModel, continuation);
     const verificationRequirement = verificationRequirementWithHistory(userMessage, historyForModel, continuation);
+    const projectRequirement = inferProjectCompletionRequirementWithHistory(userMessage, historyForModel, continuation);
     const agentResponseFormat = getAgentResponseFormat(workflow.kind);
     const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage, mustWrite);
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
@@ -1039,6 +1077,7 @@ async function runAgentLoop(
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
     let verificationSatisfied = verificationRequirement === "none";
+    const successfulProjectChecks = new Set<ProjectCheck>();
     const writtenPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
@@ -1057,6 +1096,7 @@ async function runAgentLoop(
         verificationRequirement === "none"
             ? "No explicit command-level acceptance check was inferred."
             : `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`,
+        projectRequirement ? formatProjectCompletionPrompt(projectRequirement) : "",
         skillPrompt
     ].filter(Boolean).join("\n\n"));
     let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
@@ -1130,6 +1170,7 @@ async function runAgentLoop(
             old_text?: string;
             new_text?: string;
             command?: string;
+            workdir?: string;
             server?: string;
             arguments?: Record<string, unknown>;
         } | undefined;
@@ -1180,48 +1221,94 @@ async function runAgentLoop(
         // The loop ends only when the model explicitly returns final. Until
         // then each action becomes an observation for the next reasoning step.
         if (action.action === "final") {
+            const rejectFinal = (summary: string, feedback: string): void => {
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: ${summary}`);
+                trace.add({
+                    turn,
+                    status: "error",
+                    action: "final_blocked",
+                    reason: action.reason,
+                    observation: summary
+                });
+                trace.save();
+                segmentEvents.push(`final_blocked [error]: ${summary}`);
+                messages.push({ role: "user", content: feedback });
+            };
             if (mustWrite && writtenPaths.size === 0) {
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: this request requires a successful file write`);
-                messages.push({ role: "user", content: "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final." });
+                rejectFinal(
+                    "this request requires a successful file write",
+                    "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
+                );
                 continue;
             }
             if (validationFailures.size > 0) {
                 const failed = Array.from(validationFailures).join(", ");
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: validation still failing for ${failed}`);
-                messages.push({ role: "user", content: `You cannot return final yet. Validation is failing for: ${failed}. Inspect the error, fix the file, and validate again.` });
+                rejectFinal(
+                    `validation still failing for ${failed}`,
+                    `You cannot return final yet. Validation is failing for: ${failed}. Inspect the error, fix the file, and validate again.`
+                );
                 continue;
             }
             if (unresolvedVerificationFailure) {
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: the latest verification command failed`);
-                messages.push({
-                    role: "user",
-                    content: `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Inspect the error and run an OS-compatible verification command successfully. A read_file or search_files action can diagnose the problem but does not clear the failed verification. Do not assume a localhost server exists.`
-                });
+                rejectFinal(
+                    "the latest verification command failed",
+                    `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Inspect the error and run an OS-compatible verification command successfully. A read_file or search_files action can diagnose the problem but does not clear the failed verification. Do not assume a localhost server exists.`
+                );
+                continue;
+            }
+            if (projectRequirement) {
+                const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
+                if (missingArtifacts.length > 0) {
+                    const missing = missingArtifacts.join(", ");
+                    rejectFinal(
+                        `project completion profile is missing: ${missing}`,
+                        `You cannot return final yet. The requested ${projectRequirement.label} is incomplete. Missing: ${missing}. Implement these items, then run the required checks. Do not return a starter scaffold or tell the user to expand it later.`
+                    );
+                    continue;
+                }
+                const missingChecks = projectRequirement.requiredChecks.filter((check) => !successfulProjectChecks.has(check));
+                if (missingChecks.length > 0) {
+                    rejectFinal(
+                        `required project checks have not succeeded: ${missingChecks.join(", ")}`,
+                        `You cannot return final yet. Run successful verification for: ${missingChecks.join(", ")}. Use run_command.workdir for the directory containing each project manifest.`
+                    );
+                    continue;
+                }
+            }
+            const proposedAnswer = action.answer?.trim() || "Done.";
+            if (projectRequirement && answerDefersRequiredWork(proposedAnswer)) {
+                rejectFinal(
+                    "the answer describes a starter scaffold or defers required work",
+                    "Do not return a partial scaffold or ask the user to expand it later. Finish the requested implementation and checks, then summarize concrete completed behavior."
+                );
                 continue;
             }
             if (!verificationSatisfied) {
                 const requiredCheck = verificationRequirement === "runtime"
                     ? "run an OS-compatible runtime probe of the requested URL, endpoint, server, or UI"
                     : "run the relevant test, build, lint, or verification command";
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: required ${verificationRequirement} verification has not succeeded after the latest write`);
-                messages.push({
-                    role: "user",
-                    content: `You cannot return final yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior.`
-                });
+                rejectFinal(
+                    `required ${verificationRequirement} verification has not succeeded after the latest write`,
+                    `You cannot return final yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior.`
+                );
                 continue;
             }
             if (workflow.kind === "web_research" && !mcpCallsDisabled && sourceUrls.size < 2) {
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: web research needs at least two relevant source URLs`);
-                messages.push({ role: "user", content: "You cannot return final yet. Web research requires at least two relevant source URLs from successful MCP observations. Refine the web query; do not use search_files." });
+                rejectFinal(
+                    "web research needs at least two relevant source URLs",
+                    "You cannot return final yet. Web research requires at least two relevant source URLs from successful MCP observations. Refine the web query; do not use search_files."
+                );
                 continue;
             }
             if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: MCP discovery and a successful tool call are required`);
-                messages.push({ role: "user", content: "You cannot claim MCP completion yet. Run mcp_list_tools and one relevant mcp_call_tool successfully after implementation." });
+                rejectFinal(
+                    "MCP discovery and a successful tool call are required",
+                    "You cannot claim MCP completion yet. Run mcp_list_tools and one relevant mcp_call_tool successfully after implementation."
+                );
                 continue;
             }
             spinner.update("Preparing final answer...");
-            const answer = action.answer?.trim() || "Done.";
+            const answer = proposedAnswer;
             const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
             const finalAnswer = missingSources.length === 0
                 ? answer
@@ -1298,6 +1385,11 @@ async function runAgentLoop(
         if (action.action === "read_file" && result.ok && action.path) {
             readPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
         }
+        if (action.action === "run_command" && result.ok && commandCreatesWorkspaceFiles(action.command ?? "")) {
+            writtenPaths.add("[project scaffold generated by command]");
+            successfulProjectChecks.delete("node");
+            if (verificationRequirement !== "none") verificationSatisfied = false;
+        }
         if ((action.action === "write_file" || action.action === "edit_file") && result.ok && action.path) {
             const validation = writeValidator.validate(action.path);
             result = {
@@ -1307,6 +1399,7 @@ async function runAgentLoop(
             if (validation.ok) validationFailures.delete(action.path);
             else validationFailures.add(action.path);
             writtenPaths.add(action.path);
+            projectChecksAffectedByPath(action.path).forEach((check) => successfulProjectChecks.delete(check));
             if (verificationRequirement !== "none") verificationSatisfied = false;
             if (workflow.kind === "mcp_creation") {
                 successfulMcpDiscovery = false;
@@ -1319,7 +1412,12 @@ async function runAgentLoop(
             unresolvedVerificationFailure = result.output.slice(0, 500);
             if (verificationRequirement !== "none") verificationSatisfied = false;
         } else if (action.action === "run_command" && result.ok) {
+            const completedProjectChecks = projectChecksForCommand(action.command ?? "");
+            completedProjectChecks.forEach((check) => successfulProjectChecks.add(check));
             const satisfiesRequiredCheck = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
+            if (completedProjectChecks.length > 0) {
+                unresolvedVerificationFailure = undefined;
+            }
             if (satisfiesRequiredCheck) {
                 verificationSatisfied = true;
                 unresolvedVerificationFailure = undefined;
@@ -1349,7 +1447,37 @@ async function runAgentLoop(
         });
     }
 
-    spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached; preparing a final summary`);
+    const toolLimitBlockers: string[] = [];
+    if (mustWrite && writtenPaths.size === 0) toolLimitBlockers.push("no successful workspace change was recorded");
+    if (validationFailures.size > 0) toolLimitBlockers.push(`validation failing for ${Array.from(validationFailures).join(", ")}`);
+    if (unresolvedVerificationFailure) toolLimitBlockers.push(`latest verification failed: ${unresolvedVerificationFailure}`);
+    if (projectRequirement) {
+        const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
+        if (missingArtifacts.length > 0) toolLimitBlockers.push(`missing project artifacts: ${missingArtifacts.join(", ")}`);
+        const missingChecks = projectRequirement.requiredChecks.filter((check) => !successfulProjectChecks.has(check));
+        if (missingChecks.length > 0) toolLimitBlockers.push(`project checks not passed: ${missingChecks.join(", ")}`);
+    }
+    if (!verificationSatisfied) toolLimitBlockers.push(`${verificationRequirement} verification not satisfied`);
+    if (workflow.kind === "web_research" && !mcpCallsDisabled && sourceUrls.size < 2) {
+        toolLimitBlockers.push("fewer than two web source URLs were collected");
+    }
+    if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
+        toolLimitBlockers.push("MCP discovery and a successful tool call were not completed");
+    }
+    if (toolLimitBlockers.length > 0) {
+        const answer = formatIncompleteTaskAnswer(toolLimitBlockers, Array.from(writtenPaths));
+        spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached; task remains incomplete`);
+        trace.add({
+            turn: maxTurns + 1,
+            status: "error",
+            action: "incomplete_after_tool_limit",
+            observation: toolLimitBlockers.join("; ")
+        });
+        trace.save();
+        return { answer, trace };
+    }
+
+    spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached after all completion gates passed; preparing a final summary`);
     spinner.update("Summarizing completed work...");
     messages.push({
         role: "user",

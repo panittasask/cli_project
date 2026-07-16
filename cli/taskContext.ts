@@ -1,7 +1,7 @@
 type HistoryMessage = { role: "user" | "assistant"; content: string };
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 
-const continuationPattern = /\b(it|that|this|those|these|continue|resume|carry on|also|same|previous|another (?:way|method)|until (?:it )?(?:works|passes|opens|runs))\b|(?:อันนี้|อันนั้น|เมื่อกี้|ต่อเลย|ทำ(?:งาน)?\s*ต่อ|ทำงาน\s*เก่า\s*ต่อ|ทำเลย|ยังไม่มี|ต่อ(?:จาก|จามก?)\s*(?:งาน)?เดิม|งาน\s*(?:เดิม|เก่า)|จากเดิม|เหมือนเดิม|ด้วยนะ|แล้วทีนี้|ที่ถาม|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จนกว่า|ให้(?:มัน)?\s*(?:ทำงาน|ใช้งาน|เปิด|รัน)\s*ได้|ให้เสร็จ)/i;
+const continuationPattern = /\b(it|that|this|those|these|continue|resume|carry on|also|same|previous|replace|switch|change .+ instead|another (?:way|method)|until (?:it )?(?:works|passes|opens|runs))\b|(?:อันนี้|อันนั้น|เมื่อกี้|ต่อเลย|ทำ(?:งาน)?\s*ต่อ|ทำงาน\s*เก่า\s*ต่อ|ทำเลย|ยังไม่มี|ต่อ(?:จาก|จามก?)\s*(?:งาน)?เดิม|งาน\s*(?:เดิม|เก่า)|จากเดิม|เหมือนเดิม|ด้วยนะ|แล้วทีนี้|ที่ถาม|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|เปลี่ยน[\s\S]*แทน|แทนที่|จนกว่า|ให้(?:มัน)?\s*(?:ทำงาน|ใช้งาน|เปิด|รัน)\s*ได้|ให้เสร็จ)/i;
 
 function isContinuationRequest(message: string): boolean {
     return continuationPattern.test(message.trim());
