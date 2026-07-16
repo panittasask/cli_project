@@ -22,7 +22,8 @@ const { buildStatusBarFrame, formatStatusBar } = require("../cli/statusBar") as 
     buildStatusBarFrame: (state: { model: string; contextUsed: number; contextLimit: number; workspace: string }, columns: number, rows: number) => string;
     formatStatusBar: (state: { model: string; contextUsed: number; contextLimit: number; workspace: string }, columns: number) => string;
 };
-const { formatElapsedTime, formatSpinnerLine } = require("../cli/spinner") as {
+const { formatCompletionLine, formatElapsedTime, formatSpinnerLine } = require("../cli/spinner") as {
+    formatCompletionLine: (milliseconds: number, completed?: boolean) => string;
     formatElapsedTime: (milliseconds: number) => string;
     formatSpinnerLine: (frame: string, message: string, stepMilliseconds: number, totalMilliseconds: number, columns?: number) => string;
 };
@@ -204,6 +205,8 @@ async function main(): Promise<void> {
     assert.equal(formatElapsedTime(0), "00:00");
     assert.equal(formatElapsedTime(65_000), "01:05");
     assert.equal(formatElapsedTime(3_661_000), "01:01:01");
+    assert.equal(formatCompletionLine(434_000), "Completed in 07:14");
+    assert.equal(formatCompletionLine(65_000, false), "Stopped after 01:05");
     const localLogDate = new Date(2026, 6, 16, 12, 0, 0);
     assert.equal(formatLocalDate(localLogDate), "2026-07-16");
     assert.equal(

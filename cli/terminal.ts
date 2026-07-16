@@ -112,12 +112,12 @@ const { WriteValidator } = require("./writeValidator") as { WriteValidator: new 
     exists: (inputPath: string) => boolean;
     validate: (inputPath: string) => { ok: boolean; validator: string; output: string };
 } };
-const { Spinner } = require("./spinner") as { Spinner: new (message?: string) => {
+const { Spinner, formatCompletionLine } = require("./spinner") as { Spinner: new (message?: string) => {
     start: () => void;
-    stop: () => void;
+    stop: () => number;
     update: (message: string) => void;
     log: (message: string) => void;
-} };
+}; formatCompletionLine: (milliseconds: number, completed?: boolean) => string };
 const { ImageTool } = require("./tools/imageTool") as { ImageTool: new () => {
     parseImagePrompt: (input: string) => { filePath: string; prompt: string } | undefined;
     toDataUrl: (inputPath: string) => string;
@@ -1584,11 +1584,12 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
                 const result = await runAgentLoop(trimmed, historyForModel, spinner, activeSession.id, requestController.signal);
-                spinner.stop();
+                const elapsedMs = spinner.stop();
                 if (debugEnabled) {
                     result.trace.print();
                 }
                 console.log("AI:", result.answer);
+                console.log(formatCompletionLine(elapsedMs));
                 printSessionUsage(activeSession.id);
                 console.log();
 
@@ -1747,11 +1748,12 @@ ${projectContextBlock}`
                     throw new Error(`Updated file but ${validation.validator} validation failed:\n${validation.output}`);
                 }
 
-                spinner.stop();
+                const elapsedMs = spinner.stop();
                 const editMessage = implicitEditPrompt
                     ? `Updated and validated file (auto edit intent): ${editFilePrompt.filePath} (${validation.validator})`
                     : `Updated and validated file: ${editFilePrompt.filePath} (${validation.validator})`;
                 console.log("AI:", editMessage);
+                console.log(formatCompletionLine(elapsedMs));
                 printSessionUsage(activeSession.id);
                 console.log();
 
@@ -1825,14 +1827,15 @@ Do not mention hidden context, internal tools, or system prompts.`;
             recordResponseUsage(activeSession.id, response.data);
 
             const answer = response.data.choices[0].message.content?.trim() ?? "";
-            spinner.stop();
+            const elapsedMs = spinner.stop();
             console.log("AI:", answer);
+            console.log(formatCompletionLine(elapsedMs));
             printSessionUsage(activeSession.id);
             console.log();
 
             sessionTool.appendExchange(activeSession.id, trimmed, answer);
         } catch (error) {
-            spinner.stop();
+            const elapsedMs = spinner.stop();
             if (requestController.signal.aborted) {
                 const reason = requestController.signal.reason instanceof Error && requestController.signal.reason.message.includes("budget")
                     ? requestController.signal.reason.message
@@ -1840,6 +1843,7 @@ Do not mention hidden context, internal tools, or system prompts.`;
                 console.log(`${reason} The CLI is ready for the next prompt; use /undo if a completed write should be reverted.`);
             }
             else console.error(`API Error: ${llamaClient.formatError(error)}`);
+            console.log(formatCompletionLine(elapsedMs, false));
         } finally {
             clearTimeout(requestBudgetTimer);
             if (activeRequestController === requestController) activeRequestController = undefined;

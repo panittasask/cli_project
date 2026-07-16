@@ -10,6 +10,10 @@ function formatElapsedTime(milliseconds: number): string {
         : `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function formatCompletionLine(milliseconds: number, completed = true): string {
+    return `${completed ? "Completed in" : "Stopped after"} ${formatElapsedTime(milliseconds)}`;
+}
+
 function formatSpinnerLine(
     frame: string,
     message: string,
@@ -52,14 +56,14 @@ class Spinner {
         this.timer = setInterval(() => this.render(Date.now()), 100);
     }
 
-    stop(): void {
-        if (!this.timer) {
-            return;
+    stop(): number {
+        const elapsed = this.taskStartedAt > 0 ? Math.max(0, Date.now() - this.taskStartedAt) : 0;
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+            process.stdout.write("\r\x1b[K");
         }
-
-        clearInterval(this.timer);
-        this.timer = undefined;
-        process.stdout.write("\r\x1b[K");
+        return elapsed;
     }
 
     update(message: string): void {
@@ -91,6 +95,7 @@ class Spinner {
 
 module.exports = {
     Spinner,
+    formatCompletionLine,
     formatElapsedTime,
     formatSpinnerLine
 };
