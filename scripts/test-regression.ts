@@ -3,11 +3,14 @@ import fs = require("node:fs");
 import os = require("node:os");
 import path = require("node:path");
 
-const { classifyWorkflow, classifyWorkflowWithHistory, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, workflowInstructions } = require("../cli/workflowRouter") as {
+const { classifyWorkflow, classifyWorkflowWithHistory, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, verificationRequirement, verificationRequirementWithHistory, commandSatisfiesVerification, workflowInstructions } = require("../cli/workflowRouter") as {
     classifyWorkflow: (message: string) => { kind: string };
     classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: string };
     requiresWorkspaceWrite: (message: string) => boolean;
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
+    verificationRequirement: (message: string) => "none" | "command" | "runtime";
+    verificationRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => "none" | "command" | "runtime";
+    commandSatisfiesVerification: (command: string, requirement: "none" | "command" | "runtime") => boolean;
     workflowInstructions: (kind: string) => string;
 };
 const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext") as {
@@ -92,6 +95,8 @@ async function main(): Promise<void> {
     assert.equal(classifyWorkflow("ยังไม่มี ตัว register นะ").kind, "coding");
     assert.equal(classifyWorkflow("ทำเลยเพิ่มปุ่มตัว register ได้เลย").kind, "coding");
     assert.equal(classifyWorkflow("ทำงานเดิมต่อจากสถานะไฟล์ปัจจุบันให้เสร็จ").kind, "coding");
+    const swaggerUntilWorking = "ใช้วิธีแก้อื่นจนกว่ามันจะสามารถเปิด swagger ได้";
+    assert.equal(classifyWorkflow(swaggerUntilWorking).kind, "coding");
     assert.equal(classifyWorkflow("เช็ค version ล่าสุดของ llama.cpp").kind, "web_research");
     const uiSpacingRequest = "จัดระเบียบ ui ให้มันสวยกว่านี้หน่อยซิ ตัว ยกเลิก กับลงทะเบียนมันติดกันจัดๆเลย";
     assert.equal(classifyWorkflow(uiSpacingRequest).kind, "coding");
@@ -103,11 +108,22 @@ async function main(): Promise<void> {
     assert.equal(requiresWorkspaceWrite("สร้างหน้า login พร้อม privacy policy modal"), true);
     assert.equal(requiresWorkspaceWrite("ทำเลยเพิ่มปุ่มตัว register ได้เลย"), true);
     assert.equal(requiresWorkspaceWrite(uiSpacingRequest), true);
+    assert.equal(requiresWorkspaceWrite(swaggerUntilWorking), true);
     assert.equal(requiresWorkspaceWriteWithHistory("ทำงานต่อจากเดิมหน่อย", [
         { role: "user", content: "แก้ไฟล์ login.html ให้มี register" },
         { role: "assistant", content: "ยังแก้ไม่เสร็จ" }
     ], true), true);
     assert.equal(requiresWorkspaceWrite("file ถูกสร้างไว้ที่ไหน"), false);
+    assert.equal(verificationRequirement(swaggerUntilWorking), "runtime");
+    assert.equal(verificationRequirement("แก้ TypeScript จนกว่า npm test จะผ่าน"), "command");
+    assert.equal(verificationRequirement("อธิบายว่า Swagger คืออะไร"), "none");
+    assert.equal(verificationRequirementWithHistory("ทำงานต่อให้เสร็จ", [
+        { role: "user", content: swaggerUntilWorking },
+        { role: "assistant", content: "ยังเปิดไม่ได้" }
+    ], true), "runtime");
+    assert.equal(commandSatisfiesVerification("go build -o app.exe main.go", "runtime"), false);
+    assert.equal(commandSatisfiesVerification("Invoke-WebRequest http://localhost:3000/swagger", "runtime"), true);
+    assert.equal(commandSatisfiesVerification("npm test", "command"), true);
     assert.match(workflowInstructions("web_research"), /Never use search_files/);
     const webActions = getAgentResponseFormat("web_research").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(webActions.includes("mcp_call_tool"));
@@ -129,6 +145,9 @@ async function main(): Promise<void> {
     const firstCreateActions = getInitialAgentResponseFormat("coding", "สร้างหน้า login พร้อม privacy policy modal", true).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(firstCreateActions.includes("write_file"));
     assert.ok(!firstCreateActions.includes("final"));
+    const swaggerRepairActions = getInitialAgentResponseFormat("coding", swaggerUntilWorking, true).schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.ok(swaggerRepairActions.includes("edit_file"));
+    assert.ok(!swaggerRepairActions.includes("final"));
     const repeatedReadRecoveryActions = getAgentRecoveryResponseFormat("coding", "read_file").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(!repeatedReadRecoveryActions.includes("read_file"));
     assert.ok(repeatedReadRecoveryActions.includes("write_file"));
@@ -160,6 +179,8 @@ async function main(): Promise<void> {
         maxSegments: 3,
         writtenPaths: ["login.html"],
         validationFailures: [],
+        verificationRequirement: "runtime",
+        verificationSatisfied: false,
         sourceUrls: [],
         recentEvents: ["edit_file [ok] login.html", "read_file [ok] login.html"],
         mcpCallsDisabled: true
@@ -168,6 +189,8 @@ async function main(): Promise<void> {
     assert.match(compacted[1]?.content ?? "", /Continuation segment: 2\/3/);
     assert.match(compacted[1]?.content ?? "", /Successful file changes: login\.html/);
     assert.match(compacted[1]?.content ?? "", /MCP calls available: no/);
+    assert.match(compacted[1]?.content ?? "", /Required verification: runtime/);
+    assert.match(compacted[1]?.content ?? "", /Required verification satisfied after the latest write: no/);
 
     const sharedLogDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cli-shared-task-id-"));
     try {
@@ -209,6 +232,7 @@ async function main(): Promise<void> {
     assert.equal(isContinuationRequest("ยังไม่มี ตัว register นะ"), true);
     assert.equal(isContinuationRequest("ทำเลยเพิ่มปุ่มตัว register ได้เลย"), true);
     assert.equal(isContinuationRequest("ทำงานเก่าต่อให้หน่อย"), true);
+    assert.equal(isContinuationRequest(swaggerUntilWorking), true);
     assert.equal(selectTaskContext("ทำงานต่อจากเดิมหน่อย", history, "general", 6).length, 4);
     const related = selectTaskContext("session อยู่ตรงไหน", history, "coding", 6);
     assert.ok(related.some((message) => message.content.includes("session")));

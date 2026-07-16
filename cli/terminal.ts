@@ -71,6 +71,8 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
             writtenPaths: string[];
             validationFailures: string[];
             unresolvedVerificationFailure?: string;
+            verificationRequirement?: "none" | "command" | "runtime";
+            verificationSatisfied?: boolean;
             sourceUrls: string[];
             recentEvents: string[];
             mcpCallsDisabled?: boolean;
@@ -100,9 +102,12 @@ const { formatSessionHistory } = require("./sessionHistory") as {
     formatSessionHistory: (messages: Array<{ role: "user" | "assistant"; content: string }>, maxMessages?: number) => string;
 };
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
-const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, workflowInstructions } = require("./workflowRouter") as {
+type VerificationRequirement = "none" | "command" | "runtime";
+const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, verificationRequirementWithHistory, commandSatisfiesVerification, workflowInstructions } = require("./workflowRouter") as {
     classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: WorkflowKind; reason: string };
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
+    verificationRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => VerificationRequirement;
+    commandSatisfiesVerification: (command: string, requirement: VerificationRequirement) => boolean;
     workflowInstructions: (kind: WorkflowKind) => string;
 };
 const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
@@ -1021,6 +1026,7 @@ async function runAgentLoop(
     const continuation = isContinuationRequest(userMessage);
     const workflow = classifyWorkflowWithHistory(userMessage, historyForModel, continuation);
     const mustWrite = requiresWorkspaceWriteWithHistory(userMessage, historyForModel, continuation);
+    const verificationRequirement = verificationRequirementWithHistory(userMessage, historyForModel, continuation);
     const agentResponseFormat = getAgentResponseFormat(workflow.kind);
     const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage, mustWrite);
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
@@ -1032,6 +1038,7 @@ async function runAgentLoop(
     const readPaths = new Set<string>();
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
+    let verificationSatisfied = verificationRequirement === "none";
     const writtenPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
@@ -1047,6 +1054,9 @@ async function runAgentLoop(
     const systemPrompt = await agentTool.buildSystemPrompt([
         workflowInstructions(workflow.kind),
         `Router decision: ${workflow.reason}`,
+        verificationRequirement === "none"
+            ? "No explicit command-level acceptance check was inferred."
+            : `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`,
         skillPrompt
     ].filter(Boolean).join("\n\n"));
     let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
@@ -1065,6 +1075,8 @@ async function runAgentLoop(
                 writtenPaths: Array.from(writtenPaths),
                 validationFailures: Array.from(validationFailures),
                 ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {}),
+                verificationRequirement,
+                verificationSatisfied,
                 sourceUrls: Array.from(sourceUrls),
                 recentEvents: segmentEvents,
                 mcpCallsDisabled
@@ -1183,7 +1195,18 @@ async function runAgentLoop(
                 spinner.log(`[${turn}/${maxTurns}] Final blocked: the latest verification command failed`);
                 messages.push({
                     role: "user",
-                    content: `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Use read_file or search_files to verify the changed file, or run an OS-compatible verification command. Do not assume a localhost server exists.`
+                    content: `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Inspect the error and run an OS-compatible verification command successfully. A read_file or search_files action can diagnose the problem but does not clear the failed verification. Do not assume a localhost server exists.`
+                });
+                continue;
+            }
+            if (!verificationSatisfied) {
+                const requiredCheck = verificationRequirement === "runtime"
+                    ? "run an OS-compatible runtime probe of the requested URL, endpoint, server, or UI"
+                    : "run the relevant test, build, lint, or verification command";
+                spinner.log(`[${turn}/${maxTurns}] Final blocked: required ${verificationRequirement} verification has not succeeded after the latest write`);
+                messages.push({
+                    role: "user",
+                    content: `You cannot return final yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior.`
                 });
                 continue;
             }
@@ -1284,6 +1307,7 @@ async function runAgentLoop(
             if (validation.ok) validationFailures.delete(action.path);
             else validationFailures.add(action.path);
             writtenPaths.add(action.path);
+            if (verificationRequirement !== "none") verificationSatisfied = false;
             if (workflow.kind === "mcp_creation") {
                 successfulMcpDiscovery = false;
                 successfulMcpCall = false;
@@ -1293,9 +1317,13 @@ async function runAgentLoop(
         if (action.action === "mcp_call_tool" && result.ok) successfulMcpCall = true;
         if (action.action === "run_command" && !result.ok) {
             unresolvedVerificationFailure = result.output.slice(0, 500);
-        } else if (unresolvedVerificationFailure && result.ok
-            && (action.action === "read_file" || action.action === "search_files" || action.action === "run_command")) {
-            unresolvedVerificationFailure = undefined;
+            if (verificationRequirement !== "none") verificationSatisfied = false;
+        } else if (action.action === "run_command" && result.ok) {
+            const satisfiesRequiredCheck = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
+            if (satisfiesRequiredCheck) {
+                verificationSatisfied = true;
+                unresolvedVerificationFailure = undefined;
+            }
         }
         spinner.update(result.ok
             ? `Completed ${action.action}; reviewing result...`
