@@ -165,7 +165,8 @@ file, validation, verification, source, and recent-event state, then continues
 automatically for up to `maxSegments`. Wall-clock and completion-token budgets
 remain global hard limits across segments. Model-generated writes show a compact
 diff preview and save a checkpoint first. Run `/undo` to restore the most recent
-checkpoint for the active workspace.
+checkpoint for the active workspace. After each request, the CLI keeps the
+spinner's total duration as a persistent `Completed in` or `Stopped after` line.
 
 Project-local skills live at `.cli/skills/<name>/SKILL.md` with required `name`
 and `description` frontmatter. Run `/skills` to list them, invoke one explicitly
