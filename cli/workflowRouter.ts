@@ -6,8 +6,12 @@ type WorkflowDecision = {
 };
 
 const webPatterns = [
-    /\b(latest|current|today|news|price|weather|search (?:the )?web|look up|online)\b/i,
-    /(ล่าสุด|ปัจจุบัน|วันนี้|ตอนนี้.*(?:เวอร์ชัน|version)|ข่าว|ราคา|อากาศ|ค้น(?:หา)?(?:เว็บ|เน็ต|ออนไลน์))/i
+    /\b(search (?:the )?web|look up online|browse|online search)\b/i,
+    /\b(latest|current|today)\b[\s\S]*\b(news|price|weather|version|release|online)\b/i,
+    /\b(news|price|weather|version|release)\b[\s\S]*\b(latest|current|today|online)\b/i,
+    /(ค้น(?:หา)?(?:เว็บ|เน็ต|ออนไลน์)|เช็ค(?:เว็บ|ออนไลน์)|ดูข่าว)/i,
+    /(ล่าสุด|ปัจจุบัน|วันนี้|ตอนนี้)[\s\S]*(เวอร์ชัน|version|ข่าว|ราคา|อากาศ|ข้อมูลออนไลน์)/i,
+    /(เวอร์ชัน|version|ข่าว|ราคา|อากาศ)[\s\S]*(ล่าสุด|ปัจจุบัน|วันนี้|ตอนนี้)/i
 ];
 
 const mcpPatterns = [

@@ -34,7 +34,7 @@ const { SkillLoader } = require("./skillLoader") as { SkillLoader: new () => {
     select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string; description: string; body: string }>;
     formatPrompt: (skills: Array<{ name: string; description: string; body: string }>) => string;
 } };
-const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }) => {
+const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }, taskId?: string) => {
     add: (entry: {
         turn: number;
         status: "action" | "ok" | "error" | "parse_error" | "final";
@@ -46,7 +46,7 @@ const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?:
     save: () => void;
     print: () => void;
 } };
-const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog: new (logTarget?: string | { directory: string; basename: string }) => {
+const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog: new (logTarget?: string | { directory: string; basename: string }, taskId?: string) => {
     append: (entry: {
         turn: number;
         maxTurns: number;
@@ -73,13 +73,15 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
             unresolvedVerificationFailure?: string;
             sourceUrls: string[];
             recentEvents: string[];
+            mcpCallsDisabled?: boolean;
         }
     ) => Array<{ role: "system" | "user"; content: string }>;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string) => Record<string, unknown>;
+    getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string, requiresWrite?: boolean) => Record<string, unknown>;
 };
 const { StatusBar } = require("./statusBar") as { StatusBar: new (getState: () => {
@@ -142,7 +144,7 @@ const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => 
         contextReason: string;
     } | undefined;
 } };
-const { AgentTool } = require("./tools/agentTool") as { AgentTool: new () => {
+const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRoot?: string) => {
     buildSystemPrompt: (workflowInstructions?: string) => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
@@ -358,7 +360,7 @@ const imageTool = new ImageTool();
 const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
 const toolRouter = new ToolRouter();
-const agentTool = new AgentTool();
+const agentTool = new AgentTool(appRoot);
 const checkpointStore = new FileCheckpointStore(appRoot);
 const skillLoader = new SkillLoader();
 let activeRequestController: AbortController | undefined;
@@ -1033,12 +1035,14 @@ async function runAgentLoop(
     const writtenPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
+    let mcpCallsDisabled = false;
     const sourceUrls = new Set<string>();
     const logDirectory = path.resolve(appRoot, ".cli", "logs");
     const traceTarget = { directory: logDirectory, basename: "agent-trace" };
     const responseTarget = { directory: logDirectory, basename: "agent-model-responses" };
-    const trace = new AgentTrace(traceTarget);
-    const responseLog = new AgentResponseLog(responseTarget);
+    const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    const trace = new AgentTrace(traceTarget, taskId);
+    const responseLog = new AgentResponseLog(responseTarget, taskId);
     const responseLogDisplayPath = path.relative(appRoot, resolveJsonlLogPath(responseTarget));
     const systemPrompt = await agentTool.buildSystemPrompt([
         workflowInstructions(workflow.kind),
@@ -1062,7 +1066,8 @@ async function runAgentLoop(
                 validationFailures: Array.from(validationFailures),
                 ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {}),
                 sourceUrls: Array.from(sourceUrls),
-                recentEvents: segmentEvents
+                recentEvents: segmentEvents,
+                mcpCallsDisabled
             });
             segmentEvents = [];
             readPaths.clear();
@@ -1080,7 +1085,9 @@ async function runAgentLoop(
             return { answer, trace };
         }
         const requestFormat = recoveryResponseFormat
-            ?? (turn === 1 ? initialAgentResponseFormat : agentResponseFormat);
+            ?? (mcpCallsDisabled
+                ? getAgentLocalResponseFormat(workflow.kind)
+                : (turn === 1 ? initialAgentResponseFormat : agentResponseFormat));
         recoveryResponseFormat = undefined;
         spinner.update(turn === 1
             ? `Planning next action (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`
@@ -1180,7 +1187,7 @@ async function runAgentLoop(
                 });
                 continue;
             }
-            if (workflow.kind === "web_research" && sourceUrls.size < 2) {
+            if (workflow.kind === "web_research" && !mcpCallsDisabled && sourceUrls.size < 2) {
                 spinner.log(`[${turn}/${maxTurns}] Final blocked: web research needs at least two relevant source URLs`);
                 messages.push({ role: "user", content: "You cannot return final yet. Web research requires at least two relevant source URLs from successful MCP observations. Refine the web query; do not use search_files." });
                 continue;
@@ -1249,6 +1256,22 @@ async function runAgentLoop(
         spinner.log(agentTool.formatActionStatus(action, segmentTurn, maxTurnsPerSegment));
         spinner.update(`Executing ${action.action}...`);
         let result = await agentTool.execute(action);
+        if (workflow.kind !== "mcp_creation" && action.action === "mcp_list_tools" && result.ok
+            && (/"servers"\s*:\s*\[\s*\]/i.test(result.output) || /Unknown MCP server/i.test(result.output))) {
+            mcpCallsDisabled = true;
+            result = {
+                ok: false,
+                output: `${result.output}\nMCP disabled for this request because no configured server is available. Use local file tools and do not invent server names.`
+            };
+        }
+        if (workflow.kind !== "mcp_creation" && action.action === "mcp_call_tool" && !result.ok
+            && /Unknown MCP server|No MCP servers configured/i.test(result.output)) {
+            mcpCallsDisabled = true;
+            result = {
+                ...result,
+                output: `${result.output}\nMCP disabled for this request. Use local file tools and do not invent server names.`
+            };
+        }
         if (action.action === "read_file" && result.ok && action.path) {
             readPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
         }

@@ -141,8 +141,10 @@ Agent requests are classified as general, web research, coding, or MCP creation
 before the model acts. Classification selects specialized instructions but does
 not prevent a general request from using local file tools: the model can choose
 read, search, write, command, or final actions from the request and relevant
-session context. Web and MCP workflows remain restricted to their relevant
-tools. Existing files must be read before an agent write. JSON, TypeScript, and
+session context. A temporal word such as `current` or `ปัจจุบัน` only selects web
+research when it is paired with an online subject such as news, price, weather,
+or version. Web research keeps local file tools available as a recovery path.
+Existing files must be read before an agent write. JSON, TypeScript, and
 `.gitignore` changes receive automatic validation, and a failed validation
 blocks a final success response.
 
@@ -237,6 +239,12 @@ their tool names, descriptions, and input schemas in the model prompt, and lets
 the model use `mcp_list_tools` and `mcp_call_tool` actions. Ask it to create a
 new MCP server and it will use the same folder/config convention, then discover
 and invoke the new tool before reporting success.
+
+The active workspace's `.cli/mcp.json` takes priority. If it is absent, the CLI
+installation's config is used so switching workspaces does not hide built-in
+servers. If discovery reports no configured server, MCP actions are disabled
+for that request and compacted continuation state preserves that decision; the
+agent must use local tools instead of guessing server names.
 
 The included `example` server exposes an `echo` tool for connection testing.
 Treat `.cli/mcp.json` as trusted code because each entry starts the configured

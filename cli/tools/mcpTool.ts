@@ -53,6 +53,8 @@ class McpTool {
     private readonly connections = new Map<string, McpConnection>();
     private readonly toolOwners = new Map<string, string | null>();
 
+    constructor(private readonly configRoot = process.cwd()) {}
+
     resolveDirectCall(toolName: string, payload: JsonObject): { server: string; tool: string; arguments: JsonObject } | undefined {
         let normalizedToolName = toolName;
         let serverName = this.toolOwners.get(toolName);
@@ -202,10 +204,16 @@ ${sections.join("\n")}`;
     }
 
     private loadConfig(): Record<string, McpServerConfig> {
-        const configPath = path.resolve(process.cwd(), ".cli", "mcp.json");
-        if (!fs.existsSync(configPath)) {
+        const workspaceConfigPath = path.resolve(process.cwd(), ".cli", "mcp.json");
+        const appConfigPath = path.resolve(this.configRoot, ".cli", "mcp.json");
+        const configPath = fs.existsSync(workspaceConfigPath)
+            ? workspaceConfigPath
+            : fs.existsSync(appConfigPath) ? appConfigPath : undefined;
+        if (!configPath) {
             return {};
         }
+
+        const configRoot = path.dirname(path.dirname(configPath));
 
         const parsed = JSON.parse(fs.readFileSync(configPath, "utf8")) as { mcpServers?: unknown };
         if (!parsed.mcpServers || typeof parsed.mcpServers !== "object") {
@@ -226,19 +234,18 @@ ${sections.join("\n")}`;
             const args = raw.args === undefined ? [] : this.stringArray(raw.args, `${name}.args`);
             const env = raw.env === undefined ? {} : this.stringRecord(raw.env, `${name}.env`);
             const cwdInput = typeof raw.cwd === "string" ? raw.cwd : ".";
-            const cwd = this.resolveInsideWorkspace(cwdInput);
+            const cwd = this.resolveInsideRoot(cwdInput, configRoot);
             configs[name] = { command: raw.command, args, cwd, env };
         }
 
         return configs;
     }
 
-    private resolveInsideWorkspace(inputPath: string): string {
-        const workspace = process.cwd();
-        const resolved = path.resolve(workspace, inputPath);
-        const relative = path.relative(workspace, resolved);
+    private resolveInsideRoot(inputPath: string, root: string): string {
+        const resolved = path.resolve(root, inputPath);
+        const relative = path.relative(root, resolved);
         if (relative.startsWith("..") || path.isAbsolute(relative)) {
-            throw new Error(`MCP cwd is outside workspace: ${inputPath}`);
+            throw new Error(`MCP cwd is outside config root: ${inputPath}`);
         }
         return resolved;
     }

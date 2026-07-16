@@ -54,12 +54,14 @@ function redact(value: unknown, key = ""): unknown {
 class AgentTrace {
     private readonly entries: TraceEntry[] = [];
     private savedEntryCount = 0;
-    private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
-    constructor(private readonly logTarget: string | { directory: string; basename: string } = {
-        directory: path.resolve(process.cwd(), ".cli", "logs"),
-        basename: "agent-trace"
-    }) {}
+    constructor(
+        private readonly logTarget: string | { directory: string; basename: string } = {
+            directory: path.resolve(process.cwd(), ".cli", "logs"),
+            basename: "agent-trace"
+        },
+        private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+    ) {}
 
     add(entry: Omit<TraceEntry, "taskId" | "timestamp">): void {
         this.entries.push({
