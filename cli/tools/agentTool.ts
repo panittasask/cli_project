@@ -1,7 +1,7 @@
 import childProcess = require("node:child_process");
 import fs = require("node:fs");
 import path = require("node:path");
-const { McpTool } = require("./mcpTool") as { McpTool: new () => {
+const { McpTool } = require("./mcpTool") as { McpTool: new (configRoot?: string) => {
     buildPromptSection: () => Promise<string>;
     listTools: (serverName?: string) => Promise<string>;
     callTool: (serverName: string, toolName: string, args: Record<string, unknown>) => Promise<string>;
@@ -79,7 +79,11 @@ class AgentTool {
         "system volume information",
         "recovery"
     ]);
-    private readonly mcpTool = new McpTool();
+    private readonly mcpTool: InstanceType<typeof McpTool>;
+
+    constructor(configRoot = process.cwd()) {
+        this.mcpTool = new McpTool(configRoot);
+    }
 
     async buildSystemPrompt(workflowInstructions = ""): Promise<string> {
         const mcpSection = await this.mcpTool.buildPromptSection();

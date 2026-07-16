@@ -54,7 +54,7 @@ const workflowActions: Record<WorkflowKind, string[]> = {
     // conversational context instead of relying on an exhaustive intent regex.
     // Runtime guards still enforce workspace boundaries and safe mutations.
     general: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "final"],
-    web_research: ["mcp_call_tool", "mcp_list_tools", "final"],
+    web_research: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "final"],
     coding: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "final"],
     mcp_creation: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "final"]
 };
@@ -68,6 +68,11 @@ function getAgentRecoveryResponseFormat(workflow: WorkflowKind, blockedAction: s
     return formatForActions(actions.length > 0 ? actions : ["final"]);
 }
 
+function getAgentLocalResponseFormat(workflow: WorkflowKind): Record<string, unknown> {
+    const actions = workflowActions[workflow].filter((action) => !action.startsWith("mcp_"));
+    return formatForActions(actions.length > 0 ? actions : ["final"]);
+}
+
 function getInitialAgentResponseFormat(workflow: WorkflowKind, message: string, requiresWrite = false): Record<string, unknown> {
     if ((workflow === "coding" || workflow === "mcp_creation") && requiresWrite) {
         return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file"]);
@@ -76,7 +81,7 @@ function getInitialAgentResponseFormat(workflow: WorkflowKind, message: string, 
         return formatForActions(["read_file"]);
     }
     if (workflow === "web_research") {
-        return formatForActions(["mcp_call_tool", "mcp_list_tools"]);
+        return getAgentResponseFormat(workflow);
     }
     return getAgentResponseFormat(workflow);
 }
@@ -98,4 +103,4 @@ function formatForActions(actions: string[]): Record<string, unknown> {
     };
 }
 
-module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getInitialAgentResponseFormat };
+module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat };

@@ -6,6 +6,7 @@ type CompactState = {
     unresolvedVerificationFailure?: string;
     sourceUrls: string[];
     recentEvents: string[];
+    mcpCallsDisabled?: boolean;
 };
 
 function buildCompactedAgentMessages(
@@ -20,6 +21,7 @@ function buildCompactedAgentMessages(
         `Validation failures: ${state.validationFailures.join(", ") || "none"}`,
         `Unresolved verification failure: ${state.unresolvedVerificationFailure || "none"}`,
         `Collected source URLs: ${state.sourceUrls.join(", ") || "none"}`,
+        `MCP calls available: ${state.mcpCallsDisabled ? "no - use local file tools and do not invent server names" : "yes"}`,
         "Recent agent events:",
         ...(state.recentEvents.slice(-10).length > 0 ? state.recentEvents.slice(-10) : ["none"]),
         "Continue the task from this compact state. Re-read any file whose exact current content is needed. Do not repeat completed work or claim unverified success."

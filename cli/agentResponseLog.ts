@@ -16,13 +16,12 @@ type AgentResponseLogEntry = {
 };
 
 class AgentResponseLog {
-    private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-
     constructor(
         private readonly logTarget: string | { directory: string; basename: string } = {
             directory: path.resolve(process.cwd(), ".cli", "logs"),
             basename: "agent-model-responses"
-        }
+        },
+        private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
     ) {}
 
     append(entry: AgentResponseLogEntry): void {

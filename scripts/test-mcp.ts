@@ -1,11 +1,18 @@
-const { McpTool } = require("../cli/tools/mcpTool") as { McpTool: new () => {
+import fs = require("node:fs");
+import os = require("node:os");
+import path = require("node:path");
+
+const { McpTool } = require("../cli/tools/mcpTool") as { McpTool: new (configRoot?: string) => {
     listTools: (serverName?: string) => Promise<string>;
     callTool: (serverName: string, toolName: string, args: Record<string, unknown>) => Promise<string>;
     close: () => Promise<void>;
 } };
 
 async function main(): Promise<void> {
-    const mcp = new McpTool();
+    const appRoot = process.cwd();
+    const emptyWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-mcp-workspace-"));
+    process.chdir(emptyWorkspace);
+    const mcp = new McpTool(appRoot);
 
     try {
         const listed = JSON.parse(await mcp.listTools("example")) as {
@@ -35,6 +42,8 @@ async function main(): Promise<void> {
         console.log("MCP discovery, web capability manifest, and example tool call passed.");
     } finally {
         await mcp.close();
+        process.chdir(appRoot);
+        fs.rmSync(emptyWorkspace, { recursive: true, force: true });
     }
 }
 

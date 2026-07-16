@@ -21,7 +21,7 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () =
     buildSystemPrompt: (instructions?: string) => Promise<string>;
     close: () => Promise<void>;
 } };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentResponseFormat: (workflow: string) => {
         schema: {
@@ -29,6 +29,9 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
         };
     };
     getAgentRecoveryResponseFormat: (workflow: string, blockedAction: string) => {
+        schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
+    };
+    getAgentLocalResponseFormat: (workflow: string) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
     getInitialAgentResponseFormat: (workflow: string, message: string, requiresWrite?: boolean) => {
@@ -57,6 +60,17 @@ const { SkillLoader } = require("../cli/skillLoader") as { SkillLoader: new () =
 const { buildCompactedAgentMessages } = require("../cli/agentCompaction") as {
     buildCompactedAgentMessages: (system: string, request: string, state: Record<string, unknown>) => Array<{ role: string; content: string }>;
 };
+const { AgentTrace } = require("../cli/agentTrace") as {
+    AgentTrace: new (target: { directory: string; basename: string }, taskId?: string) => {
+        add: (entry: Record<string, unknown>) => void;
+        save: () => void;
+    };
+};
+const { AgentResponseLog } = require("../cli/agentResponseLog") as {
+    AgentResponseLog: new (target: { directory: string; basename: string }, taskId?: string) => {
+        append: (entry: Record<string, unknown>) => void;
+    };
+};
 
 async function main(): Promise<void> {
     const startScript = fs.readFileSync(path.resolve(__dirname, "start.ps1"), "utf8");
@@ -77,6 +91,8 @@ async function main(): Promise<void> {
     assert.equal(classifyWorkflow("สร้างหน้า login พร้อม privacy policy modal").kind, "coding");
     assert.equal(classifyWorkflow("ยังไม่มี ตัว register นะ").kind, "coding");
     assert.equal(classifyWorkflow("ทำเลยเพิ่มปุ่มตัว register ได้เลย").kind, "coding");
+    assert.equal(classifyWorkflow("ทำงานเดิมต่อจากสถานะไฟล์ปัจจุบันให้เสร็จ").kind, "coding");
+    assert.equal(classifyWorkflow("เช็ค version ล่าสุดของ llama.cpp").kind, "web_research");
     const uiSpacingRequest = "จัดระเบียบ ui ให้มันสวยกว่านี้หน่อยซิ ตัว ยกเลิก กับลงทะเบียนมันติดกันจัดๆเลย";
     assert.equal(classifyWorkflow(uiSpacingRequest).kind, "coding");
     assert.equal(classifyWorkflowWithHistory("ทำงานต่อจากเดิมหน่อย", [
@@ -94,8 +110,13 @@ async function main(): Promise<void> {
     assert.equal(requiresWorkspaceWrite("file ถูกสร้างไว้ที่ไหน"), false);
     assert.match(workflowInstructions("web_research"), /Never use search_files/);
     const webActions = getAgentResponseFormat("web_research").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(webActions, ["mcp_call_tool", "mcp_list_tools", "final"]);
-    assert.ok(!webActions.includes("search_files"));
+    assert.ok(webActions.includes("mcp_call_tool"));
+    assert.ok(webActions.includes("read_file"));
+    assert.ok(webActions.includes("search_files"));
+    const localWebActions = getAgentLocalResponseFormat("web_research").schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.ok(localWebActions.includes("read_file"));
+    assert.ok(!localWebActions.includes("mcp_call_tool"));
+    assert.ok(!localWebActions.includes("mcp_list_tools"));
     const generalActions = getAgentResponseFormat("general").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "final"]);
     const ambiguousWorkspaceActions = getInitialAgentResponseFormat("general", "ช่วยเอาสองอันนี้แยกออกจากกัน").schema.oneOf.map((variant) => variant.properties.action.const);
@@ -140,11 +161,29 @@ async function main(): Promise<void> {
         writtenPaths: ["login.html"],
         validationFailures: [],
         sourceUrls: [],
-        recentEvents: ["edit_file [ok] login.html", "read_file [ok] login.html"]
+        recentEvents: ["edit_file [ok] login.html", "read_file [ok] login.html"],
+        mcpCallsDisabled: true
     });
     assert.deepEqual(compacted.map((message) => message.role), ["system", "user"]);
     assert.match(compacted[1]?.content ?? "", /Continuation segment: 2\/3/);
     assert.match(compacted[1]?.content ?? "", /Successful file changes: login\.html/);
+    assert.match(compacted[1]?.content ?? "", /MCP calls available: no/);
+
+    const sharedLogDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cli-shared-task-id-"));
+    try {
+        const sharedTaskId = "task_shared_regression";
+        const trace = new AgentTrace({ directory: sharedLogDirectory, basename: "trace" }, sharedTaskId);
+        trace.add({ turn: 1, status: "final", action: "final" });
+        trace.save();
+        const responses = new AgentResponseLog({ directory: sharedLogDirectory, basename: "responses" }, sharedTaskId);
+        responses.append({ turn: 1, maxTurns: 1, requestFormat: {}, rawContent: "{}", parsedAction: "final" });
+        const loggedIds = fs.readdirSync(sharedLogDirectory).flatMap((file) =>
+            fs.readFileSync(path.join(sharedLogDirectory, file), "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line).taskId)
+        );
+        assert.deepEqual(loggedIds, [sharedTaskId, sharedTaskId]);
+    } finally {
+        fs.rmSync(sharedLogDirectory, { recursive: true, force: true });
+    }
     const agent = new AgentTool();
     try {
         const generalPrompt = await agent.buildSystemPrompt(workflowInstructions("general"));
