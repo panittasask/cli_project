@@ -3,14 +3,18 @@ import fs = require("node:fs");
 import os = require("node:os");
 import path = require("node:path");
 
-const { classifyWorkflow, classifyWorkflowWithHistory, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, verificationRequirement, verificationRequirementWithHistory, commandSatisfiesVerification, workflowInstructions } = require("../cli/workflowRouter") as {
+const { classifyWorkflow, classifyWorkflowWithHistory, forbidsWorkspaceWrite, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, verificationRequirement, verificationRequirementWithHistory, commandSatisfiesVerification, acceptanceContract, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("../cli/workflowRouter") as {
     classifyWorkflow: (message: string) => { kind: string };
     classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: string };
+    forbidsWorkspaceWrite: (message: string) => boolean;
     requiresWorkspaceWrite: (message: string) => boolean;
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     verificationRequirement: (message: string) => "none" | "command" | "runtime";
     verificationRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => "none" | "command" | "runtime";
     commandSatisfiesVerification: (command: string, requirement: "none" | "command" | "runtime") => boolean;
+    acceptanceContract: (message: string) => { evidence: "source" | "command" | "runtime" | "interaction"; verification: "none" | "command" | "runtime"; reason: string };
+    acceptanceContractWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { evidence: string; verification: string; reason: string };
+    commandSatisfiesAcceptance: (command: string, contract: { evidence: "source" | "command" | "runtime" | "interaction"; verification: "none" | "command" | "runtime"; reason: string }) => boolean;
     workflowInstructions: (kind: string) => string;
 };
 const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext") as {
@@ -30,18 +34,33 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () =
 } };
 const {
     answerLooksLikeBlockingClarification,
+    clarificationBlockReason,
     clarificationObservation,
     formatClarificationRequest,
     normalizeClarificationRequest,
+    relevantClarificationInspections,
     resolveClarificationAnswer
 } = require("../cli/clarification") as {
     answerLooksLikeBlockingClarification: (answer: string) => boolean;
+    clarificationBlockReason: (input: {
+        workspaceMutationRequired: boolean;
+        successfulInspections: number;
+        answeredClarifications: number;
+        hasNewBlocker: boolean;
+        decision: "target" | "scope" | "compatibility" | "destructive" | "cost" | "external" | "preference";
+        knownProjectRoots: number;
+        asksNewVersusExisting: boolean;
+        maxClarifications: number;
+        requireInspection: boolean;
+        secondRequiresBlocker: boolean;
+    }) => string | undefined;
     clarificationObservation: (request: Record<string, any>, answer: Record<string, any>) => Record<string, unknown>;
     formatClarificationRequest: (request: Record<string, any>) => string;
-    normalizeClarificationRequest: (question: unknown, options: unknown, reason?: string) => Record<string, any> | undefined;
+    normalizeClarificationRequest: (question: unknown, options: unknown, decision: unknown, reason?: string) => Record<string, any> | undefined;
+    relevantClarificationInspections: (input: { decision: string; question: string; inspections: Array<Record<string, unknown>> }) => Array<Record<string, unknown>>;
     resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentResponseFormat: (workflow: string) => {
         schema: {
@@ -57,6 +76,9 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
     getAgentLocalResponseFormat: (workflow: string) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
+    getAgentReadOnlyResponseFormat: (workflow: string, allowCommands?: boolean) => {
+        schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
+    };
     getInitialAgentResponseFormat: (workflow: string, message: string, requiresWrite?: boolean) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
@@ -66,10 +88,15 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: string };
     resetActionHistory: () => void;
+    recordFileProgress: () => void;
     pause: () => void;
     resume: () => void;
     formatRemaining: () => string;
 } };
+const { behaviorCompanionFiles, missingBehaviorCompanionInspections } = require("../cli/behaviorEvidence") as {
+    behaviorCompanionFiles: (workspace: string, inputPath: string) => string[];
+    missingBehaviorCompanionInspections: (workspace: string, inputPath: string, readPaths: Set<string>) => string[];
+};
 const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoints") as {
     FileCheckpointStore: new (root: string) => {
         checkpoint: (workspace: string, file: string, next: string) => { preview: string };
@@ -99,6 +126,7 @@ const { AgentResponseLog } = require("../cli/agentResponseLog") as {
 const {
     answerDefersRequiredWork,
     discoverProjectChecks,
+    discoverProjectRoots,
     evaluateProjectCompletion,
     formatIncompleteTaskAnswer,
     formatProjectCompletionPrompt,
@@ -108,14 +136,17 @@ const {
     projectChecksAffectedByPath,
     projectChecksAffectedByWorkdir,
     projectChecksForCommand,
+    projectRootForPath,
+    unownedProjectMutationReason,
     requiredProjectChecks,
     protectedProjectDeletionReason
 } = require("../cli/projectCompletion") as {
     answerDefersRequiredWork: (answer: string) => boolean;
-    discoverProjectChecks: (workspace: string) => Array<{
+    discoverProjectChecks: (workspace: string, providers?: Array<Record<string, unknown>>) => Array<{
         id: string; label: string; command: string; workdir: string; manifestPath: string; ecosystem: string;
         affectedExtensions: string[]; affectedFiles: string[];
     }>;
+    discoverProjectRoots: (workspace: string, providers?: Array<Record<string, unknown>>) => string[];
     evaluateProjectCompletion: (workspace: string, requirement: Record<string, unknown>) => string[];
     formatIncompleteTaskAnswer: (reasons: string[], writtenPaths: string[]) => string;
     formatProjectCompletionPrompt: (requirement: Record<string, unknown>, checks?: Array<Record<string, unknown>>) => string;
@@ -143,10 +174,12 @@ const {
     projectChecksAffectedByPath: (filePath: string, checks: Array<Record<string, unknown>>) => string[];
     projectChecksAffectedByWorkdir: (workdir: string | undefined, checks: Array<Record<string, unknown>>) => string[];
     projectChecksForCommand: (command: string, checks: Array<Record<string, unknown>>, workdir?: string) => string[];
+    projectRootForPath: (filePath: string, checks: Array<Record<string, unknown>>) => string | undefined;
+    unownedProjectMutationReason: (filePath: string, checks: Array<Record<string, unknown>>) => string | undefined;
     requiredProjectChecks: (requirement: Record<string, unknown>, checks: Array<Record<string, unknown>>) => Array<{ id: string }>;
     protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
-const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandInteractiveRisk, commandInvocationError, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandInteractiveRisk, commandInvocationError, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, packageMutationRisk, parsePackageMutation, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
     commandMutatesWorkspaceFiles: (command: string) => boolean;
@@ -158,6 +191,8 @@ const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspac
     missingCommandTargetError: (errorOutput: string) => boolean;
     packageContentAddsBrowserAutoOpen: (filePath: string, content: string) => boolean;
     packageLifecycleRoleChanges: (beforeContent: string, afterContent: string) => string[];
+    packageMutationRisk: (workspace: string, userMessage: string, command: string, requestedWorkdir?: string) => string | undefined;
+    parsePackageMutation: (command: string) => Record<string, any> | undefined;
     resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
 };
 
@@ -171,6 +206,14 @@ async function main(): Promise<void> {
     assert.match(startScript, /Stopping reused llama\.cpp/);
     assert.match(startScript, /ProcessName -ne "llama-server"/);
     assert.match(deviceScript, /function Get-LlamaSpeculativeProfile/);
+    assert.match(deviceScript, /function Get-LlamaMemoryProfile/);
+    assert.match(deviceScript, /"SYCL" \{ @\{ BatchSize = 256; UBatchSize = 128 \} \}/);
+    assert.match(deviceScript, /"--fit", "on", "-fitc", "4096", "-fitt", "1024"/);
+    assert.match(deviceScript, /"-ctk", "q8_0", "-ctv", "q8_0"/);
+    assert.doesNotMatch(startScript, /"-ngl", "all"/);
+    assert.doesNotMatch(standaloneStartScript, /"-ngl", "all"/);
+    assert.match(startScript, /Get-LlamaMemoryProfile/);
+    assert.match(standaloneStartScript, /Get-LlamaMemoryProfile/);
     assert.match(deviceScript, /--spec-type", "draft-mtp"/);
     assert.match(startScript, /Get-LlamaSpeculativeProfile/);
     assert.match(standaloneStartScript, /Get-LlamaSpeculativeProfile/);
@@ -196,6 +239,10 @@ async function main(): Promise<void> {
     assert.equal(requiresWorkspaceWrite("install package ของ react ให้หน่อย"), true);
     assert.equal(requiresWorkspaceWrite("install zod ให้หน่อย"), true);
     assert.equal(requiresWorkspaceWrite("ติดตั้งแพ็กเกจของ react ให้หน่อย"), true);
+    assert.equal(requiresWorkspaceWrite("แก้ไฟล์ package.json โดยตั้งค่า packageMode"), true);
+    assert.equal(forbidsWorkspaceWrite("อ่าน README.md แล้วสรุป ห้ามแก้ไฟล์"), true);
+    assert.equal(forbidsWorkspaceWrite("Read README.md without editing files"), true);
+    assert.equal(forbidsWorkspaceWrite("แก้ README.md ให้ชัดขึ้น"), false);
     assert.equal(requiresWorkspaceWrite("สร้างหน้า login พร้อม privacy policy modal"), true);
     assert.equal(requiresWorkspaceWrite("ทำเลยเพิ่มปุ่มตัว register ได้เลย"), true);
     assert.equal(requiresWorkspaceWrite(uiSpacingRequest), true);
@@ -224,6 +271,16 @@ async function main(): Promise<void> {
     assert.equal(commandSatisfiesVerification("go build -o app.exe main.go", "runtime"), false);
     assert.equal(commandSatisfiesVerification("Invoke-WebRequest http://localhost:3000/swagger", "runtime"), true);
     assert.equal(commandSatisfiesVerification("npm test", "command"), true);
+    const failedInteraction = acceptanceContract("กด Employee List แล้วหน้ายังค้างอยู่ที่ Dashboard");
+    assert.equal(failedInteraction.evidence, "interaction");
+    assert.equal(failedInteraction.verification, "runtime");
+    assert.equal(commandSatisfiesAcceptance("npm run build", failedInteraction), false);
+    assert.equal(commandSatisfiesAcceptance("npm run test:e2e", failedInteraction), true);
+    assert.equal(acceptanceContract("ปรับชื่อหัวข้อใน README").evidence, "source");
+    assert.equal(acceptanceContractWithHistory("ทำงานต่อให้เสร็จ", [
+        { role: "user", content: "When I submit the form it still stays on the same screen" },
+        { role: "assistant", content: "I will fix it" }
+    ], true).evidence, "interaction");
     assert.match(workflowInstructions("web_research"), /Never use search_files/);
     const fullStackRequirement = inferProjectCompletionRequirement(fullStackPrompt);
     assert.ok(fullStackRequirement);
@@ -245,6 +302,10 @@ async function main(): Promise<void> {
             dependencies: { react: "latest" }
         }), "utf8");
         fs.writeFileSync(path.join(dynamicChecksWorkspace, "worker", "Cargo.toml"), "[package]\nname = \"worker\"\nversion = \"0.1.0\"\n", "utf8");
+        fs.mkdirSync(path.join(dynamicChecksWorkspace, "edge"), { recursive: true });
+        fs.writeFileSync(path.join(dynamicChecksWorkspace, "edge", "deno.json"), "{}", "utf8");
+        fs.mkdirSync(path.join(dynamicChecksWorkspace, "docs"), { recursive: true });
+        fs.writeFileSync(path.join(dynamicChecksWorkspace, "docs", "package.json"), JSON.stringify({ name: "docs" }), "utf8");
         const dynamicChecks = discoverProjectChecks(dynamicChecksWorkspace);
         assert.deepEqual(dynamicChecks.map((check) => check.command).sort(), ["cargo test", "go test ./...", "npm run build"]);
         const goCheck = dynamicChecks.find((check) => check.ecosystem === "go");
@@ -257,9 +318,26 @@ async function main(): Promise<void> {
         assert.deepEqual(projectChecksAffectedByPath("api/main.go", dynamicChecks), [goCheck.id]);
         assert.deepEqual(projectChecksAffectedByPath("frontend/src/App.jsx", dynamicChecks), [reactCheck.id]);
         assert.deepEqual(projectChecksAffectedByWorkdir("frontend", dynamicChecks), [reactCheck.id]);
+        assert.equal(projectRootForPath("frontend/src/App.jsx", dynamicChecks), "frontend");
+        assert.equal(projectRootForPath("src/App.jsx", dynamicChecks), undefined);
+        assert.match(unownedProjectMutationReason("src/App.jsx", dynamicChecks) ?? "", /not owned by a discovered project root/);
+        assert.equal(unownedProjectMutationReason("NOTES.md", dynamicChecks), undefined);
         assert.deepEqual(requiredProjectChecks(fullStackRequirement, dynamicChecks).map((check) => check.id).sort(), [goCheck.id, reactCheck.id].sort());
         assert.match(formatProjectChecksPrompt(dynamicChecks), /npm run build/);
         assert.match(formatProjectChecksPrompt(dynamicChecks), /workdir `frontend`/);
+        const extendedChecks = discoverProjectChecks(dynamicChecksWorkspace, [{
+            manifest: "deno.json",
+            command: "deno test",
+            label: "Deno tests",
+            ecosystem: "deno",
+            affectedExtensions: [".ts"],
+            affectedFiles: ["deno.lock"]
+        }]);
+        const denoCheck = extendedChecks.find((check) => check.ecosystem === "deno");
+        assert.ok(denoCheck);
+        assert.equal(denoCheck.command, "deno test");
+        assert.equal(denoCheck.workdir, "edge");
+        assert.deepEqual(discoverProjectRoots(dynamicChecksWorkspace, [{ manifest: "deno.json", command: "deno test" }]), ["api", "docs", "edge", "frontend", "worker"]);
     } finally {
         fs.rmSync(dynamicChecksWorkspace, { recursive: true, force: true });
     }
@@ -380,8 +458,28 @@ async function main(): Promise<void> {
         assert.match(commandInteractiveRisk("ng test --watch=false", nestedAngularWorkspace, "dashboard") ?? "", /browser runner 'karma-chrome-launcher'/);
         assert.equal(commandInteractiveRisk("ng build", nestedAngularWorkspace, "dashboard"), undefined);
         assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { start: "ng serve --open" } })), true);
-        assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { start: "ng serve" } })), false);
-        assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { build: "go build -o app.exe" } })), false);
+    assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { start: "ng serve" } })), false);
+    assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { build: "go build -o app.exe" } })), false);
+    assert.deepEqual(parsePackageMutation("pnpm add @tanstack/react-query@5 -D"), {
+        manager: "pnpm",
+        operation: "add",
+        packages: [{ spec: "@tanstack/react-query@5", name: "@tanstack/react-query", version: "5" }],
+        development: true
+    });
+    const packagePreflightWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-package-preflight-"));
+    try {
+        fs.mkdirSync(path.join(packagePreflightWorkspace, "web"), { recursive: true });
+        fs.writeFileSync(path.join(packagePreflightWorkspace, "web", "package.json"), JSON.stringify({ name: "web", dependencies: { react: "^19.0.0" } }), "utf8");
+        fs.writeFileSync(path.join(packagePreflightWorkspace, "web", "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+        assert.equal(packageMutationRisk(packagePreflightWorkspace, "install zod ให้หน่อย", "pnpm add zod", "web"), undefined);
+        assert.match(packageMutationRisk(packagePreflightWorkspace, "install package ของ react ให้หน่อย", "pnpm add react-router-dom", "web") ?? "", /not explicitly named/);
+        assert.match(packageMutationRisk(packagePreflightWorkspace, "install zod ให้หน่อย", "npm install zod", "web") ?? "", /does not match/);
+        assert.match(packageMutationRisk(packagePreflightWorkspace, "install zod ให้หน่อย", "pnpm add zod@4", "web") ?? "", /was not requested/);
+        assert.equal(packageMutationRisk(packagePreflightWorkspace, "install zod@4 ให้หน่อย", "pnpm add zod@4", "web"), undefined);
+        assert.match(packageMutationRisk(packagePreflightWorkspace, "install zod", "pnpm add zod", "..") ?? "", /outside the workspace/);
+    } finally {
+        fs.rmSync(packagePreflightWorkspace, { recursive: true, force: true });
+    }
     } finally {
         fs.rmSync(nestedAngularWorkspace, { recursive: true, force: true });
     }
@@ -396,6 +494,14 @@ async function main(): Promise<void> {
     assert.ok(!localWebActions.includes("mcp_list_tools"));
     const generalActions = getAgentResponseFormat("general").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"]);
+    const readOnlyActions = getAgentReadOnlyResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.ok(readOnlyActions.includes("read_file"));
+    assert.ok(!readOnlyActions.includes("run_command"));
+    assert.ok(readOnlyActions.includes("final"));
+    assert.ok(!readOnlyActions.includes("edit_file"));
+    assert.ok(!readOnlyActions.includes("write_file"));
+    assert.ok(!readOnlyActions.includes("delete_file"));
+    assert.ok(getAgentReadOnlyResponseFormat("coding", true).schema.oneOf.some((variant) => variant.properties.action.const === "run_command"));
     const ambiguousWorkspaceActions = getInitialAgentResponseFormat("general", "ช่วยเอาสองอันนี้แยกออกจากกัน").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(ambiguousWorkspaceActions.includes("read_file"));
     assert.ok(ambiguousWorkspaceActions.includes("edit_file"));
@@ -407,10 +513,11 @@ async function main(): Promise<void> {
     const firstCreateActions = getInitialAgentResponseFormat("coding", "สร้างหน้า login พร้อม privacy policy modal", true).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(firstCreateActions.includes("write_file"));
     assert.ok(firstCreateActions.includes("delete_file"));
-    assert.ok(firstCreateActions.includes("ask_user"));
+    assert.ok(!firstCreateActions.includes("ask_user"));
     assert.ok(!firstCreateActions.includes("final"));
     const swaggerRepairActions = getInitialAgentResponseFormat("coding", swaggerUntilWorking, true).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(swaggerRepairActions.includes("edit_file"));
+    assert.ok(!swaggerRepairActions.includes("ask_user"));
     assert.ok(!swaggerRepairActions.includes("final"));
     const repeatedReadRecoveryActions = getAgentRecoveryResponseFormat("coding", "read_file").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(!repeatedReadRecoveryActions.includes("read_file"));
@@ -432,7 +539,7 @@ async function main(): Promise<void> {
     const clarification = normalizeClarificationRequest("ติดตั้งที่โปรเจกต์ไหน?", [
         { id: "frontend", label: "Frontend", description: "React application" },
         { id: "admin", label: "Admin", description: "Administration application" }
-    ], "พบ React project มากกว่าหนึ่งตัว");
+    ], "target", "พบ React project มากกว่าหนึ่งตัว");
     assert.ok(clarification);
     assert.match(formatClarificationRequest(clarification), /Type a number, option id, or any other answer/);
     const selectedClarification = resolveClarificationAnswer(clarification, "2");
@@ -447,6 +554,105 @@ async function main(): Promise<void> {
     assert.equal(clarificationObservation(clarification, selectedClarification).status, "answered");
     assert.equal(answerLooksLikeBlockingClarification("ต้องการติดตั้งที่โปรเจกต์ไหน?"), true);
     assert.equal(answerLooksLikeBlockingClarification("ติดตั้งที่ frontend เรียบร้อยแล้ว"), false);
+    assert.equal(relevantClarificationInspections({
+        decision: "compatibility",
+        question: "ต้องการใช้ zod version ไหน?",
+        inspections: [{ action: "read_file", path: "README.md" }]
+    }).length, 0);
+    assert.equal(relevantClarificationInspections({
+        decision: "compatibility",
+        question: "ต้องการใช้ zod version ไหน?",
+        inspections: [{ action: "read_file", path: "web/package.json" }]
+    }).length, 1);
+    assert.equal(relevantClarificationInspections({
+        decision: "target",
+        question: "ติดตั้งที่โปรเจกต์ไหน?",
+        inspections: [{ action: "list_files", path: "." }]
+    }).length, 1);
+    assert.match(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 0,
+        answeredClarifications: 0,
+        hasNewBlocker: false,
+        decision: "target",
+        knownProjectRoots: 2,
+        asksNewVersusExisting: false,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }) ?? "", /Inspect the workspace before asking/);
+    assert.equal(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 1,
+        answeredClarifications: 0,
+        hasNewBlocker: false,
+        decision: "target",
+        knownProjectRoots: 2,
+        asksNewVersusExisting: false,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }), undefined);
+    assert.match(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 1,
+        answeredClarifications: 1,
+        hasNewBlocker: false,
+        decision: "scope",
+        knownProjectRoots: 1,
+        asksNewVersusExisting: false,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }) ?? "", /already has a clarification answer/);
+    assert.equal(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 1,
+        answeredClarifications: 1,
+        hasNewBlocker: true,
+        decision: "compatibility",
+        knownProjectRoots: 1,
+        asksNewVersusExisting: false,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }), undefined);
+    assert.match(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 2,
+        answeredClarifications: 2,
+        hasNewBlocker: true,
+        decision: "compatibility",
+        knownProjectRoots: 1,
+        asksNewVersusExisting: false,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }) ?? "", /clarification limit \(2\)/);
+    assert.match(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 1,
+        answeredClarifications: 0,
+        hasNewBlocker: false,
+        decision: "target",
+        knownProjectRoots: 1,
+        asksNewVersusExisting: true,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }) ?? "", /One project root is already known/);
+    assert.match(clarificationBlockReason({
+        workspaceMutationRequired: true,
+        successfulInspections: 1,
+        answeredClarifications: 0,
+        hasNewBlocker: false,
+        decision: "preference",
+        knownProjectRoots: 1,
+        asksNewVersusExisting: false,
+        maxClarifications: 2,
+        requireInspection: true,
+        secondRequiresBlocker: true
+    }) ?? "", /Preference questions are non-blocking/);
     const continuedMessages = buildInitialAgentMessages("system rules", "User: สร้างหน้า login", "file ถูกสร้างไว้ที่ไหน");
     assert.deepEqual(continuedMessages.map((message) => message.role), ["system", "user"]);
     assert.match(continuedMessages[0]?.content ?? "", /Recent session context \(use only when relevant/);
@@ -492,6 +698,15 @@ async function main(): Promise<void> {
     const repeatedWrite = { action: "write_file", path: "same.txt", content: "same" };
     assert.equal(repeatedWriteGuard.registerAction(repeatedWrite).status, "allow");
     assert.equal(repeatedWriteGuard.registerAction(repeatedWrite).status, "replan");
+    const verificationEpochGuard = new AgentGuard({ maxTurns: 8, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
+    const buildAction = { action: "run_command", command: "npm run build", workdir: "web" };
+    assert.equal(verificationEpochGuard.registerAction(buildAction).status, "allow");
+    assert.equal(verificationEpochGuard.registerAction(buildAction).status, "replan");
+    verificationEpochGuard.recordFileProgress();
+    assert.equal(verificationEpochGuard.registerAction(buildAction).status, "allow");
+    assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "allow");
+    verificationEpochGuard.recordFileProgress();
+    assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "replan");
     const compacted = buildCompactedAgentMessages("system", "แก้ login.html", {
         segment: 2,
         maxSegments: 3,
@@ -532,9 +747,12 @@ async function main(): Promise<void> {
         assert.ok(!generalPrompt.includes("Put servers under mcp/servers"));
         if (process.platform === "win32") assert.match(generalPrompt, /run_command executes Windows PowerShell/);
         assert.match(generalPrompt, /Never assume a localhost server is running/);
-        assert.match(generalPrompt, /use ask_user before acting/);
+        assert.match(generalPrompt, /Use ask_user only when required information/);
+        assert.match(generalPrompt, /Uncertainty by itself is not a blocker/);
+        assert.match(generalPrompt, /Never ask whether to create a new project/);
         const parsedClarification = agent.parseAction(JSON.stringify({
             action: "ask_user",
+            decision: "target",
             question: "Which project?",
             options: [
                 { id: "web", label: "Web", description: "Install in the web app" },
@@ -603,8 +821,18 @@ async function main(): Promise<void> {
         fs.mkdirSync(path.join(temp, "nested", "src"), { recursive: true });
         fs.writeFileSync(path.join(temp, "nested", "package.json"), "{}", "utf8");
         fs.writeFileSync(path.join(temp, "nested", "src", "app.ts"), "export {};", "utf8");
+        fs.writeFileSync(path.join(temp, "nested", "src", "app.html"), "<button>Save</button>", "utf8");
+        assert.deepEqual(behaviorCompanionFiles(temp, "nested/src/app.html"), ["nested/src/app.ts"]);
+        assert.deepEqual(missingBehaviorCompanionInspections(temp, "nested/src/app.html", new Set()), ["nested/src/app.ts"]);
+        assert.deepEqual(missingBehaviorCompanionInspections(temp, "nested/src/app.html", new Set([
+            path.resolve(temp, "nested/src/app.ts").toLowerCase()
+        ])), []);
         assert.equal(validator.projectRootFor("nested/src/app.ts"), path.join(temp, "nested"));
         assert.equal(validator.validateProjectFor("valid.json"), undefined);
+        fs.writeFileSync(path.join(temp, "orphan.ts"), "export {};", "utf8");
+        const orphanValidation = validator.validate("orphan.ts");
+        assert.equal(orphanValidation.ok, true);
+        assert.equal(orphanValidation.validator, "TypeScript read-back");
         fs.mkdirSync(path.join(temp, "go-project"), { recursive: true });
         fs.writeFileSync(path.join(temp, "go-project", "go.mod"), "module example.test/app\n\ngo 1.23\n\nrequire github.com/gorilla/mux v1.8.1\n", "utf8");
         fs.writeFileSync(path.join(temp, "go-project", "main.go"), "package main\nfunc main() {}\n", "utf8");

@@ -44,7 +44,12 @@ need to stay visible.
    npm run dev:cli
    ```
 
-Settings:
+Settings are machine-local and ignored by Git. The tracked prototype is
+`.cli/settings.example.json`. Run `/settings init` inside the CLI to create
+`.cli/settings.json` without overwriting an existing file, or copy the prototype
+manually before starting llama.cpp.
+
+Prototype contents:
 
 ```json
 {
@@ -55,7 +60,26 @@ Settings:
   "device": "auto",
   "debug": true,
   "historyMessages": 6,
-  "agent": { "maxTurns": 12, "maxSegments": 1, "maxDurationMinutes": 8, "maxCompletionTokens": 8000, "repeatLimit": 2 },
+  "agent": {
+    "maxTurns": 12,
+    "maxSegments": 1,
+    "maxDurationMinutes": 8,
+    "maxCompletionTokens": 8000,
+    "repeatLimit": 2,
+    "maxClarifications": 2,
+    "requireInspectionBeforeClarification": true,
+    "secondClarificationRequiresBlocker": true
+  },
+  "projectChecks": [
+    {
+      "manifest": "deno.json",
+      "command": "deno test",
+      "label": "Deno tests",
+      "ecosystem": "deno",
+      "affectedExtensions": [".ts"],
+      "affectedFiles": ["deno.lock"]
+    }
+  ],
   "sampling": {
     "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
     "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
@@ -64,7 +88,9 @@ Settings:
 }
 ```
 
-Defaults if `.cli/settings.json` is missing:
+When `.cli/settings.json` is missing, both the CLI and launcher read the tracked
+`.cli/settings.example.json`. Built-in fallbacks are used only if neither file
+exists. Important built-in path defaults are:
 
 - llama.cpp directory: `D:\llama.cpp\llama-b10012-bin-win-sycl-x64`
 - API URL: `http://127.0.0.1:8080/v1/chat/completions`
@@ -79,7 +105,15 @@ $env:LLAMA_DEVICE = "CUDA0"
 $env:LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 $env:LLAMA_MODEL = "another-model.gguf"
 $env:LLAMA_CONTEXT_LENGTH = "65536"
+$env:CLI_AGENT_MAX_SEGMENTS = "2"
+$env:CLI_AGENT_MAX_CLARIFICATIONS = "2"
 ```
+
+Run `/settings` to see every effective agent limit and whether its value came
+from the environment, `settings.json`, or a default. Run `/settings validate`
+to report invalid ranges, types, unsafe provider paths, or malformed JSON. Run `/capabilities` to see
+the active mode's local actions, discovered project checks, MCP servers, and
+whether a real MCP web-search tool is currently available.
 
 With `device` set to `auto`, the launcher asks the configured `llama-server.exe`
 which accelerator devices it provides and selects the first one. This lets the
@@ -98,7 +132,12 @@ user-visible Agent guard, rather than a generic five-minute Axios timeout,
 explains why a long request stopped.
 
 Launchers apply conservative runtime profiles after device auto-detection:
-CUDA uses batch/ubatch `1024/512`, while SYCL and Vulkan use `512/256`.
+CUDA uses batch/ubatch `1024/512`, SYCL uses `256/128`, and Vulkan uses
+`512/256`. Accelerator launches leave GPU layers on llama.cpp's automatic
+setting, enable memory fitting with a 1024 MiB margin, and allow context fitting
+down to 4,096 tokens. SYCL also uses q8 KV caches so long contexts consume less
+device memory. The launchers never force full `-ngl all` offload because that
+prevents recovery when model weights, KV cache, and compute buffers do not fit.
 `LLAMA_BATCH_SIZE` and `LLAMA_UBATCH_SIZE` override these values. Run
 `npm run benchmark:hardware` for an opt-in llama-bench run; startup never
 benchmarks automatically.
@@ -146,7 +185,16 @@ research when it is paired with an online subject such as news, price, weather,
 or version. Web research keeps local file tools available as a recovery path.
 Existing files must be read before an agent write. JSON, TypeScript, and
 `.gitignore` changes receive automatic validation, and a failed validation
-blocks a final success response.
+blocks a final success response. Source-like mutations must also belong to a
+discovered project root. A check from one project cannot validate a file written
+outside that project or under a sibling project.
+
+Each task receives an acceptance-evidence contract based on the kind of outcome
+the user described, independently of framework or feature names. Source-only
+changes may use read-back evidence, command outcomes require a finite project
+check, runtime outcomes require a runtime probe, and reported interaction
+failures require an automated interaction test. A successful build cannot prove
+that an observable user action produced the expected state.
 
 Creation requests for Go APIs, React or Angular applications, and Swagger/OpenAPI also
 receive a deterministic project-completion profile. A Go API profile requires a
@@ -180,12 +228,26 @@ timeout. File-content checks should use
 running. A failed verification command blocks verified success until a relevant
 file read/search or an OS-compatible command succeeds.
 
+Package mutations run through a deterministic preflight before execution. The
+selected workdir must contain `package.json`, its package manager must match an
+existing lockfile, newly added packages must be named by the user or already
+declared, and model-invented versions are rejected. An unversioned exact package
+name delegates version resolution to the configured package registry.
+
+Explicit read-only requests such as "do not edit" or "ห้ามแก้ไฟล์" remove
+mutation actions at the response-schema level and retain a runtime mutation
+guard. Read-only requests without a command acceptance criterion cannot run
+shell commands. After all explicitly named files have been read, the next model
+response is constrained to a final answer.
+
 During a running request, `Ctrl+C` cancels that request without closing the
 CLI. `maxTurns` is a soft per-segment limit: unfinished work is compacted into
 file, validation, verification, source, and recent-event state, then continues
 automatically for up to `maxSegments` (one by default). Equivalent file reads,
-listings, searches, and normalized commands are counted across intervening
-inspection actions until a file mutation starts a new progress window. Wall-clock
+listings, searches, normalized commands, and repeated mutations remain counted
+across context-compaction segments. Successful writes no longer erase repeat
+history by themselves. The third equivalent no-progress action stops the task
+early with an incomplete result instead of opening another recovery loop. Wall-clock
 and completion-token budgets remain global hard limits across segments. Model-generated writes show a compact
 diff preview and save a checkpoint first. Run `/undo` to restore the most recent
 checkpoint for the active workspace. After each request, the CLI keeps the
@@ -220,8 +282,11 @@ agent action request five times and records JSON validity, tool selection
 stability, and concise-reason coverage under `.cli/logs/baseline-agent-*.json`.
 
 Run `npm test` for the complete offline suite: agent protocol, context/router,
-write validators, web relevance, MCP discovery/tool invocation, and TypeScript
-type checking. Run `npm run test:web` for an optional live network smoke test.
+write validators, web relevance, MCP discovery/tool invocation, deterministic
+full-CLI E2E scenarios, and TypeScript type checking. Run
+`npm run test:live-agent` for an isolated live llama.cpp agent scenario; it skips
+safely when the server is unavailable or its slots are busy. Run
+`npm run test:web` for an optional live network smoke test.
 
 ## Changing models
 
@@ -269,6 +334,17 @@ context, it pauses the same task and shows 2-6 concrete choices. Enter a choice
 number or id, type any free-text answer when none of the choices fit, or enter
 `/cancel` to stop the task. Clarification wait time does not consume the agent's
 wall-clock budget, and the answer is retained in the session task context.
+Clarifications carry a decision type such as `target`, `compatibility`, or
+`destructive`; reversible preference questions are rejected. The default policy
+requires workspace inspection first, allows two questions at most, and permits
+a second question only after new command, validation, or missing-target evidence.
+These limits are configurable under `agent` as shown above.
+
+Built-in verification discovery covers Node package scripts, Go, Rust, pytest,
+.NET, and Maven. Additional finite checks can be registered with `projectChecks`.
+`manifest` may be a filename matched in every project root or one exact relative
+manifest path. Custom providers are validated, merged with built-in checks, and
+deduplicated by manifest and command.
 
 The active workspace's `.cli/mcp.json` takes priority. If it is absent, the CLI
 installation's config is used so switching workspaces does not hide built-in

@@ -75,8 +75,14 @@ class WriteValidator {
             if (fs.existsSync(localCompiler)) {
                 return this.fileCommand("TypeScript", process.execPath, [localCompiler, "--noEmit"], projectRoot);
             }
-            const npx = process.platform === "win32" ? "npx.cmd" : "npx";
-            return this.fileCommand("TypeScript", npx, ["tsc", "--noEmit"], projectRoot);
+            const size = fs.statSync(absolute).size;
+            return {
+                ok: size > 0,
+                validator: "TypeScript read-back",
+                output: size > 0
+                    ? "No project-local TypeScript compiler was found; compiler validation is deferred to a manifest-discovered project check."
+                    : "Written TypeScript file is empty."
+            };
         }
 
         if (path.basename(absolute).toLowerCase() === ".gitignore") {
@@ -116,8 +122,7 @@ class WriteValidator {
             return this.fileCommand("TypeScript", process.execPath, [localCompiler, "--noEmit"], projectRoot);
         }
 
-        const npx = process.platform === "win32" ? "npx.cmd" : "npx";
-        return this.fileCommand("TypeScript", npx, ["tsc", "--noEmit"], projectRoot);
+        return undefined;
     }
 
     projectRootFor(inputPath: string): string {

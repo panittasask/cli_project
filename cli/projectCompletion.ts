@@ -2,6 +2,7 @@ import fs = require("node:fs");
 import path = require("node:path");
 
 type ProjectCheck = import("./projectTypes").ProjectCheck;
+type ProjectCheckProvider = import("./projectTypes").ProjectCheckProvider;
 type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
 
 const mutationPattern = /\b(create|build|make|generate|scaffold|implement|write|add|fix|finish|complete)\b|(?:สร้าง|เพิ่ม|เขียน|ทำ|แก้|ให้เสร็จ)/i;
@@ -371,7 +372,21 @@ function createProjectCheck(
     };
 }
 
-function discoverProjectChecks(workspace: string): ProjectCheck[] {
+function discoverProjectRoots(workspace: string, providers: ProjectCheckProvider[] = []): string[] {
+    const configuredManifests = new Set(providers.map((provider) => provider.manifest.replace(/\\/g, "/").toLowerCase()));
+    const builtInManifests = new Set(["package.json", "go.mod", "cargo.toml", "pyproject.toml", "pom.xml"]);
+    const roots = collectFiles(workspace).flatMap((file) => {
+        const basename = path.basename(file).toLowerCase();
+        const relative = relativePath(workspace, file).toLowerCase();
+        const configuredMatch = Array.from(configuredManifests).some((manifest) => manifest.includes("/") ? manifest === relative : manifest === basename);
+        return builtInManifests.has(basename) || /\.(?:sln|csproj)$/i.test(file) || configuredMatch
+            ? [relativePath(workspace, path.dirname(file))]
+            : [];
+    });
+    return roots.filter((root, index) => roots.indexOf(root) === index).sort();
+}
+
+function discoverProjectChecks(workspace: string, providers: ProjectCheckProvider[] = []): ProjectCheck[] {
     const files = collectFiles(workspace);
     const checks: ProjectCheck[] = [];
 
@@ -435,7 +450,32 @@ function discoverProjectChecks(workspace: string): ProjectCheck[] {
         checks.push(createProjectCheck(workspace, manifestPath, `${relativePath(workspace, path.dirname(manifestPath))} Maven tests`, "mvn test", "java", [".java", ".kt"], ["pom.xml"]));
     }
 
-    return checks;
+    for (const provider of providers) {
+        const normalizedManifest = provider.manifest.replace(/\\/g, "/").toLowerCase();
+        const matches = files.filter((file) => {
+            const relative = relativePath(workspace, file).toLowerCase();
+            return normalizedManifest.includes("/")
+                ? relative === normalizedManifest
+                : path.basename(file).toLowerCase() === normalizedManifest;
+        });
+        for (const manifestPath of matches) {
+            const root = path.dirname(manifestPath);
+            const label = provider.label
+                ? `${provider.label} (${relativePath(workspace, root)})`
+                : `${relativePath(workspace, root)} ${provider.ecosystem ?? "custom"} check`;
+            checks.push(createProjectCheck(
+                workspace,
+                manifestPath,
+                label,
+                provider.command,
+                provider.ecosystem ?? "custom",
+                provider.affectedExtensions ?? [],
+                [path.basename(manifestPath), ...(provider.affectedFiles ?? [])]
+            ));
+        }
+    }
+
+    return checks.filter((check, index) => checks.findIndex((candidate) => candidate.id === check.id) === index);
 }
 
 function normalizeCommand(command: string): string {
@@ -466,6 +506,28 @@ function projectChecksAffectedByPath(filePath: string, checks: ProjectCheck[]): 
     if (candidates.length === 0) return [];
     const deepestRoot = Math.max(...candidates.map((check) => check.workdir === "." ? 0 : check.workdir.length));
     return candidates.filter((check) => (check.workdir === "." ? 0 : check.workdir.length) === deepestRoot).map((check) => check.id);
+}
+
+function projectRootForPath(filePath: string, checks: ProjectCheck[]): string | undefined {
+    const normalized = filePath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    const owners = checks.filter((check) => {
+        const root = check.workdir.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+        return root === "." || normalized === root || normalized.startsWith(`${root}/`);
+    });
+    if (owners.length === 0) return undefined;
+    return owners.sort((left, right) => right.workdir.length - left.workdir.length)[0]?.workdir;
+}
+
+function unownedProjectMutationReason(filePath: string, checks: ProjectCheck[]): string | undefined {
+    if (checks.length === 0 || projectRootForPath(filePath, checks)) return undefined;
+    const normalized = filePath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    const basename = path.posix.basename(normalized);
+    const extension = path.posix.extname(normalized);
+    const projectLike = checks.some((check) => check.affectedExtensions.includes(extension)
+        || check.affectedFiles.some((file) => file.toLowerCase() === basename));
+    if (!projectLike) return undefined;
+    const roots = Array.from(new Set(checks.map((check) => check.workdir))).sort();
+    return `Mutation target '${filePath}' is not owned by a discovered project root. Discovered roots: ${roots.join(", ")}. Inspect the intended project and use a path under that same root; verification from another root cannot validate this file.`;
 }
 
 function projectChecksAffectedByWorkdir(workdir: string | undefined, checks: ProjectCheck[]): string[] {
@@ -534,6 +596,7 @@ function answerDefersRequiredWork(answer: string): boolean {
 module.exports = {
     answerDefersRequiredWork,
     discoverProjectChecks,
+    discoverProjectRoots,
     evaluateProjectCompletion,
     formatIncompleteTaskAnswer,
     formatProjectCompletionPrompt,
@@ -544,5 +607,7 @@ module.exports = {
     projectChecksAffectedByPath,
     projectChecksAffectedByWorkdir,
     projectChecksForCommand,
+    projectRootForPath,
+    unownedProjectMutationReason,
     requiredProjectChecks
 };

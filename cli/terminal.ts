@@ -4,15 +4,34 @@ import fs = require("node:fs");
 import path = require("node:path");
 const {
     answerLooksLikeBlockingClarification,
+    clarificationBlockReason,
     clarificationObservation,
     clarificationTranscriptLine,
     formatClarificationRequest,
+    relevantClarificationInspections,
     resolveClarificationAnswer
 } = require("./clarification") as {
     answerLooksLikeBlockingClarification: (answer: string) => boolean;
+    clarificationBlockReason: (input: {
+        workspaceMutationRequired: boolean;
+        successfulInspections: number;
+        answeredClarifications: number;
+        hasNewBlocker: boolean;
+        decision: ClarificationRequest["decision"];
+        knownProjectRoots: number;
+        asksNewVersusExisting: boolean;
+        maxClarifications: number;
+        requireInspection: boolean;
+        secondRequiresBlocker: boolean;
+    }) => string | undefined;
     clarificationObservation: (request: ClarificationRequest, answer: ClarificationAnswer) => Record<string, unknown>;
     clarificationTranscriptLine: (request: ClarificationRequest, answer: ClarificationAnswer) => string;
     formatClarificationRequest: (request: ClarificationRequest) => string;
+    relevantClarificationInspections: (input: {
+        decision: ClarificationRequest["decision"];
+        question: string;
+        inspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }>;
+    }) => Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }>;
     resolveClarificationAnswer: (request: ClarificationRequest, input: string) => ClarificationAnswer | undefined;
 };
 type ClarificationRequest = import("./clarificationTypes").ClarificationRequest;
@@ -26,23 +45,30 @@ const { LlamaClient } = require("./llamaClient") as { LlamaClient: new (apiUrl: 
     formatError: (error: unknown) => string;
     close: () => void;
 } };
-const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require("./config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, initializeCliSettings, validateCliSettingsFile } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
     getAgentGuardSettings: (settings: CliSettings) => AgentGuardSettings;
+    getClarificationSettings: (settings: CliSettings) => ClarificationSettings;
+    getProjectCheckProviders: (settings: CliSettings) => ProjectCheckProvider[];
+    initializeCliSettings: (appRoot?: string) => { created: boolean; path: string; message: string };
+    validateCliSettingsFile: (appRoot?: string) => { ok: boolean; path: string; source: string; errors: string[] };
 };
 type AgentGuardSettings = { maxTurns: number; maxSegments: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
+type ClarificationSettings = { maxClarifications: number; requireInspection: boolean; secondRequiresBlocker: boolean };
+type ProjectCheckProvider = import("./projectTypes").ProjectCheckProvider;
 const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: AgentGuardSettings) => {
     settings: AgentGuardSettings;
     recordCompletionTokens: (tokens: number) => void;
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: "allow" | "replan" | "stop"; message?: string };
     resetActionHistory: () => void;
+    recordFileProgress: () => void;
     pause: () => void;
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges } = require("./commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk } = require("./commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
     commandMutatesWorkspaceFiles: (command: string) => boolean;
@@ -51,6 +77,7 @@ const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspac
     missingCommandTargetError: (errorOutput: string) => boolean;
     normalizeCommandSignature: (command: string) => string;
     packageLifecycleRoleChanges: (beforeContent: string, afterContent: string) => string[];
+    packageMutationRisk: (workspace: string, userMessage: string, command: string, requestedWorkdir?: string) => string | undefined;
 };
 const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpointStore: new (root: string) => {
     checkpoint: (workspace: string, inputPath: string, nextContent: string) => { id: string; preview: string };
@@ -106,12 +133,14 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
         }
     ) => Array<{ role: "system" | "user"; content: string }>;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string | string[]) => Record<string, unknown>;
     getAgentMutationResponseFormat: (blockedAction?: string) => Record<string, unknown>;
     getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
+    getAgentReadOnlyResponseFormat: (workflow: WorkflowKind, allowCommands?: boolean) => Record<string, unknown>;
+    getAgentFinalResponseFormat: () => Record<string, unknown>;
     getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string, requiresWrite?: boolean) => Record<string, unknown>;
 };
 const { StatusBar } = require("./statusBar") as { StatusBar: new (getState: () => {
@@ -131,18 +160,21 @@ const { formatSessionHistory } = require("./sessionHistory") as {
 };
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 type VerificationRequirement = "none" | "command" | "runtime";
+type AcceptanceContract = { evidence: "source" | "command" | "runtime" | "interaction"; verification: VerificationRequirement; reason: string };
 type ProjectCheck = import("./projectTypes").ProjectCheck;
 type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
-const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, verificationRequirementWithHistory, commandSatisfiesVerification, workflowInstructions } = require("./workflowRouter") as {
+const { classifyWorkflowWithHistory, forbidsWorkspaceWriteWithHistory, requiresWorkspaceWriteWithHistory, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("./workflowRouter") as {
     classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: WorkflowKind; reason: string };
+    forbidsWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
-    verificationRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => VerificationRequirement;
-    commandSatisfiesVerification: (command: string, requirement: VerificationRequirement) => boolean;
+    acceptanceContractWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => AcceptanceContract;
+    commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract) => boolean;
     workflowInstructions: (kind: WorkflowKind) => string;
 };
 const {
     answerDefersRequiredWork,
     discoverProjectChecks,
+    discoverProjectRoots,
     evaluateProjectCompletion,
     formatIncompleteTaskAnswer,
     formatProjectCompletionPrompt,
@@ -151,11 +183,13 @@ const {
     projectChecksAffectedByPath,
     projectChecksAffectedByWorkdir,
     projectChecksForCommand,
+    unownedProjectMutationReason,
     requiredProjectChecks,
     protectedProjectDeletionReason
 } = require("./projectCompletion") as {
     answerDefersRequiredWork: (answer: string) => boolean;
-    discoverProjectChecks: (workspace: string) => ProjectCheck[];
+    discoverProjectChecks: (workspace: string, providers?: ProjectCheckProvider[]) => ProjectCheck[];
+    discoverProjectRoots: (workspace: string, providers?: ProjectCheckProvider[]) => string[];
     evaluateProjectCompletion: (workspace: string, requirement: ProjectCompletionRequirement) => string[];
     formatIncompleteTaskAnswer: (reasons: string[], writtenPaths: string[]) => string;
     formatProjectCompletionPrompt: (requirement: ProjectCompletionRequirement, checks?: ProjectCheck[]) => string;
@@ -168,6 +202,7 @@ const {
     projectChecksAffectedByPath: (filePath: string, checks: ProjectCheck[]) => string[];
     projectChecksAffectedByWorkdir: (workdir: string | undefined, checks: ProjectCheck[]) => string[];
     projectChecksForCommand: (command: string, checks: ProjectCheck[], workdir?: string) => string[];
+    unownedProjectMutationReason: (filePath: string, checks: ProjectCheck[]) => string | undefined;
     requiredProjectChecks: (requirement: ProjectCompletionRequirement, checks: ProjectCheck[]) => ProjectCheck[];
     protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
@@ -175,6 +210,9 @@ const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = requi
     isContinuationRequest: (message: string) => boolean;
     selectTaskContext: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, workflow: WorkflowKind, maxMessages?: number) => Array<{ role: "user" | "assistant"; content: string }>;
     summarizeTaskContext: (messages: Array<{ role: "user" | "assistant"; content: string }>) => string;
+};
+const { missingBehaviorCompanionInspections } = require("./behaviorEvidence") as {
+    missingBehaviorCompanionInspections: (workspace: string, inputPath: string, readPaths: Set<string>) => string[];
 };
 const { WriteValidator } = require("./writeValidator") as { WriteValidator: new (workspace?: string) => {
     exists: (inputPath: string) => boolean;
@@ -218,6 +256,7 @@ const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRo
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
+    inspectCapabilities: () => Promise<{ servers: Array<Record<string, unknown>> }>;
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string };
     diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
@@ -288,7 +327,8 @@ type CliSettings = {
     device?: string;
     debug?: boolean;
     historyMessages?: number;
-    agent?: { maxTurns?: number; maxSegments?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number };
+    agent?: { maxTurns?: number; maxSegments?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number; maxClarifications?: number; requireInspectionBeforeClarification?: boolean; secondClarificationRequiresBlocker?: boolean };
+    projectChecks?: ProjectCheckProvider[];
     sampling?: Partial<Record<"chat" | "planner" | "action", Partial<SamplingSettings>>>;
 };
 
@@ -353,6 +393,10 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/editfile", description: "edit a file with AI" },
     { command: "/workspace", description: "show or change workspace" },
     { command: "/model", description: "show loaded and available models" },
+    { command: "/settings", description: "show effective runtime settings" },
+    { command: "/settings init", description: "create settings from the prototype" },
+    { command: "/settings validate", description: "validate effective settings" },
+    { command: "/capabilities", description: "show tools, checks, and web availability" },
     { command: "/usage", description: "show session token usage" },
     { command: "/clear", description: "start a clean task context" },
     { command: "/undo", description: "restore the latest file checkpoint" },
@@ -397,6 +441,8 @@ rl.on("SIGINT", () => {
 const apiUrl = process.env.LLAMA_API_URL?.trim()
     || "http://127.0.0.1:8080/v1/chat/completions";
 const agentGuardSettings = getAgentGuardSettings(cliSettings);
+const clarificationSettings = getClarificationSettings(cliSettings);
+const projectCheckProviders = getProjectCheckProviders(cliSettings);
 // The request-level Axios timeout must not fire before the user-visible Agent
 // wall-clock guard. The guard's AbortController remains the single source of
 // truth and produces the actionable timeout message.
@@ -605,6 +651,10 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/workspace <path>         Change workspace for agent/files");
     console.log("/model                    Show loaded and available GGUF models");
     console.log("                            Switch GGUF by restarting npm run llama");
+    console.log("/settings                 Show effective settings and their source");
+    console.log("/settings init            Create settings.json from the tracked prototype without overwriting");
+    console.log("/settings validate        Validate the effective settings file");
+    console.log("/capabilities             Show local tools, project checks, MCP, and web search");
     console.log("/usage                    Show session and active context token usage");
     console.log("/clear                    Start a new task context; keep session history");
     console.log("/undo                     Restore the latest model file checkpoint");
@@ -613,6 +663,52 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/exit                     Exit the app");
     console.log();
     printModeHelp(currentMode);
+}
+
+function settingsFileSource(): string {
+    return fs.existsSync(path.resolve(appRoot, ".cli", "settings.json")) ? "settings.json" : "settings.example.json";
+}
+
+function settingSource(envName: string, configured: boolean): string {
+    if (process.env[envName]?.trim()) return `environment (${envName})`;
+    if (!configured) return "built-in default";
+    return settingsFileSource();
+}
+
+function printEffectiveSettings(): void {
+    const agent = cliSettings.agent ?? {};
+    const rows: Array<[string, string | number | boolean, string]> = [
+        ["agent.maxTurns", agentGuardSettings.maxTurns, settingSource("CLI_AGENT_MAX_TURNS", agent.maxTurns !== undefined)],
+        ["agent.maxSegments", agentGuardSettings.maxSegments, settingSource("CLI_AGENT_MAX_SEGMENTS", agent.maxSegments !== undefined)],
+        ["agent.maxDurationMinutes", Math.round(agentGuardSettings.maxDurationMs / 60_000), settingSource("CLI_AGENT_MAX_MINUTES", agent.maxDurationMinutes !== undefined)],
+        ["agent.maxCompletionTokens", agentGuardSettings.maxCompletionTokens, settingSource("CLI_AGENT_MAX_COMPLETION_TOKENS", agent.maxCompletionTokens !== undefined)],
+        ["agent.repeatLimit", agentGuardSettings.repeatLimit, settingSource("CLI_AGENT_REPEAT_LIMIT", agent.repeatLimit !== undefined)],
+        ["agent.maxClarifications", clarificationSettings.maxClarifications, settingSource("CLI_AGENT_MAX_CLARIFICATIONS", agent.maxClarifications !== undefined)],
+        ["agent.requireInspectionBeforeClarification", clarificationSettings.requireInspection, settingSource("CLI_AGENT_REQUIRE_INSPECTION_BEFORE_CLARIFICATION", agent.requireInspectionBeforeClarification !== undefined)],
+        ["agent.secondClarificationRequiresBlocker", clarificationSettings.secondRequiresBlocker, settingSource("CLI_AGENT_SECOND_CLARIFICATION_REQUIRES_BLOCKER", agent.secondClarificationRequiresBlocker !== undefined)],
+        ["contextLength", configuredContextLength, settingSource("LLAMA_CONTEXT_LENGTH", cliSettings.contextLength !== undefined)]
+    ];
+    console.log("Effective settings:");
+    rows.forEach(([name, value, source]) => console.log(`  ${name}: ${value} [${source}]`));
+    console.log(`  projectChecks providers: ${projectCheckProviders.length} [${cliSettings.projectChecks ? settingsFileSource() : "built-in default"}]`);
+}
+
+async function printCapabilities(currentMode: RunMode): Promise<void> {
+    const checks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+    const mcp = await agentTool.inspectCapabilities();
+    const tools = mcp.servers.flatMap((server) => Array.isArray(server.tools) ? server.tools as Array<Record<string, unknown>> : []);
+    const webTools = tools.filter((tool) => /(?:web|search|browser)/i.test(`${tool.name ?? ""} ${tool.description ?? ""}`));
+    console.log(`Mode: ${currentMode}`);
+    console.log(`Local workspace actions: ${currentMode === "agent" ? "read, search, list, edit, write, delete, safe commands" : "not available to the model in this mode"}`);
+    console.log(`Project checks: ${checks.length === 0 ? "none discovered" : ""}`);
+    checks.forEach((check) => console.log(`  ${check.label}: ${check.command} (workdir ${check.workdir})`));
+    console.log(`Configured project-check providers: ${projectCheckProviders.length}`);
+    console.log(`MCP servers: ${mcp.servers.length === 0 ? "none configured" : ""}`);
+    mcp.servers.forEach((server) => {
+        const serverTools = Array.isArray(server.tools) ? server.tools as Array<Record<string, unknown>> : [];
+        console.log(`  ${String(server.name ?? "unknown")}: ${server.error ? `error — ${String(server.error)}` : `${serverTools.length} tool(s)`}`);
+    });
+    console.log(`Web search: ${currentMode !== "agent" ? "unavailable in this mode" : webTools.length > 0 ? `available via ${webTools.map((tool) => String(tool.name)).join(", ")}` : "unavailable (no discovered MCP search tool)"}`);
 }
 
 function getSlashSuggestions(line: string): SlashCommandOption[] {
@@ -1180,12 +1276,15 @@ async function runAgentLoop(
     const continuation = isContinuationRequest(userMessage);
     let effectiveUserMessage = userMessage;
     let workflow = classifyWorkflowWithHistory(effectiveUserMessage, historyForTask, continuation);
-    let mustWrite = requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
-    let verificationRequirement = verificationRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+    const readOnlyRequest = forbidsWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let mustWrite = !readOnlyRequest && requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let acceptance = acceptanceContractWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let verificationRequirement = acceptance.verification;
+    let readOnlyAllowsCommands = verificationRequirement !== "none";
     let projectRequirement = inferProjectCompletionRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
-    let projectChecks = discoverProjectChecks(activeWorkspace);
-    let agentResponseFormat = getAgentResponseFormat(workflow.kind);
-    let initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
+    let projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+    let agentResponseFormat = readOnlyRequest ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands) : getAgentResponseFormat(workflow.kind);
+    let initialAgentResponseFormat = readOnlyRequest ? agentResponseFormat : getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
     const contextSummary = summarizeTaskContext(relevantHistory);
     const writeValidator = new WriteValidator(activeWorkspace);
@@ -1193,6 +1292,8 @@ async function runAgentLoop(
     const selectedSkills = skillLoader.select(userMessage, availableSkills);
     const skillPrompt = skillLoader.formatPrompt(selectedSkills);
     const readPaths = new Set<string>();
+    const explicitlyRequestedFiles = Array.from(effectiveUserMessage.matchAll(/(?:^|[\s"'`])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go))(?=$|[\s"'`,)])/gi))
+        .map((match) => path.resolve(activeWorkspace, match[1] ?? "").toLowerCase());
     const writeRetriesAwaitingRead = new Set<string>();
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
@@ -1204,6 +1305,7 @@ async function runAgentLoop(
     const pendingProjectChecks = new Set<string>();
     const clarificationTranscript: string[] = [];
     const answeredClarifications = new Map<string, Record<string, unknown>>();
+    const contextInspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }> = [];
     const writtenPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
@@ -1222,6 +1324,11 @@ async function runAgentLoop(
         verificationRequirement === "none"
             ? "No explicit command-level acceptance check was inferred."
             : `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`,
+        `Acceptance evidence contract: ${acceptance.evidence}. ${acceptance.reason} Final claims must not exceed successful tool evidence.`,
+        acceptance.evidence === "interaction"
+            ? "Trace the rendered declaration through its owning implementation, imports/providers, event handler, state transition, and output before editing. Inspect co-located implementation companions referenced by the target. Then use a finite automated interaction test that performs the user-visible action and asserts its observable outcome. A build, typecheck, source read, response-body text search, or unrelated HTTP probe is not sufficient. Prefer an existing project test runner over starting a development server."
+            : "",
+        readOnlyRequest ? "Read-only contract: the user explicitly prohibited workspace changes. Do not edit, write, delete, install, scaffold, or run any command that mutates files." : "",
         formatProjectChecksPrompt(projectChecks),
         projectRequirement ? formatProjectCompletionPrompt(projectRequirement, projectChecks) : "",
         skillPrompt
@@ -1257,7 +1364,6 @@ async function runAgentLoop(
             readPaths.clear();
             writeRetriesAwaitingRead.clear();
             recoveryResponseFormat = undefined;
-            guard.resetActionHistory();
             spinner.log(`Compacted agent context; continuing segment ${segment}/${maxSegments}.`);
             trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${segment}/${maxSegments}` });
             trace.save();
@@ -1305,6 +1411,7 @@ async function runAgentLoop(
             command?: string;
             workdir?: string;
             question?: string;
+            decision?: ClarificationRequest["decision"];
             options?: Array<{ id: string; label: string; description?: string }>;
             server?: string;
             arguments?: Record<string, unknown>;
@@ -1377,6 +1484,7 @@ async function runAgentLoop(
             const request: ClarificationRequest = {
                 question: action.question ?? "",
                 options: action.options ?? [],
+                decision: action.decision ?? "scope",
                 ...(action.reason ? { reason: action.reason } : {})
             };
             const clarificationKey = JSON.stringify([
@@ -1396,6 +1504,42 @@ async function runAgentLoop(
                 messages.push({
                     role: "user",
                     content: `This clarification was already answered: ${JSON.stringify(previousObservation)}\nUse the existing answer and continue; do not ask it again.`
+                });
+                continue;
+            }
+            const clarificationBlocked = clarificationBlockReason({
+                workspaceMutationRequired: mustWrite,
+                successfulInspections: relevantClarificationInspections({
+                    decision: request.decision,
+                    question: request.question,
+                    inspections: contextInspections
+                }).length,
+                answeredClarifications: answeredClarifications.size,
+                hasNewBlocker: Boolean(
+                    unresolvedVerificationFailure
+                    || unresolvedMissingCommandTarget
+                    || validationFailures.size > 0
+                ),
+                decision: request.decision,
+                knownProjectRoots: discoverProjectRoots(activeWorkspace, projectCheckProviders).length,
+                asksNewVersusExisting: /(?:new|create|สร้าง)[\s\S]*(?:existing|current|ใช้โปรเจกต์|ใช้โปรเจค|ที่มีอยู่)/i.test(`${request.question} ${request.options.map((option) => `${option.id} ${option.label}`).join(" ")}`)
+                    || /(?:existing|current|ใช้โปรเจกต์|ใช้โปรเจค|ที่มีอยู่)[\s\S]*(?:new|create|สร้าง)/i.test(`${request.question} ${request.options.map((option) => `${option.id} ${option.label}`).join(" ")}`),
+                ...clarificationSettings
+            });
+            if (clarificationBlocked) {
+                recoveryResponseFormat = recoveryFormat("ask_user");
+                spinner.log(`[${turn}/${maxTurns}] Clarification blocked: ${clarificationBlocked}`);
+                trace.add({
+                    turn,
+                    status: "error",
+                    action: "ask_user_blocked",
+                    reason: action.reason,
+                    observation: clarificationBlocked
+                });
+                trace.save();
+                messages.push({
+                    role: "user",
+                    content: `Clarification rejected: ${clarificationBlocked} Do not guess blindly; use the available evidence-producing action and continue.`
                 });
                 continue;
             }
@@ -1435,11 +1579,13 @@ async function runAgentLoop(
             const previousVerificationRequirement = verificationRequirement;
             effectiveUserMessage = `${userMessage}\n\nUser clarifications:\n${clarificationTranscript.map((line) => `- ${line}`).join("\n")}`;
             workflow = classifyWorkflowWithHistory(effectiveUserMessage, historyForTask, continuation);
-            mustWrite = requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
-            verificationRequirement = verificationRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+            mustWrite = !readOnlyRequest && requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
+            acceptance = acceptanceContractWithHistory(effectiveUserMessage, historyForTask, continuation);
+            verificationRequirement = acceptance.verification;
+            readOnlyAllowsCommands = verificationRequirement !== "none";
             projectRequirement = inferProjectCompletionRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
-            agentResponseFormat = getAgentResponseFormat(workflow.kind);
-            initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
+            agentResponseFormat = readOnlyRequest ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands) : getAgentResponseFormat(workflow.kind);
+            initialAgentResponseFormat = readOnlyRequest ? agentResponseFormat : getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
             if (verificationRequirement !== previousVerificationRequirement) {
                 verificationSatisfied = verificationRequirement === "none";
             }
@@ -1504,7 +1650,7 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            projectChecks = discoverProjectChecks(activeWorkspace);
+            projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
             if (projectRequirement) {
                 const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
                 if (missingArtifacts.length > 0) {
@@ -1554,7 +1700,9 @@ async function runAgentLoop(
             }
             if (!verificationSatisfied) {
                 const requiredCheck = verificationRequirement === "runtime"
-                    ? "run an OS-compatible runtime probe of the requested URL, endpoint, server, or UI"
+                    ? acceptance.evidence === "interaction"
+                        ? "run a finite automated interaction test that performs the action and asserts the resulting state"
+                        : "run an OS-compatible runtime probe of the requested URL, endpoint, server, or UI"
                     : "run the relevant test, build, lint, or verification command";
                 rejectFinal(
                     `required ${verificationRequirement} verification has not succeeded after the latest write`,
@@ -1620,26 +1768,18 @@ async function runAgentLoop(
             continue;
         }
         if (guardDecision.status === "stop") {
-            const invocationCorrection = action.action === "run_command"
-                && Boolean(unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure));
             const failureSummary = unresolvedVerificationFailure
                 ? ` Last unresolved command failure: ${unresolvedVerificationFailure}`
                 : "";
-            const observation = `${guardDecision.message}${failureSummary} This action is quarantined until a successful file mutation resets the progress window.`;
-            trace.add({ turn, status: "error", action: "repeat_quarantine", arguments: action, observation });
+            const observation = `${guardDecision.message}${failureSummary} The task stopped because repeated work produced no new evidence.`;
+            trace.add({ turn, status: "error", action: "repeat_stop", arguments: action, observation });
             trace.save();
-            recoveryResponseFormat = invocationCorrection
-                ? recoveryFormat("final")
-                : getAgentMutationResponseFormat(
-                    ["edit_file", "write_file", "delete_file"].includes(action.action ?? "") ? action.action : undefined
-                );
-            messages.push({
-                role: "user",
-                content: invocationCorrection
-                    ? `Observation: ${observation} Use a corrected finite verification command with a different invocation. Do not mutate project files merely to preserve the rejected command or option.`
-                    : `Observation: ${observation} Use the files and errors already observed to make a concrete write_file, edit_file, or delete_file correction now. Do not retry the quarantined action before the workspace changes.`
-            });
-            continue;
+            const writes = writtenPaths.size > 0 ? ` Successful writes before stopping: ${Array.from(writtenPaths).join(", ")}.` : "";
+            return {
+                answer: `Agent stopped early after detecting repeated work without progress. ${observation}${writes}`,
+                trace,
+                clarifications: clarificationTranscript
+            };
         }
 
         if (action.action === "run_command" && action.command
@@ -1652,6 +1792,61 @@ async function runAgentLoop(
             trace.save();
             messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
             continue;
+        }
+        const attemptsReadOnlyMutation = readOnlyRequest && (
+            ["write_file", "edit_file", "delete_file"].includes(action.action ?? "")
+            || (action.action === "run_command" && commandMutatesWorkspaceFiles(action.command ?? ""))
+        );
+        if (attemptsReadOnlyMutation) {
+            const output = "Blocked by read-only contract: the user explicitly prohibited workspace changes. Inspect with read/list/search or return a factual final answer without mutating files.";
+            recoveryResponseFormat = getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands);
+            spinner.log(`[${turn}/${maxTurns}] ${output}`);
+            trace.add({ turn, status: "error", action: "read_only_mutation_blocked", reason: action.reason, arguments: action, observation: output });
+            trace.save();
+            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+            continue;
+        }
+
+        if (["write_file", "edit_file", "delete_file"].includes(action.action ?? "") && action.path) {
+            projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+            const scopeFailure = unownedProjectMutationReason(action.path, projectChecks);
+            if (scopeFailure) {
+                const output = `Blocked unscoped project mutation: ${scopeFailure}`;
+                recoveryResponseFormat = recoveryFormat([action.action ?? "write_file", "final"]);
+                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                trace.add({ turn, status: "error", action: "project_scope_blocked", reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
+        }
+
+        if (acceptance.evidence === "interaction"
+            && ["write_file", "edit_file", "delete_file"].includes(action.action ?? "")
+            && action.path) {
+            const missingCompanions = missingBehaviorCompanionInspections(activeWorkspace, action.path, readPaths);
+            if (missingCompanions.length > 0) {
+                const output = `Blocked behavior mutation: inspect the target's owning implementation companion before editing: ${missingCompanions.join(", ")}. Trace bindings, imports/providers, handlers, and state changes from source evidence instead of changing presentation markup speculatively.`;
+                recoveryResponseFormat = recoveryFormat([action.action ?? "edit_file", "final"]);
+                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                trace.add({ turn, status: "error", action: "behavior_inspection_blocked", reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
+        }
+
+        if (action.action === "run_command" && action.command) {
+            const packageRisk = packageMutationRisk(activeWorkspace, userMessage, action.command, action.workdir);
+            if (packageRisk) {
+                const output = `Blocked package mutation: ${packageRisk}. Inspect the selected manifest and lockfile, then use an exact user-authorized package and compatible package manager.`;
+                recoveryResponseFormat = recoveryFormat("final");
+                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                trace.add({ turn, status: "error", action: "package_preflight_blocked", reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
         }
 
         if (action.action === "delete_file" && action.path) {
@@ -1730,19 +1925,30 @@ async function runAgentLoop(
                 output: `${result.output}\nMCP disabled for this request. Use local file tools and do not invent server names.`
             };
         }
+        if (result.ok && ["list_files", "search_files", "read_file"].includes(action.action ?? "")) {
+            contextInspections.push({
+                action: action.action as "list_files" | "search_files" | "read_file",
+                ...(action.path ? { path: action.path } : {}),
+                ...(action.query ? { query: action.query } : {})
+            });
+        }
         if (action.action === "read_file" && result.ok && action.path) {
             const resolvedReadPath = path.resolve(activeWorkspace, action.path).toLowerCase();
             readPaths.add(resolvedReadPath);
+            if (readOnlyRequest && verificationRequirement === "none" && explicitlyRequestedFiles.length > 0
+                && explicitlyRequestedFiles.every((requestedPath) => readPaths.has(requestedPath))) {
+                recoveryResponseFormat = getAgentFinalResponseFormat();
+            }
             if (writeRetriesAwaitingRead.delete(resolvedReadPath)) {
                 guard.resetActionHistory();
             }
         }
         if (action.action === "run_command" && result.ok && commandMutatesWorkspaceFiles(action.command ?? "")) {
-            guard.resetActionHistory();
+            guard.recordFileProgress();
             writtenPaths.add(commandCreatesWorkspaceFiles(action.command ?? "")
                 ? "[project scaffold generated by command]"
                 : "[dependency metadata updated by command]");
-            projectChecks = discoverProjectChecks(activeWorkspace);
+            projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
             const effectiveWorkdir = action.workdir
                 ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
             projectChecksAffectedByWorkdir(effectiveWorkdir, projectChecks).forEach((checkId) => {
@@ -1790,9 +1996,9 @@ async function runAgentLoop(
             if (validation.ok || rollback?.ok) validationFailures.delete(action.path);
             else validationFailures.add(action.path);
             if (!rollback?.ok) {
-                guard.resetActionHistory();
+                guard.recordFileProgress();
                 writtenPaths.add(action.path);
-                projectChecks = discoverProjectChecks(activeWorkspace);
+                projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
                 projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId) => {
                     successfulProjectChecks.delete(checkId);
                     pendingProjectChecks.add(checkId);
@@ -1824,10 +2030,10 @@ async function runAgentLoop(
                     output: `${result.output}\nDeletion rolled back because it introduced unmet task requirements: ${introducedBlockers.join("; ")}. ${rollback.message} The delete_file action is quarantined until a different mutation persists.`
                 };
             } else {
-                guard.resetActionHistory();
+                guard.recordFileProgress();
                 validationFailures.delete(action.path);
                 writtenPaths.add(action.path);
-                projectChecks = discoverProjectChecks(activeWorkspace);
+                projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
                 projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId) => {
                     successfulProjectChecks.delete(checkId);
                     pendingProjectChecks.add(checkId);
@@ -1848,7 +2054,7 @@ async function runAgentLoop(
             const effectiveWorkdir = action.workdir
                 ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
             const failedKnownCheck = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir).length > 0;
-            const failedRequiredVerification = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
+            const failedRequiredVerification = commandSatisfiesAcceptance(action.command ?? "", acceptance);
             if (failedKnownCheck || failedRequiredVerification) {
                 unresolvedVerificationFailure = result.output.slice(0, 2000);
             }
@@ -1858,12 +2064,15 @@ async function runAgentLoop(
             if (verificationRequirement !== "none") verificationSatisfied = false;
         } else if (action.action === "run_command" && result.ok) {
             lastFailedCommand = undefined;
-            projectChecks = discoverProjectChecks(activeWorkspace);
+            projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
             const effectiveWorkdir = action.workdir
                 ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
             const completedProjectChecks = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir);
             completedProjectChecks.forEach((checkId) => successfulProjectChecks.add(checkId));
-            const satisfiesRequiredCheck = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
+            const wroteInteractionTest = acceptance.evidence === "interaction"
+                && Array.from(writtenPaths).some((file) => /(?:^|[\\/])[^\\/]*(?:e2e|spec|test)\.[^\\/]+$/i.test(file));
+            const satisfiesRequiredCheck = commandSatisfiesAcceptance(action.command ?? "", acceptance)
+                || (wroteInteractionTest && completedProjectChecks.length > 0 && /\btest\b/i.test(action.command ?? ""));
             if (completedProjectChecks.length > 0) {
                 unresolvedVerificationFailure = undefined;
                 unresolvedMissingCommandTarget = false;
@@ -1910,7 +2119,7 @@ async function runAgentLoop(
     if (mustWrite && writtenPaths.size === 0) toolLimitBlockers.push("no successful workspace change was recorded");
     if (validationFailures.size > 0) toolLimitBlockers.push(`validation failing for ${Array.from(validationFailures).join(", ")}`);
     if (unresolvedVerificationFailure) toolLimitBlockers.push(`latest verification failed: ${unresolvedVerificationFailure}`);
-    projectChecks = discoverProjectChecks(activeWorkspace);
+    projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
     if (projectRequirement) {
         const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
         if (missingArtifacts.length > 0) toolLimitBlockers.push(`missing project artifacts: ${missingArtifacts.join(", ")}`);
@@ -2062,6 +2271,40 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         if (trimmed.toLowerCase() === "/help") {
             printCommandHelp(runMode);
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/settings") {
+            printEffectiveSettings();
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/settings init") {
+            const result = initializeCliSettings(appRoot);
+            console.log(`${result.message} (${result.path})`);
+            if (result.created) console.log("Restart the CLI to load the new settings.");
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/settings validate") {
+            const validation = validateCliSettingsFile(appRoot);
+            console.log(validation.ok
+                ? `Settings valid: ${validation.path} [${validation.source}]`
+                : `Settings invalid: ${validation.path} [${validation.source}]`);
+            validation.errors.forEach((error) => console.log(`  - ${error}`));
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/capabilities") {
+            await printCapabilities(runMode);
+            console.log();
             ask(activeSession, runMode);
             return;
         }

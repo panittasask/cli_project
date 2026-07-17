@@ -16,7 +16,10 @@
     "test:web": "tsx scripts/smoke-web.ts",
     "smoke:agent:cli": "tsx scripts/smoke-agent-cli.ts",
     "test:regression": "tsx scripts/test-regression.ts",
-    "test": "npm run test:agent && npm run test:regression && npm run test:mcp && npx tsc --noEmit",
+    "test:e2e": "tsx scripts/test-agent-e2e.ts",
+    "test:live-agent": "tsx scripts/test-live-agent.ts",
+    "test:live-behavior": "tsx scripts/test-live-behavior.ts",
+    "test": "npm run test:agent && npm run test:regression && npm run test:mcp && npm run test:e2e && npx tsc --noEmit",
     "run test": "npm test"
   },
   "keywords": [],

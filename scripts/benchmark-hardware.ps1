@@ -2,7 +2,11 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "llama-device.ps1")
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$settings = Get-Content -LiteralPath (Join-Path $root ".cli\settings.json") -Raw | ConvertFrom-Json
+$settingsPath = Join-Path $root ".cli\settings.json"
+if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+    $settingsPath = Join-Path $root ".cli\settings.example.json"
+}
+$settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
 $llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } else { $settings.llamaCppPath }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } else { $settings.modelPath }
 $modelName = if ($env:LLAMA_MODEL) { $env:LLAMA_MODEL } else { $settings.defaultModel }
@@ -24,7 +28,7 @@ Write-Host "Opt-in benchmark: $($profile.Backend) / $device"
 Write-Host "Model: $modelName"
 Write-Host "This runs prompt 512 and generation 128 twice."
 $arguments = @("-m", $model, "-p", "512", "-n", "128", "-r", "2", "-b", $profile.BatchSize.ToString(), "-ub", $profile.UBatchSize.ToString())
-if ($device) { $arguments += @("--device", $device, "-ngl", "all") }
+if ($device) { $arguments += @("--device", $device) }
 & $bench @arguments 2>&1 | Tee-Object -FilePath $logPath
 if ($LASTEXITCODE -ne 0) { throw "llama-bench failed with exit code $LASTEXITCODE" }
 Write-Host "Benchmark log: $logPath"

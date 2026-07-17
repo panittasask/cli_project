@@ -4,6 +4,7 @@ node_modules/
 # Runtime state
 .cli/logs/
 .cli/checkpoints.json
+.cli/settings.json
 
 # Environment and local secrets
 .env

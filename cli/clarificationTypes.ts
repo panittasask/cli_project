@@ -7,6 +7,7 @@ export type ClarificationOption = {
 export type ClarificationRequest = {
     question: string;
     options: ClarificationOption[];
+    decision: "target" | "scope" | "compatibility" | "destructive" | "cost" | "external" | "preference";
     reason?: string;
 };
 

@@ -11,6 +11,7 @@ class AgentGuard {
     private completionTokens = 0;
     private readonly actionCounts = new Map<string, number>();
     private inspectionEpoch = 0;
+    private verificationEpoch = 0;
     private pausedAt: number | undefined;
     private pausedDurationMs = 0;
 
@@ -45,6 +46,13 @@ class AgentGuard {
         this.actionCounts.clear();
     }
 
+    recordFileProgress(): void {
+        // A verification command is expected to run again after source changes.
+        // Keep mutation signatures intact so delete/write/edit cycles still
+        // accumulate, but give commands a new evidence epoch.
+        this.verificationEpoch += 1;
+    }
+
     pause(now = Date.now()): void {
         if (this.pausedAt === undefined) this.pausedAt = now;
     }
@@ -75,6 +83,9 @@ class AgentGuard {
         }
         if (action.action === "run_command" && typeof action.workdir !== "string") {
             canonicalAction.workdir = ".";
+        }
+        if (action.action === "run_command") {
+            canonicalAction.verification_epoch = this.verificationEpoch;
         }
         if ((action.action === "list_files" || action.action === "search_files")
             && typeof action.path !== "string") {

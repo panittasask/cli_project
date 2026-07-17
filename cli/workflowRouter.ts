@@ -1,5 +1,12 @@
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 type VerificationRequirement = "none" | "command" | "runtime";
+type AcceptanceEvidence = "source" | "command" | "runtime" | "interaction";
+
+type AcceptanceContract = {
+    evidence: AcceptanceEvidence;
+    verification: VerificationRequirement;
+    reason: string;
+};
 
 type WorkflowDecision = {
     kind: WorkflowKind;
@@ -35,12 +42,17 @@ const codingPatterns = [
 ];
 
 const workspaceMutationPatterns = [
-    /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|replace|switch|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)\b/i,
-    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|เปลี่ยน|แทนที่|ลบ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)/i,
+    /\b(create|build|make|generate|scaffold|add|edit|update|modify|configure|fix|refactor|implement|write|replace|switch|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)\b/i,
+    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|ตั้งค่า|อัปเดต|ทำ|เปลี่ยน|แทนที่|ลบ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)/i,
     /\b(?:install|uninstall|add|remove|upgrade|update)\b[\s\S]*\b(?:package|dependency|dependencies|library|plugin|react|npm|pnpm|yarn|bun)\b/i,
     /(?:ติดตั้ง|ถอน|ลบ|เพิ่ม|อัปเดต)[\s\S]*(?:แพ็กเกจ|package|dependency|ไลบรารี|ปลั๊กอิน|react|npm|pnpm|yarn|bun)/i,
     /\b(?:install|uninstall|upgrade)\s+(?:--save-dev\s+)?(?:@[\w.-]+\/)?[\w.-]+\b/i,
     /(?:ติดตั้ง|ลง|ถอน)\s*(?:(?:แพ็กเกจ|package|ไลบรารี|dependency)\s*)?(?:@[\w.-]+\/)?[\w.-]+/i
+];
+
+const readOnlyPatterns = [
+    /\b(?:do not|don't|never)\s+(?:edit|change|modify|write|delete|install|update)\b|\bwithout\s+(?:editing|changing|modifying|writing|deleting|installing|updating)\b|\bread[ -]?only\b|\b(?:just|only)\s+(?:read|inspect|review|explain|summarize)\b/i,
+    /(?:ห้าม|อย่า|ไม่ต้อง|ไม่ให้)\s*(?:แก้|เปลี่ยน|เขียน|ลบ|ติดตั้ง|อัปเดต)(?:ไฟล์|โค้ด|โปรเจกต์)?|(?:แค่|เพียง|อย่างเดียว)\s*(?:อ่าน|ตรวจ|ดู|รีวิว|อธิบาย|สรุป)/i
 ];
 
 const runtimeVerificationPatterns = [
@@ -108,6 +120,24 @@ function requiresWorkspaceWrite(message: string): boolean {
     return matchesAny(message.trim(), workspaceMutationPatterns);
 }
 
+function forbidsWorkspaceWrite(message: string): boolean {
+    return matchesAny(message.trim(), readOnlyPatterns);
+}
+
+function forbidsWorkspaceWriteWithHistory(
+    message: string,
+    history: Array<{ role: "user" | "assistant"; content: string }>,
+    continuation: boolean
+): boolean {
+    if (forbidsWorkspaceWrite(message)) return true;
+    if (!continuation) return false;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const previous = history[index];
+        if (previous?.role === "user") return forbidsWorkspaceWrite(previous.content);
+    }
+    return false;
+}
+
 function requiresWorkspaceWriteWithHistory(
     message: string,
     history: Array<{ role: "user" | "assistant"; content: string }>,
@@ -160,6 +190,55 @@ function commandSatisfiesVerification(command: string, requirement: Verification
     return /\b(test|check|verify|lint|typecheck|tsc|build|compile|go\s+test|go\s+build|cargo\s+test|pytest|unittest|dotnet\s+test|mvn\s+test|gradle\s+test)\b/i.test(clean);
 }
 
+// Classify the kind of evidence needed from the user's described outcome, not
+// from a framework or feature name. This applies equally to any UI technology.
+const interactionActionPattern = /\b(?:click|press|tap|select|submit|toggle|drag|navigate)\b|(?:กด|คลิก|แตะ|เลือก|ส่งฟอร์ม|สลับ|ลาก)/i;
+const observedMismatchPattern = /\b(?:does\s+not|doesn't|did\s+not|didn't|won't|nothing|still|instead|remains?|stays?|fails?)\b|(?:ไม่|ไม่ได้|ไม่ไป|ไม่เปลี่ยน|ไม่ทำงาน|ยัง|กลับ|แทน|ค้าง)/i;
+
+function acceptanceContract(message: string): AcceptanceContract {
+    const clean = message.trim();
+    if (interactionActionPattern.test(clean) && observedMismatchPattern.test(clean)) {
+        return {
+            evidence: "interaction",
+            verification: "runtime",
+            reason: "The user reported an observable interaction whose outcome is wrong; compilation alone cannot prove the behavior."
+        };
+    }
+    const verification = verificationRequirement(clean);
+    return verification === "runtime"
+        ? { evidence: "runtime", verification, reason: "The requested outcome must be observed at runtime." }
+        : verification === "command"
+            ? { evidence: "command", verification, reason: "A finite project command is the requested acceptance evidence." }
+            : { evidence: "source", verification, reason: "No observable runtime or command acceptance criterion was inferred." };
+}
+
+function acceptanceContractWithHistory(
+    message: string,
+    history: Array<{ role: "user" | "assistant"; content: string }>,
+    continuation: boolean
+): AcceptanceContract {
+    const direct = acceptanceContract(message);
+    if (!continuation || direct.evidence === "interaction" || direct.evidence === "runtime") return direct;
+    let inherited = direct;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+        const previous = history[index];
+        if (previous?.role !== "user") continue;
+        const candidate = acceptanceContract(previous.content);
+        if (candidate.evidence === "interaction") return candidate;
+        if (candidate.evidence === "runtime") inherited = candidate;
+        else if (candidate.evidence === "command" && inherited.evidence === "source") inherited = candidate;
+    }
+    return inherited;
+}
+
+function commandSatisfiesAcceptance(command: string, contract: AcceptanceContract): boolean {
+    if (contract.evidence === "source") return true;
+    if (contract.evidence === "interaction") {
+        return /\b(playwright|cypress|selenium|webdriver|test:e2e|e2e:test|e2e)\b/i.test(command);
+    }
+    return commandSatisfiesVerification(command, contract.verification);
+}
+
 function workflowInstructions(kind: WorkflowKind): string {
     if (kind === "web_research") {
         return `Workflow: web research.
@@ -192,10 +271,15 @@ function workflowInstructions(kind: WorkflowKind): string {
 module.exports = {
     classifyWorkflow,
     classifyWorkflowWithHistory,
+    forbidsWorkspaceWrite,
+    forbidsWorkspaceWriteWithHistory,
     requiresWorkspaceWrite,
     requiresWorkspaceWriteWithHistory,
     verificationRequirement,
     verificationRequirementWithHistory,
     commandSatisfiesVerification,
+    acceptanceContract,
+    acceptanceContractWithHistory,
+    commandSatisfiesAcceptance,
     workflowInstructions
 };

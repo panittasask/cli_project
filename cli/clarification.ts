@@ -1,10 +1,12 @@
 type ClarificationOption = import("./clarificationTypes").ClarificationOption;
 type ClarificationRequest = import("./clarificationTypes").ClarificationRequest;
 type ClarificationAnswer = import("./clarificationTypes").ClarificationAnswer;
+type ClarificationInspection = { action: "list_files" | "search_files" | "read_file"; path?: string; query?: string };
 
 function normalizeClarificationRequest(
     question: unknown,
     options: unknown,
+    decision: unknown,
     reason?: string
 ): ClarificationRequest | undefined {
     if (typeof question !== "string" || !question.trim() || !Array.isArray(options)) return undefined;
@@ -21,9 +23,12 @@ function normalizeClarificationRequest(
         normalizedOptions.findIndex((candidate) => candidate.id.toLowerCase() === option.id.toLowerCase()) === index
     )).slice(0, 6);
     if (uniqueOptions.length < 2) return undefined;
+    const normalizedDecision = typeof decision === "string" ? decision.trim().toLowerCase() : "";
+    if (!["target", "scope", "compatibility", "destructive", "cost", "external", "preference"].includes(normalizedDecision)) return undefined;
     return {
         question: question.trim().slice(0, 500),
         options: uniqueOptions,
+        decision: normalizedDecision as ClarificationRequest["decision"],
         ...(reason ? { reason } : {})
     };
 }
@@ -95,11 +100,77 @@ function answerLooksLikeBlockingClarification(answer: string): boolean {
     return /\b(?:which|choose|specify|clarify|do you want|would you like|what (?:package|project|option|version|kind|type))\b|(?:ต้องการ|เลือก|ระบุ|หมายถึง|ขอรายละเอียด|แบบไหน|อันไหน|ตัวไหน|โปรเจกต์ไหน|แพ็กเกจไหน)/i.test(clean);
 }
 
+function relevantClarificationInspections(input: {
+    decision: ClarificationRequest["decision"];
+    question: string;
+    inspections: ClarificationInspection[];
+}): ClarificationInspection[] {
+    const manifestOrConfig = /(?:^|[\\/])(?:package\.json|go\.mod|cargo\.toml|pyproject\.toml|pom\.xml|[^\\/]+\.(?:sln|csproj)|[^\\/]*(?:lock|config|workspace|project)[^\\/]*)$/i;
+    const questionTerms = input.question.toLowerCase().match(/[\p{L}\p{N}_@.-]{3,}/gu) ?? [];
+    return input.inspections.filter((inspection) => {
+        const evidence = `${inspection.path ?? ""} ${inspection.query ?? ""}`.toLowerCase();
+        const overlapsQuestion = questionTerms.some((term) => evidence.includes(term));
+        if (input.decision === "preference") return false;
+        if (input.decision === "target") {
+            return inspection.action === "list_files" || manifestOrConfig.test(inspection.path ?? "") || overlapsQuestion;
+        }
+        if (input.decision === "compatibility") {
+            return manifestOrConfig.test(inspection.path ?? "")
+                || /(?:dependency|dependencies|version|peer|package|lock|runtime|engine)/i.test(inspection.query ?? "")
+                || overlapsQuestion;
+        }
+        if (input.decision === "destructive") {
+            return inspection.action === "read_file" || inspection.action === "list_files" || overlapsQuestion;
+        }
+        if (input.decision === "scope") {
+            return manifestOrConfig.test(inspection.path ?? "")
+                || /(?:readme|requirements?|routes?|src|app|workspace|project)/i.test(evidence)
+                || overlapsQuestion;
+        }
+        return true;
+    });
+}
+
+function clarificationBlockReason(input: {
+    workspaceMutationRequired: boolean;
+    successfulInspections: number;
+    answeredClarifications: number;
+    hasNewBlocker: boolean;
+    decision: ClarificationRequest["decision"];
+    knownProjectRoots: number;
+    asksNewVersusExisting: boolean;
+    maxClarifications: number;
+    requireInspection: boolean;
+    secondRequiresBlocker: boolean;
+}): string | undefined {
+    if (input.decision === "preference") {
+        return "Preference questions are non-blocking. Follow observed project conventions and choose a conservative reversible default.";
+    }
+    if (input.maxClarifications === 0) {
+        return "Clarifications are disabled by the effective agent settings. Continue only with safe, reversible actions supported by workspace evidence.";
+    }
+    if (input.requireInspection && input.workspaceMutationRequired && input.successfulInspections === 0) {
+        return "Inspect the workspace before asking. Use list_files, search_files, or read_file to resolve project structure and existing conventions first.";
+    }
+    if (input.asksNewVersusExisting && input.knownProjectRoots === 1) {
+        return "One project root is already known. Use that existing project unless the user explicitly requested a separate project.";
+    }
+    if (input.answeredClarifications >= input.maxClarifications) {
+        return `The configured clarification limit (${input.maxClarifications}) has been reached. Use prior answers and workspace evidence, or stop safely if the remaining action is irreversible.`;
+    }
+    if (input.secondRequiresBlocker && input.answeredClarifications > 0 && !input.hasNewBlocker) {
+        return "The task already has a clarification answer and no new execution blocker. Continue with the observed conventions and a safe reversible default instead of asking another preference question.";
+    }
+    return undefined;
+}
+
 module.exports = {
     answerLooksLikeBlockingClarification,
+    clarificationBlockReason,
     clarificationObservation,
     clarificationTranscriptLine,
     formatClarificationRequest,
     normalizeClarificationRequest,
+    relevantClarificationInspections,
     resolveClarificationAnswer
 };

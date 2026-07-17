@@ -6,6 +6,9 @@ Set-Location -LiteralPath $appRoot
 function Get-CliSettings {
     $settingsPath = Join-Path $PSScriptRoot "..\.cli\settings.json"
     if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        $settingsPath = Join-Path $PSScriptRoot "..\.cli\settings.example.json"
+    }
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
         return [pscustomobject]@{}
     }
 
@@ -66,6 +69,7 @@ if ($portInUse) {
 
     $llamaDevice = Resolve-LlamaDevice -ServerExecutable $serverExecutable -RequestedDevice $requestedLlamaDevice
     $runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
+    $memoryProfile = Get-LlamaMemoryProfile -Device $llamaDevice
     $models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
     if ($models.Count -eq 0) { throw "No .gguf models found in: $modelDirectory" }
 
@@ -105,7 +109,7 @@ if ($portInUse) {
         "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(),
         "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080"
     )
-    if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) { $serverArguments += @("--device", $llamaDevice, "-ngl", "all") }
+    $serverArguments += @($memoryProfile.Arguments)
     $serverArguments += @($speculativeProfile.Arguments)
 
     Write-Host ""
@@ -114,6 +118,7 @@ if ($portInUse) {
     Write-Host ("llama.cpp configured context: {0:N0} tokens" -f $parsedContextLength)
     if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) { Write-Host "llama.cpp device: $llamaDevice" }
     Write-Host "llama.cpp profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
+    Write-Host "llama.cpp memory: $($memoryProfile.Description)"
     Write-Host "llama.cpp speculative decoding: $($speculativeProfile.Description)"
     Write-Host "Server logs: $stdoutLog"
 
