@@ -1,20 +1,8 @@
 import fs = require("node:fs");
 import path = require("node:path");
 
-type ProjectCheck = "go" | "node";
-
-type ProjectCompletionRequirement = {
-    label: string;
-    requireGoModule: boolean;
-    requireGoJsonApi: boolean;
-    requireReactApp: boolean;
-    requireAngularApp: boolean;
-    forbidReactArtifacts: boolean;
-    forbidAngularArtifacts: boolean;
-    requireFrontendApiCall: boolean;
-    requireSwagger: boolean;
-    requiredChecks: ProjectCheck[];
-};
+type ProjectCheck = import("./projectTypes").ProjectCheck;
+type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
 
 const mutationPattern = /\b(create|build|make|generate|scaffold|implement|write|add|fix|finish|complete)\b|(?:สร้าง|เพิ่ม|เขียน|ทำ|แก้|ให้เสร็จ)/i;
 const goPattern = /\b(golang|go\s*lang|go\s+(?:api|server|backend|rest)|gin|go-chi)\b|(?:ภาษา\s*go|โกแลง)/i;
@@ -37,10 +25,6 @@ function inferProjectCompletionRequirement(message: string): ProjectCompletionRe
 
     const labels = [wantsGo ? "Go API" : "", wantsReact ? "React app" : "", wantsAngular ? "Angular app" : "", wantsSwagger ? "Swagger/OpenAPI" : ""]
         .filter(Boolean);
-    const requiredChecks: ProjectCheck[] = [];
-    if (wantsGo) requiredChecks.push("go");
-    if (wantsReact || wantsAngular) requiredChecks.push("node");
-
     return {
         label: labels.join(" + "),
         requireGoModule: wantsGo,
@@ -50,8 +34,7 @@ function inferProjectCompletionRequirement(message: string): ProjectCompletionRe
         forbidReactArtifacts: removesReact,
         forbidAngularArtifacts: removesAngular,
         requireFrontendApiCall: wantsGo && (wantsReact || wantsAngular),
-        requireSwagger: wantsSwagger,
-        requiredChecks
+        requireSwagger: wantsSwagger
     };
 }
 
@@ -90,9 +73,6 @@ function mergeProjectCompletionRequirements(
     const requireGoModule = newer.requireGoModule || older.requireGoModule;
     const requireGoJsonApi = newer.requireGoJsonApi || older.requireGoJsonApi;
     const requireSwagger = newer.requireSwagger || older.requireSwagger;
-    const requiredChecks: ProjectCheck[] = [];
-    if (requireGoModule) requiredChecks.push("go");
-    if (requireReactApp || requireAngularApp) requiredChecks.push("node");
     const labels = [
         requireGoModule ? "Go API" : "",
         requireReactApp ? "React app" : "",
@@ -108,8 +88,7 @@ function mergeProjectCompletionRequirements(
         forbidReactArtifacts: newer.forbidReactArtifacts,
         forbidAngularArtifacts: newer.forbidAngularArtifacts,
         requireFrontendApiCall: requireGoModule && (requireReactApp || requireAngularApp),
-        requireSwagger,
-        requiredChecks
+        requireSwagger
     };
 }
 
@@ -366,37 +345,166 @@ function evaluateProjectCompletion(
     return missing;
 }
 
-function projectChecksForCommand(command: string): ProjectCheck[] {
+function relativePath(workspace: string, target: string): string {
+    return path.relative(workspace, target).replace(/\\/g, "/") || ".";
+}
+
+function createProjectCheck(
+    workspace: string,
+    manifestPath: string,
+    label: string,
+    command: string,
+    ecosystem: string,
+    affectedExtensions: string[],
+    affectedFiles: string[]
+): ProjectCheck {
+    const relativeManifest = relativePath(workspace, manifestPath);
+    return {
+        id: `${relativeManifest.toLowerCase()}::${command.toLowerCase()}`,
+        label,
+        command,
+        workdir: relativePath(workspace, path.dirname(manifestPath)),
+        manifestPath: relativeManifest,
+        ecosystem,
+        affectedExtensions,
+        affectedFiles
+    };
+}
+
+function discoverProjectChecks(workspace: string): ProjectCheck[] {
+    const files = collectFiles(workspace);
     const checks: ProjectCheck[] = [];
-    if (/\bgo\s+(?:test|build|vet)\b/i.test(command)) checks.push("go");
-    if (/\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:test|run\s+(?:build|check|lint|typecheck))\b|\bnpx(?:\.cmd)?\s+(?:tsc|vite\s+build)\b|\bng\s+(?:build|test|lint)\b/i.test(command)) {
-        checks.push("node");
+
+    for (const manifestPath of files.filter((file) => path.basename(file).toLowerCase() === "package.json")) {
+        try {
+            const parsed = JSON.parse(readText(manifestPath)) as {
+                name?: unknown;
+                scripts?: Record<string, unknown>;
+                dependencies?: Record<string, unknown>;
+                devDependencies?: Record<string, unknown>;
+            };
+            const scripts = parsed.scripts ?? {};
+            const dependencies = { ...parsed.dependencies, ...parsed.devDependencies };
+            const ecosystem = dependencies["@angular/core"] ? "angular" : dependencies.react ? "react" : "node";
+            const priority = ecosystem === "node"
+                ? ["test", "build", "check", "typecheck", "lint"]
+                : ["build", "test", "check", "typecheck", "lint"];
+            const script = priority.find((name) => typeof scripts[name] === "string" && String(scripts[name]).trim().length > 0);
+            if (!script) continue;
+            const root = path.dirname(manifestPath);
+            const runner = fs.existsSync(path.join(root, "bun.lock")) || fs.existsSync(path.join(root, "bun.lockb"))
+                ? "bun" : fs.existsSync(path.join(root, "pnpm-lock.yaml"))
+                    ? "pnpm" : fs.existsSync(path.join(root, "yarn.lock")) ? "yarn" : "npm";
+            const command = script === "test" ? `${runner} test` : `${runner} run ${script}`;
+            const projectName = typeof parsed.name === "string" && parsed.name.trim()
+                ? parsed.name.trim() : relativePath(workspace, root);
+            checks.push(createProjectCheck(
+                workspace,
+                manifestPath,
+                `${projectName} ${script}`,
+                command,
+                ecosystem,
+                [".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"],
+                ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "angular.json", "tsconfig.json"]
+            ));
+        } catch {
+            // Invalid manifests are handled by normal validation.
+        }
     }
+
+    for (const manifestPath of files.filter((file) => path.basename(file).toLowerCase() === "go.mod")) {
+        checks.push(createProjectCheck(workspace, manifestPath, `${relativePath(workspace, path.dirname(manifestPath))} Go tests`, "go test ./...", "go", [".go"], ["go.mod", "go.sum"]));
+    }
+    for (const manifestPath of files.filter((file) => path.basename(file).toLowerCase() === "cargo.toml")) {
+        checks.push(createProjectCheck(workspace, manifestPath, `${relativePath(workspace, path.dirname(manifestPath))} Rust tests`, "cargo test", "rust", [".rs"], ["cargo.toml", "cargo.lock"]));
+    }
+    for (const manifestPath of files.filter((file) => path.basename(file).toLowerCase() === "pyproject.toml")) {
+        const content = readText(manifestPath);
+        if (/\bpytest\b|\[tool\.pytest\./i.test(content)) {
+            checks.push(createProjectCheck(workspace, manifestPath, `${relativePath(workspace, path.dirname(manifestPath))} Python tests`, "python -m pytest", "python", [".py"], ["pyproject.toml", "pytest.ini"]));
+        }
+    }
+    for (const manifestPath of files.filter((file) => /\.(?:sln|csproj)$/i.test(file))) {
+        const root = path.dirname(manifestPath);
+        const hasSolutionInRoot = files.some((file) => path.dirname(file) === root && /\.sln$/i.test(file));
+        if (/\.csproj$/i.test(manifestPath) && hasSolutionInRoot) continue;
+        const manifestName = path.basename(manifestPath);
+        checks.push(createProjectCheck(workspace, manifestPath, `${relativePath(workspace, root)} .NET build`, `dotnet build "${manifestName}"`, "dotnet", [".cs", ".fs", ".vb", ".cshtml"], [manifestName, "Directory.Build.props", "Directory.Build.targets"]));
+    }
+    for (const manifestPath of files.filter((file) => path.basename(file).toLowerCase() === "pom.xml")) {
+        checks.push(createProjectCheck(workspace, manifestPath, `${relativePath(workspace, path.dirname(manifestPath))} Maven tests`, "mvn test", "java", [".java", ".kt"], ["pom.xml"]));
+    }
+
     return checks;
 }
 
-function projectChecksAffectedByPath(filePath: string): ProjectCheck[] {
-    const normalized = filePath.replace(/\\/g, "/").toLowerCase();
-    const checks: ProjectCheck[] = [];
-    if (/(?:^|\/)(?:go\.mod|go\.sum)$|\.go$/.test(normalized)) checks.push("go");
-    if (/(?:^|\/)package(?:-lock)?\.json$|pnpm-lock\.yaml$|yarn\.lock$|\.(?:js|jsx|ts|tsx|css|scss|html)$/.test(normalized)) {
-        checks.push("node");
+function normalizeCommand(command: string): string {
+    return command.toLowerCase().replace(/\.cmd\b/g, "").replace(/\s+/g, " ").trim();
+}
+
+function projectChecksForCommand(command: string, checks: ProjectCheck[], workdir?: string): string[] {
+    const normalizedCommand = normalizeCommand(command);
+    const normalizedWorkdir = workdir?.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    return checks.filter((check) => {
+        const commandMatches = normalizedCommand.includes(normalizeCommand(check.command));
+        if (!commandMatches || !normalizedWorkdir) return commandMatches;
+        const checkWorkdir = check.workdir.replace(/\\/g, "/").toLowerCase();
+        return normalizedWorkdir === checkWorkdir || normalizedWorkdir.endsWith(`/${checkWorkdir}`);
+    }).map((check) => check.id);
+}
+
+function projectChecksAffectedByPath(filePath: string, checks: ProjectCheck[]): string[] {
+    const normalized = filePath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    const candidates = checks.filter((check) => {
+        const root = check.workdir === "." ? "" : `${check.workdir.toLowerCase().replace(/\\/g, "/")}/`;
+        if (root && !normalized.startsWith(root)) return false;
+        const basename = path.posix.basename(normalized);
+        const extension = path.posix.extname(normalized);
+        return check.affectedFiles.some((file) => file.toLowerCase() === basename)
+            || check.affectedExtensions.includes(extension);
+    });
+    if (candidates.length === 0) return [];
+    const deepestRoot = Math.max(...candidates.map((check) => check.workdir === "." ? 0 : check.workdir.length));
+    return candidates.filter((check) => (check.workdir === "." ? 0 : check.workdir.length) === deepestRoot).map((check) => check.id);
+}
+
+function projectChecksAffectedByWorkdir(workdir: string | undefined, checks: ProjectCheck[]): string[] {
+    if (!workdir) return checks.map((check) => check.id);
+    const normalized = workdir.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    return checks.filter((check) => {
+        const root = check.workdir.replace(/\\/g, "/").toLowerCase();
+        return root === "." || normalized === root || normalized.startsWith(`${root}/`) || root.startsWith(`${normalized}/`);
+    }).map((check) => check.id);
+}
+
+function requiredProjectChecks(requirement: ProjectCompletionRequirement, checks: ProjectCheck[]): ProjectCheck[] {
+    return checks.filter((check) => (
+        (requirement.requireGoModule && check.ecosystem === "go")
+        || (requirement.requireReactApp && check.ecosystem === "react")
+        || (requirement.requireAngularApp && check.ecosystem === "angular")
+    ));
+}
+
+function formatProjectChecksPrompt(checks: ProjectCheck[]): string {
+    if (checks.length === 0) {
+        return "No finite project verification command was discovered yet. Inspect manifests created during the task; the runtime will discover their declared checks after each mutation.";
     }
-    return checks;
+    const lines = checks.map((check) => `- ${check.label}: run \`${check.command}\` with workdir \`${check.workdir}\` (from ${check.manifestPath})`);
+    return `Workspace verification checks discovered from manifests:\n${lines.join("\n")}\nThese commands are runtime facts, not suggestions invented from the request. After changing an affected file, rerun its check successfully before final.`;
 }
 
 function protectedProjectDeletionReason(workspace: string, filePath: string, request: string): string | undefined {
     const absolute = path.resolve(workspace, filePath);
     const basename = path.basename(absolute).toLowerCase();
-    if (!/^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(basename)) return undefined;
+    if (!/^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/.test(basename)) return undefined;
     if (!fs.existsSync(path.join(path.dirname(absolute), "package.json"))) return undefined;
-    const explicitRemoval = /(?:remove|delete|ลบ|เอาออก)[\s\S]{0,50}(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|lockfile|lock file)/i.test(request);
+    const explicitRemoval = /(?:remove|delete|ลบ|เอาออก)[\s\S]{0,50}(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|lockfile|lock file)/i.test(request);
     return explicitRemoval
         ? undefined
         : `preserve active project lockfile ${filePath}; it is co-located with package.json and the request did not explicitly ask to remove it`;
 }
 
-function formatProjectCompletionPrompt(requirement: ProjectCompletionRequirement): string {
+function formatProjectCompletionPrompt(requirement: ProjectCompletionRequirement, checks: ProjectCheck[] = []): string {
     const items: string[] = [];
     if (requirement.requireGoModule) items.push("a go.mod and Go application source");
     if (requirement.requireGoJsonApi) items.push("an HTTP route returning structured JSON");
@@ -406,8 +514,11 @@ function formatProjectCompletionPrompt(requirement: ProjectCompletionRequirement
     if (requirement.forbidAngularArtifacts) items.push("remove old Angular source, scripts, and dependencies");
     if (requirement.requireFrontendApiCall) items.push("a real frontend API call using fetch, axios, or Angular HttpClient");
     if (requirement.requireSwagger) items.push("Swagger/OpenAPI specification or route integration");
-    if (requirement.requiredChecks.includes("go")) items.push("a successful go test/build/vet command");
-    if (requirement.requiredChecks.includes("node")) items.push("a successful frontend test/build/check command");
+    const requiredChecks = requiredProjectChecks(requirement, checks);
+    for (const check of requiredChecks) items.push(`successful verification '${check.command}' in '${check.workdir}'`);
+    if ((requirement.requireGoModule || requirement.requireReactApp || requirement.requireAngularApp) && requiredChecks.length === 0) {
+        items.push("a finite verification command discovered from each completed project manifest");
+    }
     return `Project completion profile (${requirement.label}): before final, ensure ${items.join("; ")}. A frontend manifest, its workspace configuration, source directory, and build command must belong to the same project root; do not scatter them across unrelated directories. Use a finite build/test command rather than a long-running development server for verification. Do not return a starter scaffold or defer required work to the user.`;
 }
 
@@ -422,12 +533,16 @@ function answerDefersRequiredWork(answer: string): boolean {
 
 module.exports = {
     answerDefersRequiredWork,
+    discoverProjectChecks,
     evaluateProjectCompletion,
     formatIncompleteTaskAnswer,
     formatProjectCompletionPrompt,
+    formatProjectChecksPrompt,
     inferProjectCompletionRequirement,
     inferProjectCompletionRequirementWithHistory,
     protectedProjectDeletionReason,
     projectChecksAffectedByPath,
-    projectChecksForCommand
+    projectChecksAffectedByWorkdir,
+    projectChecksForCommand,
+    requiredProjectChecks
 };

@@ -27,12 +27,20 @@ const codingPatterns = [
     /(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|เวิร์กสเปซ|คอนฟิก|แก้บั๊ก|รีแฟกเตอร์|รันเทส|ทดสอบ|คอมไพล์|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์)/i,
     /(หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล)/i,
     /\b(swagger|openapi|api|endpoint|router|server|framework)\b/i,
-    /(?:^|\s)[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go)(?:\s|$)/i
+    /(?:^|\s)[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go)(?:\s|$)/i,
+    /\b(?:install|uninstall|add|remove|upgrade|update)\b[\s\S]*\b(?:package|dependency|dependencies|library|plugin|react|npm|pnpm|yarn|bun)\b/i,
+    /(?:ติดตั้ง|ถอน|ลบ|เพิ่ม|อัปเดต)[\s\S]*(?:แพ็กเกจ|package|dependency|ไลบรารี|ปลั๊กอิน|react|npm|pnpm|yarn|bun)/i,
+    /\b(?:install|uninstall|upgrade)\s+(?:--save-dev\s+)?(?:@[\w.-]+\/)?[\w.-]+\b/i,
+    /(?:ติดตั้ง|ลง|ถอน)\s*(?:(?:แพ็กเกจ|package|ไลบรารี|dependency)\s*)?(?:@[\w.-]+\/)?[\w.-]+/i
 ];
 
 const workspaceMutationPatterns = [
     /\b(create|build|make|generate|scaffold|add|edit|update|modify|fix|refactor|implement|write|replace|switch|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)\b/i,
-    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|เปลี่ยน|แทนที่|ลบ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)/i
+    /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|อัปเดต|ทำ|เปลี่ยน|แทนที่|ลบ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)/i,
+    /\b(?:install|uninstall|add|remove|upgrade|update)\b[\s\S]*\b(?:package|dependency|dependencies|library|plugin|react|npm|pnpm|yarn|bun)\b/i,
+    /(?:ติดตั้ง|ถอน|ลบ|เพิ่ม|อัปเดต)[\s\S]*(?:แพ็กเกจ|package|dependency|ไลบรารี|ปลั๊กอิน|react|npm|pnpm|yarn|bun)/i,
+    /\b(?:install|uninstall|upgrade)\s+(?:--save-dev\s+)?(?:@[\w.-]+\/)?[\w.-]+\b/i,
+    /(?:ติดตั้ง|ลง|ถอน)\s*(?:(?:แพ็กเกจ|package|ไลบรารี|dependency)\s*)?(?:@[\w.-]+\/)?[\w.-]+/i
 ];
 
 const runtimeVerificationPatterns = [

@@ -154,7 +154,7 @@ async function main(): Promise<void> {
     assert.ok(typeof configuredContextLength === "number" && configuredContextLength > 0);
     const actionSampling = getSamplingSettings(settings, "action");
     assert.equal(actionSampling.temperature, 0.1);
-    assert.equal(actionSampling.max_tokens, 2048);
+    assert.equal(actionSampling.max_tokens, 4096);
     assert.deepEqual(getAgentGuardSettings({
         agent: {
             maxTurns: 12,

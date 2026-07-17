@@ -59,7 +59,7 @@ Settings:
   "sampling": {
     "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
     "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
-    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 2048 }
+    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 4096 }
   }
 }
 ```
@@ -263,6 +263,12 @@ their tool names, descriptions, and input schemas in the model prompt, and lets
 the model use `mcp_list_tools` and `mcp_call_tool` actions. Ask it to create a
 new MCP server and it will use the same folder/config convention, then discover
 and invoke the new tool before reporting success.
+
+If a material choice remains ambiguous after the agent inspects available
+context, it pauses the same task and shows 2-6 concrete choices. Enter a choice
+number or id, type any free-text answer when none of the choices fit, or enter
+`/cancel` to stop the task. Clarification wait time does not consume the agent's
+wall-clock budget, and the answer is retained in the session task context.
 
 The active workspace's `.cli/mcp.json` takes priority. If it is absent, the CLI
 installation's config is used so switching workspaces does not hide built-in
