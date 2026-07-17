@@ -66,6 +66,19 @@ class Spinner {
         return elapsed;
     }
 
+    suspend(): void {
+        if (!this.timer) return;
+        clearInterval(this.timer);
+        this.timer = undefined;
+        process.stdout.write("\r\x1b[K");
+    }
+
+    resume(): void {
+        if (this.timer || this.taskStartedAt === 0) return;
+        this.render(Date.now());
+        this.timer = setInterval(() => this.render(Date.now()), 100);
+    }
+
     update(message: string): void {
         if (message !== this.message) {
             this.message = message;

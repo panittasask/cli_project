@@ -68,25 +68,25 @@ function normalizeCommandSignature(command: string): string {
 
 function commandTimeoutMs(command: string): number {
     const normalized = normalizeCommandSignature(command);
-    const isDependencyInstall = /\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:install|i|ci|add|uninstall|remove)\b/.test(normalized);
-    const isProjectScaffold = /^(?:npx(?:\.cmd)?\s+)?[^\s]+\s+(?:new|init|create)\b|^npx(?:\.cmd)?\s+create-[\w-]+\b|^(?:npm|pnpm|yarn)(?:\.cmd)?\s+create\b/.test(normalized);
+    const isDependencyInstall = /\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:install|i|ci|add|uninstall|remove)\b/.test(normalized);
+    const isProjectScaffold = /^(?:npx(?:\.cmd)?\s+)?[^\s]+\s+(?:new|init|create)\b|^npx(?:\.cmd)?\s+create-[\w-]+\b|^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+create\b/.test(normalized);
     return isDependencyInstall || isProjectScaffold ? 180_000 : 30_000;
 }
 
 function commandCreatesWorkspaceFiles(command: string): boolean {
     const normalized = normalizeCommandSignature(command);
-    return /^(?:npx(?:\.cmd)?\s+)?[^\s]+\s+(?:new|init|create)\b|^npx(?:\.cmd)?\s+create-[\w-]+\b|^(?:npm|pnpm|yarn)(?:\.cmd)?\s+create\b/.test(normalized);
+    return /^(?:npx(?:\.cmd)?\s+)?[^\s]+\s+(?:new|init|create)\b|^npx(?:\.cmd)?\s+create-[\w-]+\b|^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+create\b/.test(normalized);
 }
 
 function commandMutatesWorkspaceFiles(command: string): boolean {
     const normalized = normalizeCommandSignature(command);
     if (commandCreatesWorkspaceFiles(normalized)) return true;
-    return /^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:install|i|ci|add|uninstall|remove)\b/.test(normalized);
+    return /^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:install|i|ci|add|uninstall|remove)\b/.test(normalized);
 }
 
 function commandAddsTooling(command: string): boolean {
     const normalized = normalizeCommandSignature(command);
-    return /^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:add|install|i)\s+[^-\s]/.test(normalized)
+    return /^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:add|install|i)\s+[^-\s]/.test(normalized)
         || /^\S+\s+add\s+[^-\s]/.test(normalized);
 }
 
@@ -144,7 +144,7 @@ function readPackageDependencyNames(directory: string): string[] {
 
 function packageScriptRequest(command: string): string | undefined {
     const normalized = normalizeCommandSignature(command);
-    const match = normalized.match(/^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?([^\s]+)/);
+    const match = normalized.match(/^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?([^\s]+)/);
     if (!match) return undefined;
     const requested = match[1];
     if (!requested || ["install", "i", "ci", "add", "remove", "uninstall", "create"].includes(requested)) return undefined;
@@ -155,7 +155,7 @@ function commandExecutable(command: string): string | undefined {
     const normalized = normalizeCommandSignature(command);
     const tokens = normalized.split(/\s+/).filter(Boolean);
     if (tokens[0] === "npx" || tokens[0] === "npx.cmd") return tokens[1];
-    if (["npm", "npm.cmd", "pnpm", "pnpm.cmd", "yarn", "yarn.cmd"].includes(tokens[0] ?? "")) return undefined;
+    if (["npm", "npm.cmd", "pnpm", "pnpm.cmd", "yarn", "yarn.cmd", "bun", "bun.cmd"].includes(tokens[0] ?? "")) return undefined;
     return tokens[0]?.replace(/\.cmd$/, "");
 }
 
@@ -219,7 +219,7 @@ function resolveCommandWorkdir(workspace: string, command: string, requestedWork
     }
 
     const normalized = normalizeCommandSignature(command);
-    if (/^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:install|i|ci)(?:\s|$)/.test(normalized)) {
+    if (/^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:install|i|ci|add)(?:\s|$)/.test(normalized)) {
         const manifestDirectories = findManifestDirectories(workspace, "package.json", 30);
         if (manifestDirectories.length === 1) {
             const relativeDirectory = path.relative(workspace, manifestDirectories[0] ?? workspace) || ".";
@@ -258,7 +258,7 @@ function projectRootSummary(workspace: string, relativeDirectory: string): strin
     } catch {
         return `${relativeDirectory}: unavailable`;
     }
-    const locks = entries.filter((name) => /^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(name));
+    const locks = entries.filter((name) => /^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/i.test(name));
     const configs = entries.filter((name) => {
         if (!name.toLowerCase().endsWith(".json") || /^(?:package(?:-lock)?|tsconfig(?:\.[\w-]+)?)\.json$/i.test(name)) return false;
         try {
@@ -358,7 +358,7 @@ function commandInteractiveRisk(command: string, workspace: string, workdir = ".
         }
     }
 
-    const npmScript = normalized.match(/^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:run\s+)?(start|dev|serve|watch|test)\b/);
+    const npmScript = normalized.match(/^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(start|dev|serve|watch|test)\b/);
     if (!npmScript) return undefined;
 
     const scriptName = npmScript[1];

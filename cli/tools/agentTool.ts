@@ -1,6 +1,13 @@
 import childProcess = require("node:child_process");
 import fs = require("node:fs");
 import path = require("node:path");
+const { normalizeClarificationRequest } = require("../clarification") as {
+    normalizeClarificationRequest: (
+        question: unknown,
+        options: unknown,
+        reason?: string
+    ) => import("../clarificationTypes").ClarificationRequest | undefined;
+};
 const { commandFailureGuidance, commandInteractiveRisk, commandTimeoutMs, packageContentAddsBrowserAutoOpen, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
     commandFailureGuidance: (workspace: string, command: string, errorOutput: string) => string;
     commandInteractiveRisk: (command: string, workspace: string, workdir?: string) => string | undefined;
@@ -59,6 +66,7 @@ type AgentAction = (
         command: string;
         workdir?: string;
     }
+    | ({ action: "ask_user" } & import("../clarificationTypes").ClarificationRequest)
     | {
         action: "mcp_list_tools";
         server?: string;
@@ -130,6 +138,7 @@ Available actions:
 {"action":"edit_file","path":"relative path","old_text":"exact existing text","new_text":"replacement text","reason":"brief rationale"}
 {"action":"delete_file","path":"relative file path","reason":"brief rationale"}
 {"action":"run_command","command":"safe read-only or verification command","workdir":"optional relative directory","reason":"brief rationale"}
+{"action":"ask_user","question":"one concrete decision needed","options":[{"id":"stable_id","label":"short choice","description":"impact of choosing it"},{"id":"second_id","label":"another choice","description":"impact of choosing it"}],"reason":"why this ambiguity blocks a correct action"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
 Call discovered MCP tools through mcp_call_tool using the exact configured server and tool names.
@@ -141,13 +150,17 @@ Rules:
 - For current, niche, or external information, call a relevant MCP search tool before answering. Base the answer on its observation and include the returned source URLs.
 - If a required tool is unavailable or its call fails, say so plainly. Do not fabricate results and do not pretend that telling the user to search is equivalent to searching.
 - Prefer reading relevant files before editing.
+- Resolve uncertainty from accessible conversation, files, manifests, configuration, and tool observations first. If a remaining ambiguity would materially change the target, package, scope, behavior, data, cost, compatibility, or destructive effect, use ask_user before acting.
+- Use ask_user instead of final for a blocking clarification. Offer 2-6 concrete, mutually distinct choices grounded in observed facts. Do not add an "Other" option; the CLI always accepts free-text answers outside the choices.
+- Do not ask about details that are safely inferable, reversible, or non-blocking. Ask one decision at a time and continue the same task after the answer.
+- For package operations, establish the exact package name, target project root, package manager, and production versus development role from the request and manifests. Inspect first, then use ask_user if any material choice remains or multiple project roots are plausible.
 - If the user names an exact file path, act on that path directly instead of listing the workspace to look for it.
 - Preserve existing style and dependencies unless the user asks otherwise.
 - Treat each directory containing a manifest as a separate project root. If an obsolete project is being removed and its replacement already exists in another root, delete the obsolete files after reading them instead of repurposing that manifest with guessed dependencies.
 - Prefer edit_file for an existing file: old_text must match exactly once, and new_text contains only its replacement.
 - Use delete_file when the user asks to remove an obsolete file. Read it first. Never simulate deletion by replacing a manifest or source file with empty content.
 - Use write_file for new files or when a complete replacement is genuinely necessary. For write_file, provide the full final file content.
-- Use write_file to create files and parent directories. run_command is only for read-only inspection or verification; never use mkdir, New-Item, redirection, or shell commands to create files.
+- Use write_file to create files and parent directories. Use run_command for read-only inspection, finite verification, or package/scaffold operations explicitly requested by the user; never use mkdir, New-Item, redirection, or generic shell commands to create files.
 - Verify file contents with read_file or search_files instead of shell pipelines whenever possible.
 - Never assume a localhost server is running or that a workspace file is available over HTTP. Call a local URL only after a successful observation confirms that exact server and port are running.
 - If a verification command fails, recover with an OS-compatible command or a relevant read_file/search_files action before reporting verified success.
@@ -189,6 +202,11 @@ ${mcpSection}`;
                 answer: typeof data.answer === "string" ? data.answer : "",
                 reason
             };
+        }
+
+        if (action === "ask_user") {
+            const request = normalizeClarificationRequest(data.question, data.options, reason);
+            return request ? { action, ...request } : undefined;
         }
 
         if (action === "list_files") {
@@ -352,6 +370,10 @@ ${mcpSection}`;
     }
 
     private isSupportedAction(action: string, data: Record<string, unknown>): boolean {
+        if (action === "ask_user") {
+            const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
+            return Boolean(normalizeClarificationRequest(data.question, data.options, reason));
+        }
         const builtInActions = new Set([
             "final",
             "list_files",
@@ -374,6 +396,10 @@ ${mcpSection}`;
             // operation. The model never touches the filesystem directly.
             if (action.action === "final") {
                 return { ok: true, output: action.answer };
+            }
+
+            if (action.action === "ask_user") {
+                return { ok: false, output: "ask_user must be handled by the interactive agent loop." };
             }
 
             if (action.action === "list_files") {
@@ -519,6 +545,7 @@ ${mcpSection}`;
                 const location = action.workdir ? ` in ${clean(action.workdir)}` : "";
                 return `Running check${location}: ${clean(action.command)}`;
             }
+            if (action.action === "ask_user") return `Waiting for clarification: ${clean(action.question)}`;
             if (action.action === "mcp_list_tools") return `Discovering MCP tools${action.server ? `: ${clean(action.server)}` : ""}`;
             if (action.action === "mcp_call_tool") return `Calling tool: ${clean(`${action.server}.${action.tool}`)}`;
             return "Preparing final answer";

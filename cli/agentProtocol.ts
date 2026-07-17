@@ -42,6 +42,27 @@ const variants: Record<string, Record<string, unknown>> = {
         properties: { action: { const: "run_command" }, command: stringProperty, workdir: stringProperty, reason: stringProperty },
         required: ["action", "command", "reason"], additionalProperties: false
     },
+    ask_user: {
+        type: "object",
+        properties: {
+            action: { const: "ask_user" },
+            question: stringProperty,
+            options: {
+                type: "array",
+                minItems: 2,
+                maxItems: 6,
+                items: {
+                    type: "object",
+                    properties: { id: stringProperty, label: stringProperty, description: stringProperty },
+                    required: ["id", "label", "description"],
+                    additionalProperties: false
+                }
+            },
+            reason: stringProperty
+        },
+        required: ["action", "question", "options", "reason"],
+        additionalProperties: false
+    },
     mcp_list_tools: {
         type: "object",
         properties: { action: { const: "mcp_list_tools" }, server: stringProperty, reason: stringProperty },
@@ -58,10 +79,10 @@ const workflowActions: Record<WorkflowKind, string[]> = {
     // General agent requests keep local tools available so the model can use
     // conversational context instead of relying on an exhaustive intent regex.
     // Runtime guards still enforce workspace boundaries and safe mutations.
-    general: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "final"],
-    web_research: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "final"],
-    coding: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "final"],
-    mcp_creation: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "final"]
+    general: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"],
+    web_research: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
+    coding: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"],
+    mcp_creation: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "ask_user", "final"]
 };
 
 function getAgentResponseFormat(workflow: WorkflowKind): Record<string, unknown> {
@@ -75,7 +96,7 @@ function getAgentRecoveryResponseFormat(workflow: WorkflowKind, blockedAction: s
 }
 
 function getAgentMutationResponseFormat(blockedAction?: string): Record<string, unknown> {
-    const actions = ["edit_file", "write_file", "delete_file"].filter((action) => action !== blockedAction);
+    const actions = ["edit_file", "write_file", "delete_file", "ask_user"].filter((action) => action !== blockedAction);
     return formatForActions(actions.length > 0 ? actions : ["write_file"]);
 }
 
@@ -86,7 +107,7 @@ function getAgentLocalResponseFormat(workflow: WorkflowKind): Record<string, unk
 
 function getInitialAgentResponseFormat(workflow: WorkflowKind, message: string, requiresWrite = false): Record<string, unknown> {
     if ((workflow === "coding" || workflow === "mcp_creation") && requiresWrite) {
-        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file", "delete_file"]);
+        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file", "delete_file", "ask_user"]);
     }
     if (workflow === "coding" && /(?:^|[\s"'`])(?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml)(?=$|[\s"'`,)])/i.test(message)) {
         return formatForActions(["read_file"]);

@@ -11,6 +11,8 @@ class AgentGuard {
     private completionTokens = 0;
     private readonly actionCounts = new Map<string, number>();
     private inspectionEpoch = 0;
+    private pausedAt: number | undefined;
+    private pausedDurationMs = 0;
 
     constructor(readonly settings: GuardSettings) {}
 
@@ -20,7 +22,7 @@ class AgentGuard {
 
     checkBudget(turn: number, now = Date.now()): string | undefined {
         if (turn > this.settings.maxTurns) return `turn budget reached (${this.settings.maxTurns})`;
-        if (now - this.startedAt >= this.settings.maxDurationMs) return `wall-clock budget reached (${this.formatRemaining(now)})`;
+        if (this.elapsedMs(now) >= this.settings.maxDurationMs) return `wall-clock budget reached (${this.formatRemaining(now)})`;
         if (this.completionTokens >= this.settings.maxCompletionTokens) return `completion-token budget reached (${this.completionTokens}/${this.settings.maxCompletionTokens})`;
         return undefined;
     }
@@ -43,12 +45,27 @@ class AgentGuard {
         this.actionCounts.clear();
     }
 
+    pause(now = Date.now()): void {
+        if (this.pausedAt === undefined) this.pausedAt = now;
+    }
+
+    resume(now = Date.now()): void {
+        if (this.pausedAt === undefined) return;
+        this.pausedDurationMs += Math.max(0, now - this.pausedAt);
+        this.pausedAt = undefined;
+    }
+
     formatRemaining(now = Date.now()): string {
-        const remainingMs = Math.max(0, this.settings.maxDurationMs - (now - this.startedAt));
+        const remainingMs = Math.max(0, this.settings.maxDurationMs - this.elapsedMs(now));
         const totalSeconds = Math.ceil(remainingMs / 1000);
         const minutes = Math.floor(totalSeconds / 60);
         const seconds = totalSeconds % 60;
         return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")} left`;
+    }
+
+    private elapsedMs(now: number): number {
+        const activePauseMs = this.pausedAt === undefined ? 0 : Math.max(0, now - this.pausedAt);
+        return Math.max(0, now - this.startedAt - this.pausedDurationMs - activePauseMs);
     }
 
     private signature(action: Record<string, unknown>): string {

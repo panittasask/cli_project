@@ -2,6 +2,21 @@ import axios = require("axios");
 import readline = require("node:readline");
 import fs = require("node:fs");
 import path = require("node:path");
+const {
+    answerLooksLikeBlockingClarification,
+    clarificationObservation,
+    clarificationTranscriptLine,
+    formatClarificationRequest,
+    resolveClarificationAnswer
+} = require("./clarification") as {
+    answerLooksLikeBlockingClarification: (answer: string) => boolean;
+    clarificationObservation: (request: ClarificationRequest, answer: ClarificationAnswer) => Record<string, unknown>;
+    clarificationTranscriptLine: (request: ClarificationRequest, answer: ClarificationAnswer) => string;
+    formatClarificationRequest: (request: ClarificationRequest) => string;
+    resolveClarificationAnswer: (request: ClarificationRequest, input: string) => ClarificationAnswer | undefined;
+};
+type ClarificationRequest = import("./clarificationTypes").ClarificationRequest;
+type ClarificationAnswer = import("./clarificationTypes").ClarificationAnswer;
 const { LlamaClient } = require("./llamaClient") as { LlamaClient: new (apiUrl: string, timeoutMs?: number) => {
     post: (
         payload: Record<string, unknown>,
@@ -23,6 +38,8 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: "allow" | "replan" | "stop"; message?: string };
     resetActionHistory: () => void;
+    pause: () => void;
+    resume: () => void;
     formatRemaining: () => string;
 } };
 const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges } = require("./commandNormalizer") as {
@@ -114,19 +131,8 @@ const { formatSessionHistory } = require("./sessionHistory") as {
 };
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 type VerificationRequirement = "none" | "command" | "runtime";
-type ProjectCheck = "go" | "node";
-type ProjectCompletionRequirement = {
-    label: string;
-    requireGoModule: boolean;
-    requireGoJsonApi: boolean;
-    requireReactApp: boolean;
-    requireAngularApp: boolean;
-    forbidReactArtifacts: boolean;
-    forbidAngularArtifacts: boolean;
-    requireFrontendApiCall: boolean;
-    requireSwagger: boolean;
-    requiredChecks: ProjectCheck[];
-};
+type ProjectCheck = import("./projectTypes").ProjectCheck;
+type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
 const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, verificationRequirementWithHistory, commandSatisfiesVerification, workflowInstructions } = require("./workflowRouter") as {
     classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: WorkflowKind; reason: string };
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
@@ -136,25 +142,33 @@ const { classifyWorkflowWithHistory, requiresWorkspaceWriteWithHistory, verifica
 };
 const {
     answerDefersRequiredWork,
+    discoverProjectChecks,
     evaluateProjectCompletion,
     formatIncompleteTaskAnswer,
     formatProjectCompletionPrompt,
+    formatProjectChecksPrompt,
     inferProjectCompletionRequirementWithHistory,
     projectChecksAffectedByPath,
+    projectChecksAffectedByWorkdir,
     projectChecksForCommand,
+    requiredProjectChecks,
     protectedProjectDeletionReason
 } = require("./projectCompletion") as {
     answerDefersRequiredWork: (answer: string) => boolean;
+    discoverProjectChecks: (workspace: string) => ProjectCheck[];
     evaluateProjectCompletion: (workspace: string, requirement: ProjectCompletionRequirement) => string[];
     formatIncompleteTaskAnswer: (reasons: string[], writtenPaths: string[]) => string;
-    formatProjectCompletionPrompt: (requirement: ProjectCompletionRequirement) => string;
+    formatProjectCompletionPrompt: (requirement: ProjectCompletionRequirement, checks?: ProjectCheck[]) => string;
+    formatProjectChecksPrompt: (checks: ProjectCheck[]) => string;
     inferProjectCompletionRequirementWithHistory: (
         message: string,
         history: Array<{ role: "user" | "assistant"; content: string }>,
         continuation: boolean
     ) => ProjectCompletionRequirement | undefined;
-    projectChecksAffectedByPath: (filePath: string) => ProjectCheck[];
-    projectChecksForCommand: (command: string) => ProjectCheck[];
+    projectChecksAffectedByPath: (filePath: string, checks: ProjectCheck[]) => string[];
+    projectChecksAffectedByWorkdir: (workdir: string | undefined, checks: ProjectCheck[]) => string[];
+    projectChecksForCommand: (command: string, checks: ProjectCheck[], workdir?: string) => string[];
+    requiredProjectChecks: (requirement: ProjectCompletionRequirement, checks: ProjectCheck[]) => ProjectCheck[];
     protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
 const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
@@ -170,6 +184,8 @@ const { WriteValidator } = require("./writeValidator") as { WriteValidator: new 
 const { Spinner, formatCompletionLine } = require("./spinner") as { Spinner: new (message?: string) => {
     start: () => void;
     stop: () => number;
+    suspend: () => void;
+    resume: () => void;
     update: (message: string) => void;
     log: (message: string) => void;
 }; formatCompletionLine: (milliseconds: number, completed?: boolean) => string };
@@ -351,6 +367,7 @@ const slashCommands = slashCommandOptions.map((item) => item.command);
 let slashMenuVisible = false;
 let slashKeypressListenerAttached = false;
 let renderedSlashSuggestionCount = 0;
+let clarificationPromptActive = false;
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -672,7 +689,7 @@ function renderSlashSuggestions(line: string): void {
 }
 
 function updateSlashSuggestions(): void {
-    if (!process.stdout.isTTY) {
+    if (!process.stdout.isTTY || clarificationPromptActive) {
         return;
     }
 
@@ -760,8 +777,77 @@ function changeWorkspace(workspace: string): string {
     return activeWorkspace;
 }
 
-function promptText(question: string): Promise<string> {
-    return new Promise((resolve) => rl.question(question, (answer) => resolve(answer.trim())));
+function promptText(question: string, signal?: AbortSignal): Promise<string> {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback: () => void): void => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener("abort", onAbort);
+            callback();
+        };
+        const onAbort = (): void => finish(() => reject(signal?.reason ?? new Error("Request cancelled.")));
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+        if (signal) {
+            rl.question(question, { signal }, (answer) => finish(() => resolve(answer.trim())));
+        } else {
+            rl.question(question, (answer) => finish(() => resolve(answer.trim())));
+        }
+    });
+}
+
+async function promptForClarification(request: ClarificationRequest, signal: AbortSignal): Promise<ClarificationAnswer> {
+    clarificationPromptActive = true;
+    try {
+        console.log(formatClarificationRequest(request));
+        while (true) {
+            const input = await promptText("Your choice: ", signal);
+            const answer = resolveClarificationAnswer(request, input);
+            if (answer) return answer;
+            console.log(`Please choose 1-${request.options.length}, enter an option id, or type a custom answer.`);
+        }
+    } finally {
+        clarificationPromptActive = false;
+    }
+}
+
+type RequestBudgetControl = { pause: () => void; resume: () => void; clear: () => void };
+
+function createRequestBudget(controller: AbortController, durationMs: number): RequestBudgetControl {
+    let remainingMs = durationMs;
+    let armedAt = 0;
+    let timer: NodeJS.Timeout | undefined;
+    const arm = (): void => {
+        if (timer || controller.signal.aborted) return;
+        if (remainingMs <= 0) {
+            controller.abort(new Error(`Request wall-clock budget reached (${Math.round(durationMs / 60000)} minutes).`));
+            return;
+        }
+        armedAt = Date.now();
+        timer = setTimeout(() => {
+            timer = undefined;
+            remainingMs = 0;
+            controller.abort(new Error(`Request wall-clock budget reached (${Math.round(durationMs / 60000)} minutes).`));
+        }, remainingMs);
+    };
+    arm();
+    return {
+        pause: () => {
+            if (!timer) return;
+            clearTimeout(timer);
+            timer = undefined;
+            remainingMs = Math.max(0, remainingMs - (Date.now() - armedAt));
+        },
+        resume: arm,
+        clear: () => {
+            if (timer) clearTimeout(timer);
+            timer = undefined;
+        }
+    };
 }
 
 async function restoreSessionWorkspace(activeSession: ChatSession): Promise<void> {
@@ -1077,21 +1163,29 @@ async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
     historyForTask: Array<{ role: "user" | "assistant"; content: string }>,
-    spinner: { update: (message: string) => void; log: (message: string) => void },
+    spinner: {
+        update: (message: string) => void;
+        log: (message: string) => void;
+        suspend: () => void;
+        resume: () => void;
+    },
     sessionId: string,
-    signal: AbortSignal
-): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace> }> {
+    signal: AbortSignal,
+    requestBudget: RequestBudgetControl
+): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace>; clarifications: string[] }> {
     const guard = new AgentGuard(agentGuardSettings);
     const maxTurnsPerSegment = guard.settings.maxTurns;
     const maxSegments = agentGuardSettings.maxSegments;
     const maxTurns = maxTurnsPerSegment * maxSegments;
     const continuation = isContinuationRequest(userMessage);
-    const workflow = classifyWorkflowWithHistory(userMessage, historyForTask, continuation);
-    const mustWrite = requiresWorkspaceWriteWithHistory(userMessage, historyForTask, continuation);
-    const verificationRequirement = verificationRequirementWithHistory(userMessage, historyForTask, continuation);
-    const projectRequirement = inferProjectCompletionRequirementWithHistory(userMessage, historyForTask, continuation);
-    const agentResponseFormat = getAgentResponseFormat(workflow.kind);
-    const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage, mustWrite);
+    let effectiveUserMessage = userMessage;
+    let workflow = classifyWorkflowWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let mustWrite = requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let verificationRequirement = verificationRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let projectRequirement = inferProjectCompletionRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let projectChecks = discoverProjectChecks(activeWorkspace);
+    let agentResponseFormat = getAgentResponseFormat(workflow.kind);
+    let initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
     const contextSummary = summarizeTaskContext(relevantHistory);
     const writeValidator = new WriteValidator(activeWorkspace);
@@ -1105,7 +1199,10 @@ async function runAgentLoop(
     let unresolvedMissingCommandTarget = false;
     let lastFailedCommand: string | undefined;
     let verificationSatisfied = verificationRequirement === "none";
-    const successfulProjectChecks = new Set<ProjectCheck>();
+    const successfulProjectChecks = new Set<string>();
+    const pendingProjectChecks = new Set<string>();
+    const clarificationTranscript: string[] = [];
+    const answeredClarifications = new Map<string, Record<string, unknown>>();
     const writtenPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
@@ -1118,15 +1215,17 @@ async function runAgentLoop(
     const trace = new AgentTrace(traceTarget, taskId);
     const responseLog = new AgentResponseLog(responseTarget, taskId);
     const responseLogDisplayPath = path.relative(appRoot, resolveJsonlLogPath(responseTarget));
-    const systemPrompt = await agentTool.buildSystemPrompt([
+    const buildCurrentSystemPrompt = (): Promise<string> => agentTool.buildSystemPrompt([
         workflowInstructions(workflow.kind),
         `Router decision: ${workflow.reason}`,
         verificationRequirement === "none"
             ? "No explicit command-level acceptance check was inferred."
             : `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`,
-        projectRequirement ? formatProjectCompletionPrompt(projectRequirement) : "",
+        formatProjectChecksPrompt(projectChecks),
+        projectRequirement ? formatProjectCompletionPrompt(projectRequirement, projectChecks) : "",
         skillPrompt
     ].filter(Boolean).join("\n\n"));
+    let systemPrompt = await buildCurrentSystemPrompt();
     let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
     let recoveryResponseFormat: Record<string, unknown> | undefined;
     const recoveryFormat = (extra: string | string[] = []) => getAgentRecoveryResponseFormat(
@@ -1167,7 +1266,7 @@ async function runAgentLoop(
             const answer = `Agent stopped safely because its ${budgetError}. Review the trace or continue with a narrower request.`;
             trace.add({ turn, status: "error", action: "budget_stop", observation: answer });
             trace.save();
-            return { answer, trace };
+            return { answer, trace, clarifications: clarificationTranscript };
         }
         const requestFormat = recoveryResponseFormat
             ?? (mcpCallsDisabled
@@ -1204,6 +1303,8 @@ async function runAgentLoop(
             new_text?: string;
             command?: string;
             workdir?: string;
+            question?: string;
+            options?: Array<{ id: string; label: string; description?: string }>;
             server?: string;
             arguments?: Record<string, unknown>;
         } | undefined;
@@ -1253,6 +1354,92 @@ async function runAgentLoop(
 
         // The loop ends only when the model explicitly returns final. Until
         // then each action becomes an observation for the next reasoning step.
+        if (action.action === "ask_user") {
+            const request: ClarificationRequest = {
+                question: action.question ?? "",
+                options: action.options ?? [],
+                ...(action.reason ? { reason: action.reason } : {})
+            };
+            const clarificationKey = JSON.stringify([
+                request.question.trim().toLowerCase(),
+                request.options.map((option) => option.id.trim().toLowerCase())
+            ]);
+            const previousObservation = answeredClarifications.get(clarificationKey);
+            if (previousObservation) {
+                trace.add({
+                    turn,
+                    status: "error",
+                    action: "ask_user_repeated",
+                    reason: action.reason,
+                    observation: JSON.stringify(previousObservation)
+                });
+                trace.save();
+                messages.push({
+                    role: "user",
+                    content: `This clarification was already answered: ${JSON.stringify(previousObservation)}\nUse the existing answer and continue; do not ask it again.`
+                });
+                continue;
+            }
+            spinner.suspend();
+            requestBudget.pause();
+            guard.pause();
+            let answer: ClarificationAnswer;
+            try {
+                answer = await promptForClarification(request, signal);
+            } finally {
+                guard.resume();
+                requestBudget.resume();
+                spinner.resume();
+            }
+            const observation = clarificationObservation(request, answer);
+            clarificationTranscript.push(clarificationTranscriptLine(request, answer));
+            trace.add({
+                turn,
+                status: answer.kind === "cancel" ? "error" : "action",
+                action: "ask_user",
+                reason: action.reason,
+                observation: JSON.stringify(observation)
+            });
+            trace.save();
+            if (answer.kind === "cancel") {
+                const completedWrites = writtenPaths.size > 0
+                    ? ` การเปลี่ยนแปลงที่ทำสำเร็จก่อนยกเลิกยังอยู่ใน workspace: ${Array.from(writtenPaths).join(", ")}`
+                    : "";
+                return {
+                    answer: `ยกเลิกงานตามคำขอแล้ว${completedWrites}`,
+                    trace,
+                    clarifications: clarificationTranscript
+                };
+            }
+            answeredClarifications.set(clarificationKey, observation);
+            const previousWorkflowKind = workflow.kind;
+            const previousVerificationRequirement = verificationRequirement;
+            effectiveUserMessage = `${userMessage}\n\nUser clarifications:\n${clarificationTranscript.map((line) => `- ${line}`).join("\n")}`;
+            workflow = classifyWorkflowWithHistory(effectiveUserMessage, historyForTask, continuation);
+            mustWrite = requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
+            verificationRequirement = verificationRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+            projectRequirement = inferProjectCompletionRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+            agentResponseFormat = getAgentResponseFormat(workflow.kind);
+            initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
+            if (verificationRequirement !== previousVerificationRequirement) {
+                verificationSatisfied = verificationRequirement === "none";
+            }
+            systemPrompt = await buildCurrentSystemPrompt();
+            const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
+            if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
+            guard.resetActionHistory();
+            segmentEvents.push(`Turn ${segmentTurn}: user clarification answered`);
+            if (workflow.kind !== previousWorkflowKind) {
+                segmentEvents.push(`Workflow reclassified: ${previousWorkflowKind} -> ${workflow.kind}`);
+                spinner.log(`Workflow reclassified after clarification: ${previousWorkflowKind} -> ${workflow.kind}`);
+            }
+            messages.push({
+                role: "user",
+                content: `User clarification observation: ${JSON.stringify(observation)}\nContinue the same task using this answer. Do not ask the same question again.`
+            });
+            continue;
+        }
+
         if (action.action === "final") {
             const rejectFinal = (summary: string, feedback: string): void => {
                 recoveryResponseFormat = recoveryFormat("final");
@@ -1268,6 +1455,14 @@ async function runAgentLoop(
                 segmentEvents.push(`final_blocked [error]: ${summary}`);
                 messages.push({ role: "user", content: feedback });
             };
+            const proposedAnswer = action.answer?.trim() || "Done.";
+            if (answerLooksLikeBlockingClarification(proposedAnswer)) {
+                rejectFinal(
+                    "blocking clarification must use the interactive choice action",
+                    "Do not return a blocking question as final. Use ask_user with 2-6 concrete choices grounded in the context you already inspected; the CLI automatically accepts a free-text answer outside those choices."
+                );
+                continue;
+            }
             if (mustWrite && writtenPaths.size === 0) {
                 rejectFinal(
                     "this request requires a successful file write",
@@ -1283,6 +1478,7 @@ async function runAgentLoop(
                 );
                 continue;
             }
+            projectChecks = discoverProjectChecks(activeWorkspace);
             if (projectRequirement) {
                 const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
                 if (missingArtifacts.length > 0) {
@@ -1293,14 +1489,27 @@ async function runAgentLoop(
                     );
                     continue;
                 }
-                const missingChecks = projectRequirement.requiredChecks.filter((check) => !successfulProjectChecks.has(check));
+                const missingChecks = requiredProjectChecks(projectRequirement, projectChecks)
+                    .filter((check) => !successfulProjectChecks.has(check.id));
                 if (missingChecks.length > 0) {
+                    const descriptions = missingChecks.map((check) => `${check.command} (workdir ${check.workdir})`);
                     rejectFinal(
-                        `required project checks have not succeeded: ${missingChecks.join(", ")}`,
-                        `You cannot return final yet. Run successful verification for: ${missingChecks.join(", ")}. Use run_command.workdir for the directory containing each project manifest.`
+                        `required project checks have not succeeded: ${descriptions.join(", ")}`,
+                        `You cannot return final yet. Run successful verification for: ${descriptions.join(", ")}. Use run_command.workdir exactly as discovered from each project manifest.`
                     );
                     continue;
                 }
+            }
+            const pendingChecks = projectChecks.filter((check) => (
+                pendingProjectChecks.has(check.id) && !successfulProjectChecks.has(check.id)
+            ));
+            if (pendingChecks.length > 0) {
+                const descriptions = pendingChecks.map((check) => `${check.command} (workdir ${check.workdir})`);
+                rejectFinal(
+                    `checks affected by the latest changes have not succeeded: ${descriptions.join(", ")}`,
+                    `You cannot return final yet. The latest file changes invalidated these manifest-discovered checks: ${descriptions.join(", ")}. Run each command in its discovered workdir; do not substitute an unrelated verification command.`
+                );
+                continue;
             }
             if (unresolvedVerificationFailure) {
                 recoveryResponseFormat = recoveryFormat(["run_command", "final"]);
@@ -1310,7 +1519,6 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            const proposedAnswer = action.answer?.trim() || "Done.";
             if (projectRequirement && answerDefersRequiredWork(proposedAnswer)) {
                 rejectFinal(
                     "the answer describes a starter scaffold or defers required work",
@@ -1350,7 +1558,7 @@ async function runAgentLoop(
                 : `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
             trace.add({ turn, status: "final", action: "final", reason: action.reason });
             trace.save();
-            return { answer: finalAnswer, trace };
+            return { answer: finalAnswer, trace, clarifications: clarificationTranscript };
         }
 
         if (action.action === "run_command" && action.command && lastFailedCommand
@@ -1508,7 +1716,14 @@ async function runAgentLoop(
             writtenPaths.add(commandCreatesWorkspaceFiles(action.command ?? "")
                 ? "[project scaffold generated by command]"
                 : "[dependency metadata updated by command]");
-            successfulProjectChecks.delete("node");
+            projectChecks = discoverProjectChecks(activeWorkspace);
+            const effectiveWorkdir = action.workdir
+                ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
+            projectChecksAffectedByWorkdir(effectiveWorkdir, projectChecks).forEach((checkId) => {
+                successfulProjectChecks.delete(checkId);
+                pendingProjectChecks.add(checkId);
+            });
+            result.output += `\n${formatProjectChecksPrompt(projectChecks)}`;
             if (verificationRequirement !== "none") verificationSatisfied = false;
         }
         if ((action.action === "write_file" || action.action === "edit_file") && result.ok && action.path) {
@@ -1551,7 +1766,12 @@ async function runAgentLoop(
             if (!rollback?.ok) {
                 guard.resetActionHistory();
                 writtenPaths.add(action.path);
-                projectChecksAffectedByPath(action.path).forEach((check) => successfulProjectChecks.delete(check));
+                projectChecks = discoverProjectChecks(activeWorkspace);
+                projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId) => {
+                    successfulProjectChecks.delete(checkId);
+                    pendingProjectChecks.add(checkId);
+                });
+                result.output += `\n${formatProjectChecksPrompt(projectChecks)}`;
                 if (verificationRequirement !== "none") verificationSatisfied = false;
                 if (workflow.kind === "mcp_creation") {
                     successfulMcpDiscovery = false;
@@ -1581,7 +1801,12 @@ async function runAgentLoop(
                 guard.resetActionHistory();
                 validationFailures.delete(action.path);
                 writtenPaths.add(action.path);
-                projectChecksAffectedByPath(action.path).forEach((check) => successfulProjectChecks.delete(check));
+                projectChecks = discoverProjectChecks(activeWorkspace);
+                projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId) => {
+                    successfulProjectChecks.delete(checkId);
+                    pendingProjectChecks.add(checkId);
+                });
+                result.output += `\n${formatProjectChecksPrompt(projectChecks)}`;
                 if (verificationRequirement !== "none") verificationSatisfied = false;
                 if (workflow.kind === "mcp_creation") {
                     successfulMcpDiscovery = false;
@@ -1601,8 +1826,11 @@ async function runAgentLoop(
             if (verificationRequirement !== "none") verificationSatisfied = false;
         } else if (action.action === "run_command" && result.ok) {
             lastFailedCommand = undefined;
-            const completedProjectChecks = projectChecksForCommand(action.command ?? "");
-            completedProjectChecks.forEach((check) => successfulProjectChecks.add(check));
+            projectChecks = discoverProjectChecks(activeWorkspace);
+            const effectiveWorkdir = action.workdir
+                ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
+            const completedProjectChecks = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir);
+            completedProjectChecks.forEach((checkId) => successfulProjectChecks.add(checkId));
             const satisfiesRequiredCheck = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
             if (completedProjectChecks.length > 0) {
                 unresolvedVerificationFailure = undefined;
@@ -1642,11 +1870,21 @@ async function runAgentLoop(
     if (mustWrite && writtenPaths.size === 0) toolLimitBlockers.push("no successful workspace change was recorded");
     if (validationFailures.size > 0) toolLimitBlockers.push(`validation failing for ${Array.from(validationFailures).join(", ")}`);
     if (unresolvedVerificationFailure) toolLimitBlockers.push(`latest verification failed: ${unresolvedVerificationFailure}`);
+    projectChecks = discoverProjectChecks(activeWorkspace);
     if (projectRequirement) {
         const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
         if (missingArtifacts.length > 0) toolLimitBlockers.push(`missing project artifacts: ${missingArtifacts.join(", ")}`);
-        const missingChecks = projectRequirement.requiredChecks.filter((check) => !successfulProjectChecks.has(check));
-        if (missingChecks.length > 0) toolLimitBlockers.push(`project checks not passed: ${missingChecks.join(", ")}`);
+        const missingChecks = requiredProjectChecks(projectRequirement, projectChecks)
+            .filter((check) => !successfulProjectChecks.has(check.id));
+        if (missingChecks.length > 0) {
+            toolLimitBlockers.push(`project checks not passed: ${missingChecks.map((check) => `${check.command} in ${check.workdir}`).join(", ")}`);
+        }
+    }
+    const pendingChecks = projectChecks.filter((check) => (
+        pendingProjectChecks.has(check.id) && !successfulProjectChecks.has(check.id)
+    ));
+    if (pendingChecks.length > 0) {
+        toolLimitBlockers.push(`checks invalidated by file changes: ${pendingChecks.map((check) => `${check.command} in ${check.workdir}`).join(", ")}`);
     }
     if (!verificationSatisfied) toolLimitBlockers.push(`${verificationRequirement} verification not satisfied`);
     if (workflow.kind === "web_research" && !mcpCallsDisabled && sourceUrls.size < 2) {
@@ -1665,7 +1903,7 @@ async function runAgentLoop(
             observation: toolLimitBlockers.join("; ")
         });
         trace.save();
-        return { answer, trace };
+        return { answer, trace, clarifications: clarificationTranscript };
     }
 
     spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached after all completion gates passed; preparing a final summary`);
@@ -1720,7 +1958,7 @@ Do not call another tool. Do not claim unverified success.`
                 reason: finalAction.reason
             });
             trace.save();
-            return { answer: finalAnswer, trace };
+            return { answer: finalAnswer, trace, clarifications: clarificationTranscript };
         }
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1735,7 +1973,7 @@ Do not call another tool. Do not claim unverified success.`
     const answer = "Agent completed the maximum number of tool actions but could not produce a final summary. Review the trace and ask it to inspect the existing files before continuing.";
     trace.add({ turn: maxTurns + 1, status: "error", action: "final_summary_failed", observation: answer });
     trace.save();
-    return { answer, trace };
+    return { answer, trace, clarifications: clarificationTranscript };
 }
 
 function ask(activeSession: ChatSession, runMode: RunMode): void {
@@ -1933,9 +2171,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
         }
 
         const requestController = new AbortController();
-        const requestBudgetTimer = setTimeout(() => {
-            requestController.abort(new Error(`Request wall-clock budget reached (${Math.round(agentGuardSettings.maxDurationMs / 60000)} minutes).`));
-        }, agentGuardSettings.maxDurationMs);
+        const requestBudget = createRequestBudget(requestController, agentGuardSettings.maxDurationMs);
         activeRequestController = requestController;
         activeRequestSpinner = spinner;
         try {
@@ -1961,7 +2197,15 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             ];
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const result = await runAgentLoop(trimmed, historyForModel, historyForTask, spinner, activeSession.id, requestController.signal);
+                const result = await runAgentLoop(
+                    trimmed,
+                    historyForModel,
+                    historyForTask,
+                    spinner,
+                    activeSession.id,
+                    requestController.signal,
+                    requestBudget
+                );
                 const elapsedMs = spinner.stop();
                 if (debugEnabled) {
                     result.trace.print();
@@ -1971,7 +2215,10 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
                 printSessionUsage(activeSession.id);
                 console.log();
 
-                sessionTool.appendExchange(activeSession.id, trimmed, result.answer);
+                const recordedRequest = result.clarifications.length > 0
+                    ? `${trimmed}\n\nClarifications provided during this task:\n${result.clarifications.map((line) => `- ${line}`).join("\n")}`
+                    : trimmed;
+                sessionTool.appendExchange(activeSession.id, recordedRequest, result.answer);
                 ask(activeSession, runMode);
                 return;
             }
@@ -2223,7 +2470,7 @@ Do not mention hidden context, internal tools, or system prompts.`;
             else console.error(`API Error: ${llamaClient.formatError(error)}`);
             console.log(formatCompletionLine(elapsedMs, false));
         } finally {
-            clearTimeout(requestBudgetTimer);
+            requestBudget.clear();
             if (activeRequestController === requestController) activeRequestController = undefined;
             if (activeRequestSpinner === spinner) activeRequestSpinner = undefined;
         }

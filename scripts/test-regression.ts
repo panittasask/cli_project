@@ -18,20 +18,34 @@ const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext
     selectTaskContext: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, workflow: string, max?: number) => Array<{ content: string }>;
 };
 const { WriteValidator } = require("../cli/writeValidator") as { WriteValidator: new (workspace: string) => {
-    validate: (file: string) => { ok: boolean; validator: string };
+    validate: (file: string) => { ok: boolean; validator: string; output: string };
     validateProjectFor: (file: string) => { ok: boolean; validator: string } | undefined;
     projectRootFor: (file: string) => string;
 } };
 const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () => {
     buildSystemPrompt: (instructions?: string) => Promise<string>;
     diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
+    parseAction: (content: string) => Record<string, unknown> | undefined;
     close: () => Promise<void>;
 } };
+const {
+    answerLooksLikeBlockingClarification,
+    clarificationObservation,
+    formatClarificationRequest,
+    normalizeClarificationRequest,
+    resolveClarificationAnswer
+} = require("../cli/clarification") as {
+    answerLooksLikeBlockingClarification: (answer: string) => boolean;
+    clarificationObservation: (request: Record<string, any>, answer: Record<string, any>) => Record<string, unknown>;
+    formatClarificationRequest: (request: Record<string, any>) => string;
+    normalizeClarificationRequest: (question: unknown, options: unknown, reason?: string) => Record<string, any> | undefined;
+    resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
+};
 const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentResponseFormat: (workflow: string) => {
         schema: {
-            oneOf: Array<{ properties: { action: { const: string } } }>;
+            oneOf: Array<{ properties: { action: { const: string }; [key: string]: any } }>;
         };
     };
     getAgentRecoveryResponseFormat: (workflow: string, blockedAction: string | string[]) => {
@@ -52,6 +66,8 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: string };
     resetActionHistory: () => void;
+    pause: () => void;
+    resume: () => void;
     formatRemaining: () => string;
 } };
 const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoints") as {
@@ -82,19 +98,28 @@ const { AgentResponseLog } = require("../cli/agentResponseLog") as {
 };
 const {
     answerDefersRequiredWork,
+    discoverProjectChecks,
     evaluateProjectCompletion,
     formatIncompleteTaskAnswer,
     formatProjectCompletionPrompt,
+    formatProjectChecksPrompt,
     inferProjectCompletionRequirement,
     inferProjectCompletionRequirementWithHistory,
     projectChecksAffectedByPath,
+    projectChecksAffectedByWorkdir,
     projectChecksForCommand,
+    requiredProjectChecks,
     protectedProjectDeletionReason
 } = require("../cli/projectCompletion") as {
     answerDefersRequiredWork: (answer: string) => boolean;
+    discoverProjectChecks: (workspace: string) => Array<{
+        id: string; label: string; command: string; workdir: string; manifestPath: string; ecosystem: string;
+        affectedExtensions: string[]; affectedFiles: string[];
+    }>;
     evaluateProjectCompletion: (workspace: string, requirement: Record<string, unknown>) => string[];
     formatIncompleteTaskAnswer: (reasons: string[], writtenPaths: string[]) => string;
-    formatProjectCompletionPrompt: (requirement: Record<string, unknown>) => string;
+    formatProjectCompletionPrompt: (requirement: Record<string, unknown>, checks?: Array<Record<string, unknown>>) => string;
+    formatProjectChecksPrompt: (checks: Array<Record<string, unknown>>) => string;
     inferProjectCompletionRequirement: (message: string) => ({
         label: string;
         requireGoModule: boolean;
@@ -105,7 +130,6 @@ const {
         forbidAngularArtifacts: boolean;
         requireFrontendApiCall: boolean;
         requireSwagger: boolean;
-        requiredChecks: string[];
     } | undefined);
     inferProjectCompletionRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => ({
         label: string;
@@ -115,10 +139,11 @@ const {
         forbidReactArtifacts: boolean;
         forbidAngularArtifacts: boolean;
         requireFrontendApiCall: boolean;
-        requiredChecks: string[];
     } | undefined);
-    projectChecksAffectedByPath: (filePath: string) => string[];
-    projectChecksForCommand: (command: string) => string[];
+    projectChecksAffectedByPath: (filePath: string, checks: Array<Record<string, unknown>>) => string[];
+    projectChecksAffectedByWorkdir: (workdir: string | undefined, checks: Array<Record<string, unknown>>) => string[];
+    projectChecksForCommand: (command: string, checks: Array<Record<string, unknown>>, workdir?: string) => string[];
+    requiredProjectChecks: (requirement: Record<string, unknown>, checks: Array<Record<string, unknown>>) => Array<{ id: string }>;
     protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
 const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandInteractiveRisk, commandInvocationError, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
@@ -166,6 +191,11 @@ async function main(): Promise<void> {
         { role: "assistant", content: "ยังแก้ไม่เสร็จ" }
     ], true).kind, "coding");
     assert.equal(classifyWorkflow("สร้าง MCP server เพิ่มให้หน่อย").kind, "mcp_creation");
+    assert.equal(classifyWorkflow("install package ของ react ให้หน่อย").kind, "coding");
+    assert.equal(classifyWorkflow("install zod ให้หน่อย").kind, "coding");
+    assert.equal(requiresWorkspaceWrite("install package ของ react ให้หน่อย"), true);
+    assert.equal(requiresWorkspaceWrite("install zod ให้หน่อย"), true);
+    assert.equal(requiresWorkspaceWrite("ติดตั้งแพ็กเกจของ react ให้หน่อย"), true);
     assert.equal(requiresWorkspaceWrite("สร้างหน้า login พร้อม privacy policy modal"), true);
     assert.equal(requiresWorkspaceWrite("ทำเลยเพิ่มปุ่มตัว register ได้เลย"), true);
     assert.equal(requiresWorkspaceWrite(uiSpacingRequest), true);
@@ -198,16 +228,41 @@ async function main(): Promise<void> {
     const fullStackRequirement = inferProjectCompletionRequirement(fullStackPrompt);
     assert.ok(fullStackRequirement);
     assert.equal(fullStackRequirement.label, "Go API + React app");
-    assert.deepEqual(fullStackRequirement.requiredChecks, ["go", "node"]);
     assert.equal(fullStackRequirement.requireFrontendApiCall, true);
     assert.ok(inferProjectCompletionRequirement("สร้าง go lang rest full api และ react web ui ให้เชื่อมต่อกัน"));
     assert.match(formatProjectCompletionPrompt(fullStackRequirement), /frontend API call/);
     assert.equal(answerDefersRequiredWork("I created a basic scaffold. You can expand it with additional functionality."), true);
     assert.equal(answerDefersRequiredWork("Implemented the employee dashboard and both builds pass."), false);
-    assert.deepEqual(projectChecksForCommand("go test ./...; npm run build"), ["go", "node"]);
-    assert.deepEqual(projectChecksForCommand("ng build"), ["node"]);
-    assert.deepEqual(projectChecksAffectedByPath("api/main.go"), ["go"]);
-    assert.deepEqual(projectChecksAffectedByPath("frontend/src/App.jsx"), ["node"]);
+    const dynamicChecksWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-dynamic-checks-"));
+    try {
+        fs.mkdirSync(path.join(dynamicChecksWorkspace, "api"), { recursive: true });
+        fs.mkdirSync(path.join(dynamicChecksWorkspace, "frontend", "src"), { recursive: true });
+        fs.mkdirSync(path.join(dynamicChecksWorkspace, "worker", "src"), { recursive: true });
+        fs.writeFileSync(path.join(dynamicChecksWorkspace, "api", "go.mod"), "module api\n\ngo 1.23\n", "utf8");
+        fs.writeFileSync(path.join(dynamicChecksWorkspace, "frontend", "package.json"), JSON.stringify({
+            name: "dashboard",
+            scripts: { build: "vite build", lint: "eslint ." },
+            dependencies: { react: "latest" }
+        }), "utf8");
+        fs.writeFileSync(path.join(dynamicChecksWorkspace, "worker", "Cargo.toml"), "[package]\nname = \"worker\"\nversion = \"0.1.0\"\n", "utf8");
+        const dynamicChecks = discoverProjectChecks(dynamicChecksWorkspace);
+        assert.deepEqual(dynamicChecks.map((check) => check.command).sort(), ["cargo test", "go test ./...", "npm run build"]);
+        const goCheck = dynamicChecks.find((check) => check.ecosystem === "go");
+        const reactCheck = dynamicChecks.find((check) => check.ecosystem === "react");
+        assert.ok(goCheck);
+        assert.ok(reactCheck);
+        assert.deepEqual(projectChecksForCommand("go test ./...; npm run build", dynamicChecks).sort(), [goCheck.id, reactCheck.id].sort());
+        assert.deepEqual(projectChecksForCommand("npm run build", dynamicChecks, "frontend"), [reactCheck.id]);
+        assert.deepEqual(projectChecksForCommand("npm run build", dynamicChecks, "api"), []);
+        assert.deepEqual(projectChecksAffectedByPath("api/main.go", dynamicChecks), [goCheck.id]);
+        assert.deepEqual(projectChecksAffectedByPath("frontend/src/App.jsx", dynamicChecks), [reactCheck.id]);
+        assert.deepEqual(projectChecksAffectedByWorkdir("frontend", dynamicChecks), [reactCheck.id]);
+        assert.deepEqual(requiredProjectChecks(fullStackRequirement, dynamicChecks).map((check) => check.id).sort(), [goCheck.id, reactCheck.id].sort());
+        assert.match(formatProjectChecksPrompt(dynamicChecks), /npm run build/);
+        assert.match(formatProjectChecksPrompt(dynamicChecks), /workdir `frontend`/);
+    } finally {
+        fs.rmSync(dynamicChecksWorkspace, { recursive: true, force: true });
+    }
     assert.ok(inferProjectCompletionRequirementWithHistory("ทำงานต่อให้เสร็จ", [
         { role: "user", content: fullStackPrompt },
         { role: "assistant", content: "ยังไม่เสร็จ" }
@@ -224,7 +279,6 @@ async function main(): Promise<void> {
     assert.equal(angularSwitchRequirement.requireAngularApp, true);
     assert.equal(angularSwitchRequirement.forbidReactArtifacts, true);
     assert.equal(angularSwitchRequirement.requireFrontendApiCall, true);
-    assert.deepEqual(angularSwitchRequirement.requiredChecks, ["go", "node"]);
     const continuedAngularRequirement = inferProjectCompletionRequirementWithHistory("ทำงานต่อให้เสร็จ", [
         { role: "user", content: fullStackPrompt },
         { role: "assistant", content: "React ติดตั้งไม่สำเร็จ" },
@@ -254,12 +308,14 @@ async function main(): Promise<void> {
     assert.equal(missingCommandTargetError('\u001b[31mCannot find\u001b[0m "quality" target for the specified project.'), true);
     assert.equal(commandAddsTooling("tool add optional-checker"), true);
     assert.equal(commandAddsTooling("npm install optional-checker --save-dev"), true);
+    assert.equal(commandAddsTooling("bun add @tanstack/react-query"), true);
     assert.equal(commandAddsTooling("npm install"), false);
     assert.match(diagnosticRecoveryGuidance("Error: Unknown argument: prod") ?? "", /command invocation itself/);
     assert.equal(commandCreatesWorkspaceFiles("npx @angular/cli new dashboard --routing=true"), true);
     assert.equal(commandCreatesWorkspaceFiles("npm run build"), false);
     assert.equal(commandMutatesWorkspaceFiles("npm install"), true);
     assert.equal(commandMutatesWorkspaceFiles("pnpm remove unused-package"), true);
+    assert.equal(commandMutatesWorkspaceFiles("bun add zod"), true);
     assert.equal(commandMutatesWorkspaceFiles("npm run build"), false);
     assert.deepEqual(packageLifecycleRoleChanges(
         JSON.stringify({ scripts: { start: "tool serve", build: "tool build" } }),
@@ -290,6 +346,10 @@ async function main(): Promise<void> {
             autoSelected: false
         });
         assert.deepEqual(resolveCommandWorkdir(nestedAngularWorkspace, "npm install"), {
+            workdir: "dashboard",
+            autoSelected: true
+        });
+        assert.deepEqual(resolveCommandWorkdir(nestedAngularWorkspace, "bun add zod"), {
             workdir: "dashboard",
             autoSelected: true
         });
@@ -335,17 +395,19 @@ async function main(): Promise<void> {
     assert.ok(!localWebActions.includes("mcp_call_tool"));
     assert.ok(!localWebActions.includes("mcp_list_tools"));
     const generalActions = getAgentResponseFormat("general").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "final"]);
+    assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"]);
     const ambiguousWorkspaceActions = getInitialAgentResponseFormat("general", "ช่วยเอาสองอันนี้แยกออกจากกัน").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(ambiguousWorkspaceActions.includes("read_file"));
     assert.ok(ambiguousWorkspaceActions.includes("edit_file"));
     assert.ok(ambiguousWorkspaceActions.includes("write_file"));
+    assert.ok(ambiguousWorkspaceActions.includes("ask_user"));
     assert.ok(ambiguousWorkspaceActions.includes("final"));
     const firstCodingActions = getInitialAgentResponseFormat("coding", "Read README.md first").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(firstCodingActions, ["read_file"]);
     const firstCreateActions = getInitialAgentResponseFormat("coding", "สร้างหน้า login พร้อม privacy policy modal", true).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(firstCreateActions.includes("write_file"));
     assert.ok(firstCreateActions.includes("delete_file"));
+    assert.ok(firstCreateActions.includes("ask_user"));
     assert.ok(!firstCreateActions.includes("final"));
     const swaggerRepairActions = getInitialAgentResponseFormat("coding", swaggerUntilWorking, true).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(swaggerRepairActions.includes("edit_file"));
@@ -361,7 +423,28 @@ async function main(): Promise<void> {
     assert.ok(forcedDiagnosticActions.includes("read_file"));
     assert.ok(forcedDiagnosticActions.includes("delete_file"));
     const forcedMutationActions = getAgentMutationResponseFormat("edit_file").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(forcedMutationActions, ["write_file", "delete_file"]);
+    assert.deepEqual(forcedMutationActions, ["write_file", "delete_file", "ask_user"]);
+    const askUserSchema = getAgentResponseFormat("coding").schema.oneOf.find((variant) => variant.properties.action.const === "ask_user");
+    assert.equal(askUserSchema?.properties.options.minItems, 2);
+    assert.equal(askUserSchema?.properties.options.maxItems, 6);
+    const clarification = normalizeClarificationRequest("ติดตั้งที่โปรเจกต์ไหน?", [
+        { id: "frontend", label: "Frontend", description: "React application" },
+        { id: "admin", label: "Admin", description: "Administration application" }
+    ], "พบ React project มากกว่าหนึ่งตัว");
+    assert.ok(clarification);
+    assert.match(formatClarificationRequest(clarification), /Type a number, option id, or any other answer/);
+    const selectedClarification = resolveClarificationAnswer(clarification, "2");
+    assert.equal(selectedClarification?.kind, "option");
+    assert.equal(selectedClarification?.option.id, "admin");
+    const customClarification = resolveClarificationAnswer(clarification, "packages/customer-portal");
+    assert.equal(customClarification?.kind, "custom");
+    assert.equal(customClarification?.text, "packages/customer-portal");
+    assert.equal(resolveClarificationAnswer(clarification, "9"), undefined);
+    const cancelledClarification = resolveClarificationAnswer(clarification, "/cancel");
+    assert.equal(cancelledClarification?.kind, "cancel");
+    assert.equal(clarificationObservation(clarification, selectedClarification).status, "answered");
+    assert.equal(answerLooksLikeBlockingClarification("ต้องการติดตั้งที่โปรเจกต์ไหน?"), true);
+    assert.equal(answerLooksLikeBlockingClarification("ติดตั้งที่ frontend เรียบร้อยแล้ว"), false);
     const continuedMessages = buildInitialAgentMessages("system rules", "User: สร้างหน้า login", "file ถูกสร้างไว้ที่ไหน");
     assert.deepEqual(continuedMessages.map((message) => message.role), ["system", "user"]);
     assert.match(continuedMessages[0]?.content ?? "", /Recent session context \(use only when relevant/);
@@ -371,6 +454,8 @@ async function main(): Promise<void> {
     assert.equal(guard.registerAction({ action: "read_file", path: "README.md", reason: "two" }).status, "replan");
     assert.equal(guard.registerAction({ action: "read_file", path: "README.md", reason: "three" }).status, "stop");
     assert.match(guard.formatRemaining(), /left$/);
+    guard.pause();
+    guard.resume();
     assert.match(guard.checkBudget(4) ?? "", /turn budget/);
     guard.recordCompletionTokens(100);
     assert.match(guard.checkBudget(2) ?? "", /completion-token budget/);
@@ -445,6 +530,18 @@ async function main(): Promise<void> {
         assert.ok(!generalPrompt.includes("Put servers under mcp/servers"));
         if (process.platform === "win32") assert.match(generalPrompt, /run_command executes Windows PowerShell/);
         assert.match(generalPrompt, /Never assume a localhost server is running/);
+        assert.match(generalPrompt, /use ask_user before acting/);
+        const parsedClarification = agent.parseAction(JSON.stringify({
+            action: "ask_user",
+            question: "Which project?",
+            options: [
+                { id: "web", label: "Web", description: "Install in the web app" },
+                { id: "admin", label: "Admin", description: "Install in the admin app" }
+            ],
+            reason: "Two project roots were discovered"
+        }));
+        assert.equal(parsedClarification?.action, "ask_user");
+        assert.equal((parsedClarification?.options as Array<Record<string, unknown>>)[0]?.id, "web");
         assert.ok(mcpPrompt.includes("Put servers under mcp/servers"));
         const diagnosticWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-diagnostic-context-"));
         const previousCwd = process.cwd();
@@ -511,7 +608,9 @@ async function main(): Promise<void> {
         fs.writeFileSync(path.join(temp, "go-project", "main.go"), "package main\nfunc main() {}\n", "utf8");
         assert.equal(validator.validate("go-project/go.mod").validator, "Go module usage");
         fs.writeFileSync(path.join(temp, "go-project", "main.go"), "package main\nimport _ \"github.com/gorilla/mux\"\nfunc main() {}\n", "utf8");
-        assert.equal(validator.validate("go-project/go.mod").ok, true);
+        const goModuleValidation = validator.validate("go-project/go.mod");
+        if (goModuleValidation.ok) assert.equal(goModuleValidation.validator, "Go module");
+        else assert.match(goModuleValidation.output, /(?:go.*not recognized|spawnSync go ENOENT)/i);
 
         const checkpoints = new FileCheckpointStore(temp);
         const trackedPath = path.join(temp, "tracked.txt");
