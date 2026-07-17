@@ -91,12 +91,14 @@ function getAgentResponseFormat(workflow: WorkflowKind): Record<string, unknown>
 
 function getAgentRecoveryResponseFormat(workflow: WorkflowKind, blockedAction: string | string[]): Record<string, unknown> {
     const blocked = new Set(Array.isArray(blockedAction) ? blockedAction : [blockedAction]);
-    const actions = workflowActions[workflow].filter((action) => !blocked.has(action));
+    // Recovery is for autonomous diagnosis/correction. Asking the user how to
+    // handle a tool error commonly creates a question -> rejected retry loop.
+    const actions = workflowActions[workflow].filter((action) => action !== "ask_user" && !blocked.has(action));
     return formatForActions(actions.length > 0 ? actions : ["final"]);
 }
 
 function getAgentMutationResponseFormat(blockedAction?: string): Record<string, unknown> {
-    const actions = ["edit_file", "write_file", "delete_file", "ask_user"].filter((action) => action !== blockedAction);
+    const actions = ["edit_file", "write_file", "delete_file"].filter((action) => action !== blockedAction);
     return formatForActions(actions.length > 0 ? actions : ["write_file"]);
 }
 
