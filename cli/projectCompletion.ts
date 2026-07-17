@@ -155,6 +155,8 @@ function evaluateProjectCompletion(
     const files = collectFiles(workspace);
     const relative = (file: string): string => path.relative(workspace, file).replace(/\\/g, "/");
     const missing: string[] = [];
+    const packageFiles = files.filter((file) => path.basename(file).toLowerCase() === "package.json");
+    const packageLockFiles = files.filter((file) => path.basename(file).toLowerCase() === "package-lock.json");
 
     const goModules = files.filter((file) => path.basename(file).toLowerCase() === "go.mod");
     const goFiles = files.filter((file) => file.toLowerCase().endsWith(".go"));
@@ -162,7 +164,7 @@ function evaluateProjectCompletion(
 
     const reactRoots: string[] = [];
     let hasReactBuildSetup = false;
-    for (const packageFile of files.filter((file) => path.basename(file).toLowerCase() === "package.json")) {
+    for (const packageFile of packageFiles) {
         try {
             const parsed = JSON.parse(readText(packageFile)) as {
                 scripts?: Record<string, unknown>;
@@ -192,7 +194,7 @@ function evaluateProjectCompletion(
 
     const angularRoots: string[] = [];
     let hasAngularBuildSetup = false;
-    for (const packageFile of files.filter((file) => path.basename(file).toLowerCase() === "package.json")) {
+    for (const packageFile of packageFiles) {
         try {
             const parsed = JSON.parse(readText(packageFile)) as {
                 scripts?: Record<string, unknown>;
@@ -248,6 +250,55 @@ function evaluateProjectCompletion(
         if (!hasAngularConfig) missing.push("Angular workspace configuration (angular.json)");
         if (angularSources.length === 0) missing.push("Angular source under src/");
         if (!hasAngularBuildSetup) missing.push("Angular build script and @angular/cli dependency");
+        const hasCompleteAngularRoot = angularRoots.some((root) => {
+            const hasConfig = fs.existsSync(path.join(root, "angular.json"));
+            const sourceRoot = path.join(root, "src");
+            const hasSource = angularSources.some((file) => {
+                const rel = path.relative(sourceRoot, file);
+                return !rel.startsWith("..") && !path.isAbsolute(rel);
+            });
+            return hasConfig && hasSource;
+        });
+        if (angularRoots.length > 0 && !hasCompleteAngularRoot) missing.push("co-locate the frontend manifest, workspace configuration, and source under one project root");
+        for (const configFile of files.filter((file) => path.basename(file).toLowerCase() === "angular.json")) {
+            if (!fs.existsSync(path.join(path.dirname(configFile), "package.json"))) {
+                missing.push(`remove or relocate orphan workspace configuration without a same-directory manifest: ${relative(configFile)}`);
+            }
+        }
+    }
+    if (requirement.requireReactApp || requirement.requireAngularApp) {
+        for (const lockFile of packageLockFiles) {
+            if (!fs.existsSync(path.join(path.dirname(lockFile), "package.json"))) {
+                missing.push(`remove or relocate orphan lockfile without a same-directory manifest: ${relative(lockFile)}`);
+            }
+        }
+        for (const packageFile of packageFiles) {
+            const lockFile = path.join(path.dirname(packageFile), "package-lock.json");
+            if (!fs.existsSync(lockFile)) continue;
+            try {
+                const manifest = JSON.parse(readText(packageFile)) as Record<string, unknown>;
+                const lock = JSON.parse(readText(lockFile, 5_000_000)) as { packages?: Record<string, Record<string, unknown>> };
+                const root = lock.packages?.[""];
+                if (!root) continue;
+                const keys = ["name", "version", "dependencies", "devDependencies"];
+                const mismatchedKeys = keys.filter((key) => root[key] !== undefined
+                    && JSON.stringify(manifest[key] ?? {}) !== JSON.stringify(root[key] ?? {}));
+                if (mismatchedKeys.length > 0) {
+                    const manifestDependencies = manifest.dependencies && typeof manifest.dependencies === "object"
+                        ? Object.keys(manifest.dependencies as Record<string, unknown>) : [];
+                    const lockDependencies = root.dependencies && typeof root.dependencies === "object"
+                        ? Object.keys(root.dependencies as Record<string, unknown>) : [];
+                    const onlyManifest = manifestDependencies.filter((name) => !lockDependencies.includes(name));
+                    const onlyLock = lockDependencies.filter((name) => !manifestDependencies.includes(name));
+                    const dependencyDiff = onlyManifest.length > 0 || onlyLock.length > 0
+                        ? ` Dependency keys only in manifest: [${onlyManifest.join(", ") || "none"}]; only in lockfile: [${onlyLock.join(", ") || "none"}].`
+                        : "";
+                    missing.push(`align ${relative(packageFile)} with same-directory package-lock.json root metadata for fields [${mismatchedKeys.join(", ")}]; copy those lockfile values exactly instead of guessing.${dependencyDiff}`);
+                }
+            } catch {
+                // Syntax errors are reported by normal validators and build commands.
+            }
+        }
     }
     if (requirement.forbidReactArtifacts && /react-scripts|(?:from|require\s*\()\s*[('\"]react|["']react["']\s*:/i.test(frameworkArtifactText)) {
         missing.push("remove remaining React source, scripts, and dependencies");
@@ -257,6 +308,54 @@ function evaluateProjectCompletion(
     }
     if (requirement.requireFrontendApiCall && !/\bfetch\s*\(|\baxios(?:\s*\(|\.)|\bHttpClient\b|\bhttp\.(?:get|post|put|delete)\s*\(/i.test(frontendText)) {
         missing.push("frontend API call using fetch, axios, or Angular HttpClient");
+    }
+    const placeholderFiles = [...reactSources, ...angularSources]
+        .filter((file) => /<[^>]+>\s*[\w-]+\s+works!\s*<\//i.test(readText(file)))
+        .map(relative);
+    if (requirement.requireFrontendApiCall && placeholderFiles.length > 0) {
+        missing.push(`replace generated placeholder frontend content with UI that renders the requested API data; placeholder found in [${placeholderFiles.join(", ")}]`);
+    }
+    if (requirement.requireAngularApp && requirement.requireFrontendApiCall && /\bHttpClient\b/.test(angularText)) {
+        const standaloneBootstrap = angularSources
+            .filter((file) => path.basename(file).toLowerCase() === "main.ts")
+            .some((file) => /\bbootstrapApplication\s*\(/.test(readText(file)));
+        const hasStandaloneHttpProvider = /\bprovideHttpClient\s*\(|\bimportProvidersFrom\s*\([^)]*\bHttpClientModule\b/s.test(angularText);
+        if (standaloneBootstrap && !hasStandaloneHttpProvider) {
+            const activeConfigCandidates = angularSources
+                .filter((file) => /\bApplicationConfig\b|\bprovideRouter\s*\(|\bbootstrapApplication\s*\(/.test(readText(file)))
+                .map(relative);
+            missing.push(`register the HTTP client provider in the active standalone application bootstrap configuration; inspect active config candidates [${activeConfigCandidates.join(", ") || "none found"}] rather than an unused module`);
+        }
+        if (standaloneBootstrap) {
+            const unusedRootModules = angularSources.filter((file) => path.basename(file).toLowerCase() === "app.module.ts");
+            if (unusedRootModules.length > 0) {
+                missing.push(`remove unused legacy root bootstrap modules because the application uses standalone bootstrap; stale files [${unusedRootModules.map(relative).join(", ")}] must not carry duplicate routing/providers`);
+            }
+        }
+    }
+    if (requirement.requireFrontendApiCall) {
+        const localApiOrigins = Array.from(frontendText.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1):(\d+)/gi));
+        if (localApiOrigins.length > 0 && !/Access-Control-Allow-Origin|\bcors\b/i.test(goText)) {
+            missing.push("configure cross-origin API access because the frontend calls an absolute local API origin; add an explicit CORS policy or use a same-origin proxy/relative URL");
+        }
+
+        const backendJsonFields = new Set(Array.from(goText.matchAll(/`json:["']([^,"']+)/g), (match) => match[1]));
+        const renderedFields = new Set(Array.from(frontendText.matchAll(/\{\{\s*[A-Za-z_$][\w$]*\.([A-Za-z_$][\w$]*)/g), (match) => match[1]));
+        const unknownRenderedFields = Array.from(renderedFields).filter((field) => !backendJsonFields.has(field));
+        if (backendJsonFields.size > 0 && unknownRenderedFields.length > 0) {
+            missing.push(`align rendered frontend fields with the backend JSON contract; fields absent from backend JSON: [${unknownRenderedFields.join(", ")}]`);
+        }
+    }
+    const angularRouteConfigFiles = angularSources.filter((file) => (
+        /(?:^|[.])routes?\.ts$/i.test(path.basename(file))
+        || /\bexport\s+const\s+\w*routes\w*\s*:\s*Routes\b/i.test(readText(file))
+    ));
+    const angularRouteConfigText = angularRouteConfigFiles.map((file) => readText(file)).join("\n");
+    if (requirement.requireAngularApp
+        && /<router-outlet\b/i.test(angularText)
+        && /\bpath\s*:\s*["'][^"']+["']/i.test(angularRouteConfigText)
+        && !/\bpath\s*:\s*["']\s*["']/i.test(angularRouteConfigText)) {
+        missing.push(`add a default frontend route or redirect in the active route configuration so the requested UI renders at the application's initial URL; inspect [${angularRouteConfigFiles.map(relative).join(", ") || "no route config found"}] rather than an unused module`);
     }
     if (requirement.requireSwagger) {
         const namedArtifact = files.some((file) => /(?:^|\/)(?:swagger|openapi)(?:[./_-]|$)/i.test(relative(file)));
@@ -286,6 +385,17 @@ function projectChecksAffectedByPath(filePath: string): ProjectCheck[] {
     return checks;
 }
 
+function protectedProjectDeletionReason(workspace: string, filePath: string, request: string): string | undefined {
+    const absolute = path.resolve(workspace, filePath);
+    const basename = path.basename(absolute).toLowerCase();
+    if (!/^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(basename)) return undefined;
+    if (!fs.existsSync(path.join(path.dirname(absolute), "package.json"))) return undefined;
+    const explicitRemoval = /(?:remove|delete|ลบ|เอาออก)[\s\S]{0,50}(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|lockfile|lock file)/i.test(request);
+    return explicitRemoval
+        ? undefined
+        : `preserve active project lockfile ${filePath}; it is co-located with package.json and the request did not explicitly ask to remove it`;
+}
+
 function formatProjectCompletionPrompt(requirement: ProjectCompletionRequirement): string {
     const items: string[] = [];
     if (requirement.requireGoModule) items.push("a go.mod and Go application source");
@@ -298,7 +408,7 @@ function formatProjectCompletionPrompt(requirement: ProjectCompletionRequirement
     if (requirement.requireSwagger) items.push("Swagger/OpenAPI specification or route integration");
     if (requirement.requiredChecks.includes("go")) items.push("a successful go test/build/vet command");
     if (requirement.requiredChecks.includes("node")) items.push("a successful frontend test/build/check command");
-    return `Project completion profile (${requirement.label}): before final, ensure ${items.join("; ")}. Use a finite build/test command rather than a long-running development server for verification. Do not return a starter scaffold or defer required work to the user.`;
+    return `Project completion profile (${requirement.label}): before final, ensure ${items.join("; ")}. A frontend manifest, its workspace configuration, source directory, and build command must belong to the same project root; do not scatter them across unrelated directories. Use a finite build/test command rather than a long-running development server for verification. Do not return a starter scaffold or defer required work to the user.`;
 }
 
 function formatIncompleteTaskAnswer(reasons: string[], writtenPaths: string[]): string {
@@ -317,6 +427,7 @@ module.exports = {
     formatProjectCompletionPrompt,
     inferProjectCompletionRequirement,
     inferProjectCompletionRequirementWithHistory,
+    protectedProjectDeletionReason,
     projectChecksAffectedByPath,
     projectChecksForCommand
 };

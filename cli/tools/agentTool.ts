@@ -1,8 +1,11 @@
 import childProcess = require("node:child_process");
 import fs = require("node:fs");
 import path = require("node:path");
-const { commandTimeoutMs, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
+const { commandFailureGuidance, commandInteractiveRisk, commandTimeoutMs, packageContentAddsBrowserAutoOpen, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
+    commandFailureGuidance: (workspace: string, command: string, errorOutput: string) => string;
+    commandInteractiveRisk: (command: string, workspace: string, workdir?: string) => string | undefined;
     commandTimeoutMs: (command: string) => number;
+    packageContentAddsBrowserAutoOpen: (filePath: string, content: string) => boolean;
     resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
     unwrapWindowsPowerShellCommand: (command: string) => string;
 };
@@ -48,6 +51,10 @@ type AgentAction = (
         new_text: string;
     }
     | {
+        action: "delete_file";
+        path: string;
+    }
+    | {
         action: "run_command";
         command: string;
         workdir?: string;
@@ -71,7 +78,7 @@ type AgentToolResult = {
 };
 
 class AgentTool {
-    private readonly maxFileChars = 20000;
+    private readonly maxFileChars = 6000;
     private readonly maxObservationChars = 12000;
     private readonly maxListedFiles = 180;
     private readonly ignoredDirectories = new Set([
@@ -87,7 +94,7 @@ class AgentTool {
     ]);
     private readonly mcpTool: InstanceType<typeof McpTool>;
 
-    constructor(configRoot = process.cwd()) {
+    constructor(configRoot = process.cwd(), private readonly commandTimeoutOverrideMs?: number) {
         this.mcpTool = new McpTool(configRoot);
     }
 
@@ -97,8 +104,9 @@ class AgentTool {
             ? `Runtime platform: Windows. run_command executes Windows PowerShell.
 Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.
 Set run_command.workdir to a relative workspace directory instead of using Set-Location or cd.
-If workdir is omitted for an Angular workspace command and exactly one angular.json exists, the runner selects that directory automatically.
+If workdir is omitted and exactly one nested package manifest matches the requested executable or package script, the runner selects that directory automatically.
 Dependency installation and project scaffolding may run for up to three minutes. After a real timeout, inspect files before retrying because the command may have created partial output.
+Never add automatic browser-opening flags such as --open to package scripts. Do not run dev servers, watch commands, or browser-based interactive tests; use finite build and non-watch test commands.
 Do not wrap commands in another powershell.exe invocation. Do not use Bash separators such as && or a bare & to background a process.`
             : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
         // The model is controlled through a small JSON protocol so the CLI can
@@ -120,6 +128,7 @@ Available actions:
 {"action":"read_file","path":"relative path","reason":"brief rationale"}
 {"action":"write_file","path":"relative path","content":"full updated file content","reason":"brief rationale"}
 {"action":"edit_file","path":"relative path","old_text":"exact existing text","new_text":"replacement text","reason":"brief rationale"}
+{"action":"delete_file","path":"relative file path","reason":"brief rationale"}
 {"action":"run_command","command":"safe read-only or verification command","workdir":"optional relative directory","reason":"brief rationale"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
@@ -134,12 +143,16 @@ Rules:
 - Prefer reading relevant files before editing.
 - If the user names an exact file path, act on that path directly instead of listing the workspace to look for it.
 - Preserve existing style and dependencies unless the user asks otherwise.
+- Treat each directory containing a manifest as a separate project root. If an obsolete project is being removed and its replacement already exists in another root, delete the obsolete files after reading them instead of repurposing that manifest with guessed dependencies.
 - Prefer edit_file for an existing file: old_text must match exactly once, and new_text contains only its replacement.
+- Use delete_file when the user asks to remove an obsolete file. Read it first. Never simulate deletion by replacing a manifest or source file with empty content.
 - Use write_file for new files or when a complete replacement is genuinely necessary. For write_file, provide the full final file content.
 - Use write_file to create files and parent directories. run_command is only for read-only inspection or verification; never use mkdir, New-Item, redirection, or shell commands to create files.
 - Verify file contents with read_file or search_files instead of shell pipelines whenever possible.
 - Never assume a localhost server is running or that a workspace file is available over HTTP. Call a local URL only after a successful observation confirms that exact server and port are running.
 - If a verification command fails, recover with an OS-compatible command or a relevant read_file/search_files action before reporting verified success.
+- If a project manifest is missing or damaged but a lockfile exists, inspect the lockfile and existing project configuration to recover compatible versions. Do not invent or downgrade dependency versions.
+- Preserve a lockfile that is co-located with its project manifest unless the user explicitly asks to remove that lockfile. An orphan lockfile without a same-directory manifest may be removed when it belongs to an obsolete project.
 - Treat phrases such as "until it works", "จนกว่าจะผ่าน", and "ให้ใช้งานได้" as completion criteria, not requests for advice. Keep using actions until the requested observable result is verified.
 - A successful build proves compilation only. For runtime behavior such as a URL, endpoint, server, or Swagger UI, probe the actual local behavior before returning final.
 - Do not run destructive commands.
@@ -212,6 +225,14 @@ ${mcpSection}`;
                 path: typeof data.path === "string" ? data.path : "",
                 old_text: typeof data.old_text === "string" ? data.old_text : "",
                 new_text: typeof data.new_text === "string" ? data.new_text : "",
+                reason
+            };
+        }
+
+        if (action === "delete_file") {
+            return {
+                action,
+                path: typeof data.path === "string" ? data.path : "",
                 reason
             };
         }
@@ -338,6 +359,7 @@ ${mcpSection}`;
             "read_file",
             "write_file",
             "edit_file",
+            "delete_file",
             "run_command",
             "mcp_list_tools",
             "mcp_call_tool"
@@ -383,6 +405,16 @@ ${mcpSection}`;
                     return { ok: false, output: "Missing file content." };
                 }
 
+                if (packageContentAddsBrowserAutoOpen(action.path, action.content)) {
+                    return { ok: false, output: "Blocked package script: automatic browser-opening flags such as --open are not allowed. Use a normal start script without auto-open." };
+                }
+
+                const writeTarget = this.resolveInsideWorkspace(action.path);
+                if (fs.existsSync(writeTarget) && fs.statSync(writeTarget).isFile()
+                    && fs.readFileSync(writeTarget, "utf8") === action.content) {
+                    return { ok: false, output: `No file change: ${action.path} already has the requested content.` };
+                }
+
                 this.writeFile(action.path, action.content);
                 return { ok: true, output: `Wrote ${action.path}` };
             }
@@ -392,8 +424,24 @@ ${mcpSection}`;
                 if (!prepared.ok || prepared.content === undefined) {
                     return { ok: false, output: prepared.output };
                 }
+                if (packageContentAddsBrowserAutoOpen(action.path, prepared.content)) {
+                    return { ok: false, output: "Blocked package script: automatic browser-opening flags such as --open are not allowed. Use a normal start script without auto-open." };
+                }
+                const editTarget = this.resolveInsideWorkspace(action.path);
+                if (fs.readFileSync(editTarget, "utf8") === prepared.content) {
+                    return { ok: false, output: `No file change: ${action.path} already has the requested content.` };
+                }
                 this.writeFile(action.path, prepared.content);
                 return { ok: true, output: `Edited ${action.path} with one exact replacement` };
+            }
+
+            if (action.action === "delete_file") {
+                if (!action.path.trim()) return { ok: false, output: "Missing file path." };
+                const resolved = this.resolveInsideWorkspace(action.path);
+                if (!fs.existsSync(resolved)) return { ok: false, output: `File not found: ${action.path}` };
+                if (!fs.statSync(resolved).isFile()) return { ok: false, output: `delete_file only removes files: ${action.path}` };
+                fs.rmSync(resolved);
+                return { ok: true, output: `Deleted ${action.path}` };
             }
 
             if (action.action === "mcp_list_tools") {
@@ -411,9 +459,17 @@ ${mcpSection}`;
                 return { ok: false, output: "Missing command." };
             }
 
-            return { ok: true, output: this.runCommand(action.command, action.workdir) };
+            return { ok: true, output: await this.runCommand(action.command, action.workdir) };
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            if (action.action === "run_command") {
+                const guidance = commandFailureGuidance(process.cwd(), action.command, message);
+                const sourceContext = this.diagnosticSourceContext(message, action.command, action.workdir);
+                return {
+                    ok: false,
+                    output: `Recovery guidance: ${guidance}${sourceContext ? `\n${sourceContext}` : ""}\nOriginal command error:\n${message}`
+                };
+            }
             return { ok: false, output: message };
         }
     }
@@ -436,7 +492,7 @@ ${mcpSection}`;
             return {
                 ok: false,
                 output: matchCount === 0
-                    ? `edit_file old_text was not found in ${inputPath}. Read the file again and use an exact match.`
+                    ? `edit_file old_text was not found in ${inputPath}. Read the file again and use an exact match. If line endings or whitespace still prevent an exact replacement after reading, use write_file with the complete corrected file content.`
                     : `edit_file old_text matched ${matchCount} locations in ${inputPath}; provide more surrounding text so it matches exactly once.`
             };
         }
@@ -458,6 +514,7 @@ ${mcpSection}`;
             if (action.action === "read_file") return `Reading file: ${clean(action.path)}`;
             if (action.action === "write_file") return `Writing file: ${clean(action.path)}`;
             if (action.action === "edit_file") return `Editing file: ${clean(action.path)}`;
+            if (action.action === "delete_file") return `Deleting file: ${clean(action.path)}`;
             if (action.action === "run_command") {
                 const location = action.workdir ? ` in ${clean(action.workdir)}` : "";
                 return `Running check${location}: ${clean(action.command)}`;
@@ -504,7 +561,7 @@ ${mcpSection}`;
 
     private searchFiles(query: string, inputPath?: string): string {
         const root = this.resolveInsideWorkspace(inputPath || ".");
-        const regex = new RegExp(query, "i");
+        const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
         const files: string[] = [];
         const matches: string[] = [];
 
@@ -554,7 +611,87 @@ ${mcpSection}`;
             throw new Error("Binary file is not supported.");
         }
 
-        return this.truncate(buffer.toString("utf8"), this.maxFileChars);
+        const content = buffer.toString("utf8");
+        return this.truncate(`${content}${this.relatedManifestRecoveryContext(resolved, content)}`, this.maxFileChars);
+    }
+
+    private relatedManifestRecoveryContext(resolved: string, content: string): string {
+        if (path.basename(resolved).toLowerCase() !== "package.json") return "";
+
+        try {
+            const manifest = JSON.parse(content) as Record<string, unknown>;
+            const lockPath = path.join(path.dirname(resolved), "package-lock.json");
+            if (!fs.existsSync(lockPath)) return "";
+            const lock = JSON.parse(fs.readFileSync(lockPath, "utf8")) as {
+                packages?: Record<string, Record<string, unknown>>;
+            };
+            const root = lock.packages?.[""];
+            if (!root) return "";
+
+            const evidenceKeys = ["name", "version", "dependencies", "devDependencies"];
+            const evidence = Object.fromEntries(evidenceKeys.filter((key) => root[key] !== undefined).map((key) => [key, root[key]]));
+            const comparableManifest = Object.fromEntries(evidenceKeys.filter((key) => manifest[key] !== undefined).map((key) => [key, manifest[key]]));
+            if (JSON.stringify(evidence) === JSON.stringify(comparableManifest)) return "";
+
+            return `\n\n[Recovery context: this manifest disagrees with same-directory package-lock.json root metadata. For every displayed field, copy the lockfile value exactly: remove dependency keys absent from the evidence, add keys that are present, and preserve unrelated manifest-only fields such as scripts/private. Do not guess or downgrade versions.]\n${JSON.stringify(evidence, null, 2)}`;
+        } catch {
+            return "";
+        }
+    }
+
+    diagnosticSourceContext(errorOutput: string, command = "", requestedWorkdir?: string): string | undefined {
+        const missing = errorOutput.match(/Cannot find name ['"]([^'"]+)['"]/i);
+        const symbol = missing?.[1];
+        if (!symbol || missing?.index === undefined) return undefined;
+
+        const afterDiagnostic = errorOutput.slice(missing.index);
+        const beforeDiagnostic = errorOutput.slice(0, missing.index);
+        const location = afterDiagnostic.match(/(?:^|\r?\n)\s*([^\r\n]+?\.(?:ts|tsx|js|jsx|mjs|cjs|go|rs|py)):(\d+)(?::\d+)?:/i)?.[1]
+            ?? beforeDiagnostic.match(/(?:^|\r?\n)\s*([^\r\n]+?\.(?:ts|tsx|js|jsx|mjs|cjs|go|rs|py))\(\d+,\d+\):[^\r\n]*$/i)?.[1]
+            ?? beforeDiagnostic.match(/(?:^|\r?\n)\s*([^\r\n]+?\.(?:ts|tsx|js|jsx|mjs|cjs|go|rs|py)):\d+(?::\d+)?:[^\r\n]*$/i)?.[1];
+        if (!location) return undefined;
+
+        let workdir = requestedWorkdir || ".";
+        if (command.trim()) {
+            try {
+                workdir = resolveCommandWorkdir(process.cwd(), command, requestedWorkdir).workdir;
+            } catch {
+                // Keep the requested/default workdir when project inference fails.
+            }
+        }
+        const files: string[] = [];
+        this.walk(process.cwd(), files);
+        const initialTarget = path.resolve(process.cwd(), workdir, location);
+        const normalizedLocation = location.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+        const matchingTarget = files
+            .filter((relativeFile) => relativeFile.replace(/\\/g, "/").toLowerCase().endsWith(normalizedLocation))
+            .sort((left, right) => left.length - right.length)[0];
+        const target = fs.existsSync(initialTarget) ? initialTarget : matchingTarget
+            ? path.resolve(process.cwd(), matchingTarget)
+            : initialTarget;
+        const targetRelative = path.relative(process.cwd(), target).replace(/\\/g, "/");
+        const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const exportedDefinition = new RegExp(`\\bexport\\s+(?:default\\s+)?(?:abstract\\s+)?(?:class|function|const|let|var|interface|type|enum)\\s+${escaped}\\b`);
+        const definition = files.find((relativeFile) => {
+            const absolute = path.resolve(process.cwd(), relativeFile);
+            if (absolute.toLowerCase() === target.toLowerCase()) return false;
+            if (!/\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(relativeFile)) return false;
+            try {
+                return exportedDefinition.test(fs.readFileSync(absolute, "utf8"));
+            } catch {
+                return false;
+            }
+        });
+        if (!definition) {
+            return `Diagnostic source context: '${symbol}' is used in ${targetRelative}, but no exported definition was found in visible workspace source files. Define it or choose an existing exported symbol before retrying.`;
+        }
+
+        const definitionPath = definition.replace(/\\/g, "/");
+        let moduleSpecifier = path.relative(path.dirname(target), path.resolve(process.cwd(), definition)).replace(/\\/g, "/")
+            .replace(/\.(?:tsx?|jsx?|mjs|cjs)$/i, "")
+            .replace(/\/index$/i, "");
+        if (!moduleSpecifier.startsWith(".")) moduleSpecifier = `./${moduleSpecifier}`;
+        return `Diagnostic source context: '${symbol}' is used in ${targetRelative}; an existing exported definition was found in ${definitionPath}. The target file has no in-scope declaration for that symbol. A direct source-level correction is to import it there with: import { ${symbol} } from '${moduleSpecifier}'; Keep the existing symbol reference and do not edit an unrelated registry file.`;
     }
 
     private writeFile(inputPath: string, content: string): void {
@@ -563,7 +700,7 @@ ${mcpSection}`;
         fs.writeFileSync(resolved, content, "utf8");
     }
 
-    private runCommand(command: string, workdir?: string): string {
+    private async runCommand(command: string, workdir?: string): Promise<string> {
         const normalizedCommand = process.platform === "win32"
             ? unwrapWindowsPowerShellCommand(command)
             : command.trim();
@@ -583,34 +720,16 @@ ${mcpSection}`;
         if (!fs.existsSync(commandCwd) || !fs.statSync(commandCwd).isDirectory()) {
             throw new Error(`Command workdir is not a directory: ${workdirResolution.workdir}`);
         }
+        const interactiveRisk = commandInteractiveRisk(normalizedCommand, process.cwd(), workdirResolution.workdir);
+        if (interactiveRisk) {
+            throw new Error(`Blocked interactive command: ${interactiveRisk}.`);
+        }
 
-        const timeout = commandTimeoutMs(normalizedCommand);
+        const timeout = this.commandTimeoutOverrideMs ?? commandTimeoutMs(normalizedCommand);
         let output = "";
         for (let attempt = 1; attempt <= 2; attempt += 1) {
             try {
-                output = process.platform === "win32"
-                    ? childProcess.execFileSync("powershell.exe", [
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-Command",
-                        normalizedCommand
-                    ], {
-                        cwd: commandCwd,
-                        encoding: "utf8",
-                        stdio: ["ignore", "pipe", "pipe"],
-                        timeout,
-                        windowsHide: true
-                    })
-                    : childProcess.execSync(normalizedCommand, {
-                        cwd: commandCwd,
-                        encoding: "utf8",
-                        stdio: ["ignore", "pipe", "pipe"],
-                        timeout,
-                        windowsHide: true
-                    });
+                output = await this.runFiniteProcess(normalizedCommand, commandCwd, timeout);
                 break;
             } catch (error) {
                 const code = (error as NodeJS.ErrnoException).code;
@@ -623,6 +742,95 @@ ${mcpSection}`;
         return workdirResolution.autoSelected
             ? `${commandOutput}\n[Auto-selected workdir: ${workdirResolution.workdir}]`
             : commandOutput;
+    }
+
+    private runFiniteProcess(command: string, cwd: string, timeoutMs: number): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const environment = {
+                ...process.env,
+                BROWSER: "none",
+                CI: "true",
+                NO_OPEN: "1"
+            };
+            const child = process.platform === "win32"
+                ? childProcess.spawn("powershell.exe", [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command
+                ], {
+                    cwd,
+                    env: environment,
+                    stdio: ["ignore", "pipe", "pipe"],
+                    windowsHide: true
+                })
+                : childProcess.spawn(command, {
+                    cwd,
+                    detached: true,
+                    env: environment,
+                    shell: true,
+                    stdio: ["ignore", "pipe", "pipe"]
+                });
+            let stdout = "";
+            let stderr = "";
+            let settled = false;
+            let timedOut = false;
+            const append = (current: string, chunk: Buffer): string => (
+                current.length >= 1_000_000 ? current : `${current}${chunk.toString("utf8")}`.slice(0, 1_000_000)
+            );
+            child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
+            child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+
+            const timer = setTimeout(() => {
+                timedOut = true;
+                if (child.pid) this.terminateProcessTree(child.pid);
+            }, timeoutMs);
+
+            const finish = (callback: () => void): void => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                callback();
+            };
+
+            child.once("error", (error) => finish(() => reject(error)));
+            child.once("close", (code, signal) => finish(() => {
+                if (timedOut) {
+                    const error = Object.assign(new Error(`Command timed out after ${Math.ceil(timeoutMs / 1000)} seconds; the spawned process tree was terminated.`), { code: "ETIMEDOUT" });
+                    reject(error);
+                    return;
+                }
+                const combinedOutput = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+                if (code === 0) {
+                    resolve(combinedOutput);
+                    return;
+                }
+                const error = Object.assign(new Error(`Command failed with exit code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}: ${command}${combinedOutput ? `\n${combinedOutput}` : ""}`), { code: `EXIT_${code ?? "UNKNOWN"}` });
+                reject(error);
+            }));
+        });
+    }
+
+    private terminateProcessTree(pid: number): void {
+        try {
+            if (process.platform === "win32") {
+                childProcess.spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+                    stdio: "ignore",
+                    windowsHide: true
+                });
+            } else {
+                process.kill(-pid, "SIGKILL");
+            }
+        } catch {
+            try {
+                process.kill(pid, "SIGKILL");
+            } catch {
+                // The process may already have exited between timeout and cleanup.
+            }
+        }
     }
 
     private isSafeCommand(command: string): boolean {
@@ -656,7 +864,8 @@ ${mcpSection}`;
             /\bgit\s+checkout\b/,
             /\bgit\s+clean\b/,
             /\bnpm\s+publish\b/,
-            /\bnpm(?:\.cmd)?\s+audit\s+fix\b[^\r\n]*--force\b/
+            /\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+audit\s+fix\b/,
+            /\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:install|i|add)\b[^\r\n]*(?:--legacy-peer-deps|--force)\b/
         ];
 
         return !blockedPatterns.some((pattern) => pattern.test(lower));
@@ -674,12 +883,17 @@ ${mcpSection}`;
             return;
         }
 
+        entries.sort((left, right) => {
+            if (left.isFile() !== right.isFile()) return left.isFile() ? -1 : 1;
+            return left.name.localeCompare(right.name);
+        });
+
         for (const entry of entries) {
-            if (entry.isDirectory() && this.ignoredDirectories.has(entry.name.toLowerCase())) {
+            const absolute = path.join(root, entry.name);
+            if (entry.isDirectory() && this.shouldIgnoreDirectory(absolute, entry.name)) {
                 continue;
             }
 
-            const absolute = path.join(root, entry.name);
             const relative = path.relative(process.cwd(), absolute) || ".";
 
             if (entry.isDirectory()) {
@@ -687,6 +901,17 @@ ${mcpSection}`;
             } else if (entry.isFile()) {
                 files.push(relative);
             }
+        }
+    }
+
+    private shouldIgnoreDirectory(absolutePath: string, name: string): boolean {
+        const normalized = name.toLowerCase();
+        if (this.ignoredDirectories.has(normalized) || normalized === "cache" || normalized === ".cache") return true;
+        if (!normalized.startsWith(".")) return false;
+        try {
+            return fs.statSync(path.join(absolutePath, "cache")).isDirectory();
+        } catch {
+            return false;
         }
     }
 
@@ -708,7 +933,9 @@ ${mcpSection}`;
             return content;
         }
 
-        return `${content.slice(0, maxChars)}\n\n[Truncated to first ${maxChars} characters]`;
+        const headChars = Math.ceil(maxChars / 2);
+        const tailChars = Math.floor(maxChars / 2);
+        return `${content.slice(0, headChars)}\n\n[Middle truncated; showing first ${headChars} and last ${tailChars} characters]\n\n${content.slice(-tailChars)}`;
     }
 }
 

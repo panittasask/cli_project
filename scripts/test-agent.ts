@@ -1,6 +1,7 @@
 import assert = require("node:assert/strict");
 import fs = require("node:fs");
 import http = require("node:http");
+import net = require("node:net");
 import os = require("node:os");
 import path = require("node:path");
 const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require("../cli/config") as {
@@ -14,7 +15,7 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require(
         repeatLimit: number;
     };
 };
-const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () => {
+const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number) => {
     parseAction: (content: string) => { action?: string; reason?: string; path?: string; old_text?: string; new_text?: string; workdir?: string } | undefined;
     explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
@@ -198,6 +199,13 @@ async function main(): Promise<void> {
         reason: "Adjust spacing"
     }));
     assert.equal(editAction?.action, "edit_file");
+    const deleteAction = agent.parseAction(JSON.stringify({
+        action: "delete_file",
+        path: "obsolete.txt",
+        reason: "Remove an obsolete file."
+    }));
+    assert.equal(deleteAction?.action, "delete_file");
+    assert.equal(deleteAction?.path, "obsolete.txt");
     assert.equal(editAction?.old_text, "margin-top: 15px");
     const commandAction = agent.parseAction(JSON.stringify({
         action: "run_command",
@@ -275,6 +283,43 @@ async function main(): Promise<void> {
     const forcedAudit = await agent.execute({ action: "run_command", command: "npm audit fix --force" });
     assert.equal(forcedAudit.ok, false);
     assert.match(forcedAudit.output, /Blocked unsafe command/);
+    const auditMutation = await agent.execute({ action: "run_command", command: "npm audit fix" });
+    assert.equal(auditMutation.ok, false);
+    assert.match(auditMutation.output, /Blocked unsafe command/);
+    const dependencyBypass = await agent.execute({ action: "run_command", command: "npm install --legacy-peer-deps" });
+    assert.equal(dependencyBypass.ok, false);
+    assert.match(dependencyBypass.output, /Blocked unsafe command/);
+    const interactiveServer = await agent.execute({ action: "run_command", command: "ng serve --open" });
+    assert.equal(interactiveServer.ok, false);
+    assert.match(interactiveServer.output, /Blocked interactive command/);
+    if (process.platform === "win32") {
+        const reservation = net.createServer();
+        await new Promise<void>((resolve, reject) => {
+            reservation.once("error", reject);
+            reservation.listen(0, "127.0.0.1", resolve);
+        });
+        const address = reservation.address();
+        assert.ok(address && typeof address !== "string");
+        const port = address.port;
+        await new Promise<void>((resolve) => reservation.close(() => resolve()));
+        const timeoutAgent = new AgentTool(process.cwd(), 750);
+        try {
+            const timedOut = await timeoutAgent.execute({
+                action: "run_command",
+                command: `node -e "require('node:net').createServer().listen(${port}); setInterval(function(){},1000)"`
+            });
+            assert.equal(timedOut.ok, false);
+            assert.match(timedOut.output, /process tree was terminated/);
+            const probe = net.createServer();
+            await new Promise<void>((resolve, reject) => {
+                probe.once("error", reject);
+                probe.listen(port, "127.0.0.1", resolve);
+            });
+            await new Promise<void>((resolve) => probe.close(() => resolve()));
+        } finally {
+            await timeoutAgent.close();
+        }
+    }
     if (process.platform === "win32") {
         const powershellCheck = await agent.execute({ action: "run_command", command: "Write-Output 'powershell-ok'" });
         assert.equal(powershellCheck.ok, true);
@@ -306,6 +351,38 @@ async function main(): Promise<void> {
         const relativeWorkdir = path.relative(process.cwd(), editDirectory);
         const emptyDirectory = path.join(editDirectory, "empty");
         fs.mkdirSync(emptyDirectory);
+        const hiddenToolCache = path.join(editDirectory, ".tooling", "cache");
+        fs.mkdirSync(hiddenToolCache, { recursive: true });
+        fs.writeFileSync(path.join(hiddenToolCache, "noise.txt"), "generated", "utf8");
+        fs.writeFileSync(path.join(editDirectory, "literal-search.txt"), "RouterModule.forRoot(routes)", "utf8");
+        const literalSearch = await agent.execute({
+            action: "search_files",
+            query: "RouterModule.forRoot(routes)",
+            path: path.relative(process.cwd(), editDirectory)
+        });
+        assert.equal(literalSearch.ok, true);
+        assert.match(literalSearch.output, /literal-search\.txt/);
+        const manifestDirectory = path.join(editDirectory, "recovery-project");
+        fs.mkdirSync(manifestDirectory);
+        fs.writeFileSync(path.join(manifestDirectory, "package.json"), "{}", "utf8");
+        fs.writeFileSync(path.join(manifestDirectory, "package-lock.json"), JSON.stringify({
+            lockfileVersion: 3,
+            packages: { "": { name: "recovery-project", version: "1.2.3", dependencies: { library: "^4.5.6" } } }
+        }), "utf8");
+        const manifestRead = await agent.execute({
+            action: "read_file",
+            path: path.relative(process.cwd(), path.join(manifestDirectory, "package.json"))
+        });
+        assert.equal(manifestRead.ok, true);
+        assert.match(manifestRead.output, /manifest disagrees with same-directory package-lock\.json/);
+        assert.match(manifestRead.output, /\^4\.5\.6/);
+        const filteredListResult = await agent.execute({
+            action: "list_files",
+            path: path.relative(process.cwd(), editDirectory)
+        });
+        assert.equal(filteredListResult.ok, true);
+        assert.doesNotMatch(filteredListResult.output, /noise\.txt/);
+        assert.match(filteredListResult.output, /sample\.html/);
         const emptyListResult = await agent.execute({
             action: "list_files",
             path: path.relative(process.cwd(), emptyDirectory)
@@ -336,6 +413,14 @@ async function main(): Promise<void> {
         });
         assert.equal(editResult.ok, true);
         assert.match(fs.readFileSync(editPath, "utf8"), /margin-top: 25px/);
+        const deletePath = path.join(editDirectory, "obsolete.txt");
+        fs.writeFileSync(deletePath, "obsolete", "utf8");
+        const deleteResult = await agent.execute({
+            action: "delete_file",
+            path: path.relative(process.cwd(), deletePath)
+        });
+        assert.equal(deleteResult.ok, true);
+        assert.equal(fs.existsSync(deletePath), false);
         fs.writeFileSync(editPath, "same same", "utf8");
         assert.equal(agent.prepareEdit(relativeEditPath, "same", "next").ok, false);
     } finally {

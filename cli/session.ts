@@ -35,7 +35,7 @@ interface SessionStore {
 
 class SessionTool {
     private readonly maxSessions = 12;
-    private readonly maxMessagesPerSession = 24;
+    private readonly maxMessagesPerSession = 160;
     private readonly maxMessageChars = 800;
     private readonly maxStorageBytes = 180 * 1024;
 
