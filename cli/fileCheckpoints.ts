@@ -20,10 +20,11 @@ class FileCheckpointStore {
         return { id, preview: formatDiffPreview(content, nextContent, inputPath) };
     }
 
-    undoLatest(workspace: string): { ok: boolean; message: string } {
+    undoLatest(workspace: string, checkpointId?: string): { ok: boolean; message: string } {
         const entries = this.load();
         const normalized = path.resolve(workspace).toLowerCase();
-        const index = entries.findLastIndex((entry) => entry.workspace.toLowerCase() === normalized);
+        const index = entries.findLastIndex((entry) => entry.workspace.toLowerCase() === normalized
+            && (!checkpointId || entry.id === checkpointId));
         if (index < 0) return { ok: false, message: "No checkpoint is available for this workspace." };
         const [entry] = entries.splice(index, 1);
         if (!entry) return { ok: false, message: "Checkpoint could not be loaded." };

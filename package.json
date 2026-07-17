@@ -14,6 +14,7 @@
     "test:agent": "tsx scripts/test-agent.ts",
     "test:mcp": "tsx scripts/test-mcp.ts",
     "test:web": "tsx scripts/smoke-web.ts",
+    "smoke:agent:cli": "tsx scripts/smoke-agent-cli.ts",
     "test:regression": "tsx scripts/test-regression.ts",
     "test": "npm run test:agent && npm run test:regression && npm run test:mcp && npx tsc --noEmit",
     "run test": "npm test"

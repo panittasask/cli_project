@@ -25,12 +25,19 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     resetActionHistory: () => void;
     formatRemaining: () => string;
 } };
-const { commandCreatesWorkspaceFiles } = require("./commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges } = require("./commandNormalizer") as {
+    commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
+    commandMutatesWorkspaceFiles: (command: string) => boolean;
+    commandInvocationError: (errorOutput: string) => boolean;
+    diagnosticRecoveryGuidance: (errorOutput: string) => string | undefined;
+    missingCommandTargetError: (errorOutput: string) => boolean;
+    normalizeCommandSignature: (command: string) => string;
+    packageLifecycleRoleChanges: (beforeContent: string, afterContent: string) => string[];
 };
 const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpointStore: new (root: string) => {
     checkpoint: (workspace: string, inputPath: string, nextContent: string) => { id: string; preview: string };
-    undoLatest: (workspace: string) => { ok: boolean; message: string };
+    undoLatest: (workspace: string, checkpointId?: string) => { ok: boolean; message: string };
 } };
 const { SkillLoader } = require("./skillLoader") as { SkillLoader: new () => {
     discover: (workspace: string) => Array<{ name: string; description: string; body: string }>;
@@ -82,10 +89,11 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
         }
     ) => Array<{ role: "system" | "user"; content: string }>;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
-    getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string) => Record<string, unknown>;
+    getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string | string[]) => Record<string, unknown>;
+    getAgentMutationResponseFormat: (blockedAction?: string) => Record<string, unknown>;
     getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string, requiresWrite?: boolean) => Record<string, unknown>;
 };
@@ -133,7 +141,8 @@ const {
     formatProjectCompletionPrompt,
     inferProjectCompletionRequirementWithHistory,
     projectChecksAffectedByPath,
-    projectChecksForCommand
+    projectChecksForCommand,
+    protectedProjectDeletionReason
 } = require("./projectCompletion") as {
     answerDefersRequiredWork: (answer: string) => boolean;
     evaluateProjectCompletion: (workspace: string, requirement: ProjectCompletionRequirement) => string[];
@@ -146,6 +155,7 @@ const {
     ) => ProjectCompletionRequirement | undefined;
     projectChecksAffectedByPath: (filePath: string) => ProjectCheck[];
     projectChecksForCommand: (command: string) => ProjectCheck[];
+    protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
 const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = require("./taskContext") as {
     isContinuationRequest: (message: string) => boolean;
@@ -155,6 +165,7 @@ const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = requi
 const { WriteValidator } = require("./writeValidator") as { WriteValidator: new (workspace?: string) => {
     exists: (inputPath: string) => boolean;
     validate: (inputPath: string) => { ok: boolean; validator: string; output: string };
+    validateProjectFor: (inputPath: string) => { ok: boolean; validator: string; output: string } | undefined;
 } };
 const { Spinner, formatCompletionLine } = require("./spinner") as { Spinner: new (message?: string) => {
     start: () => void;
@@ -186,12 +197,13 @@ const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => 
         contextReason: string;
     } | undefined;
 } };
-const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRoot?: string) => {
+const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number) => {
     buildSystemPrompt: (workflowInstructions?: string) => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string };
+    diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     formatObservation: (action: unknown, result: { ok: boolean; output: string }) => string;
     close: () => Promise<void>;
@@ -1009,6 +1021,18 @@ function buildProjectContextBlock(filePaths: string[], reason?: string): string 
     return `${header}\n\n${sections.join("\n\n---\n\n")}`;
 }
 
+function countCompilerDiagnostics(output: string): number {
+    const diagnostics = output.match(/\berror\s+TS\d+:/gi);
+    return diagnostics?.length ?? (output.trim() ? 1 : 0);
+}
+
+function compilerDiagnosticFingerprint(output: string): string[] {
+    return output.split(/\r?\n/)
+        .filter((line) => /\berror\s+TS\d+:/i.test(line))
+        .map((line) => line.trim().replace(/\s+/g, " "))
+        .sort();
+}
+
 async function routeTool(message: string, sessionId: string, signal?: AbortSignal): Promise<ToolDecision> {
     try {
         const response = await llamaClient.post({
@@ -1052,6 +1076,7 @@ async function routeTool(message: string, sessionId: string, signal?: AbortSigna
 async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
+    historyForTask: Array<{ role: "user" | "assistant"; content: string }>,
     spinner: { update: (message: string) => void; log: (message: string) => void },
     sessionId: string,
     signal: AbortSignal
@@ -1061,10 +1086,10 @@ async function runAgentLoop(
     const maxSegments = agentGuardSettings.maxSegments;
     const maxTurns = maxTurnsPerSegment * maxSegments;
     const continuation = isContinuationRequest(userMessage);
-    const workflow = classifyWorkflowWithHistory(userMessage, historyForModel, continuation);
-    const mustWrite = requiresWorkspaceWriteWithHistory(userMessage, historyForModel, continuation);
-    const verificationRequirement = verificationRequirementWithHistory(userMessage, historyForModel, continuation);
-    const projectRequirement = inferProjectCompletionRequirementWithHistory(userMessage, historyForModel, continuation);
+    const workflow = classifyWorkflowWithHistory(userMessage, historyForTask, continuation);
+    const mustWrite = requiresWorkspaceWriteWithHistory(userMessage, historyForTask, continuation);
+    const verificationRequirement = verificationRequirementWithHistory(userMessage, historyForTask, continuation);
+    const projectRequirement = inferProjectCompletionRequirementWithHistory(userMessage, historyForTask, continuation);
     const agentResponseFormat = getAgentResponseFormat(workflow.kind);
     const initialAgentResponseFormat = getInitialAgentResponseFormat(workflow.kind, userMessage, mustWrite);
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
@@ -1074,8 +1099,11 @@ async function runAgentLoop(
     const selectedSkills = skillLoader.select(userMessage, availableSkills);
     const skillPrompt = skillLoader.formatPrompt(selectedSkills);
     const readPaths = new Set<string>();
+    const writeRetriesAwaitingRead = new Set<string>();
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
+    let unresolvedMissingCommandTarget = false;
+    let lastFailedCommand: string | undefined;
     let verificationSatisfied = verificationRequirement === "none";
     const successfulProjectChecks = new Set<ProjectCheck>();
     const writtenPaths = new Set<string>();
@@ -1101,6 +1129,10 @@ async function runAgentLoop(
     ].filter(Boolean).join("\n\n"));
     let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
     let recoveryResponseFormat: Record<string, unknown> | undefined;
+    const recoveryFormat = (extra: string | string[] = []) => getAgentRecoveryResponseFormat(
+        workflow.kind,
+        Array.from(new Set(Array.isArray(extra) ? extra : [extra])).filter(Boolean)
+    );
     let segmentEvents: string[] = [];
 
     if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
@@ -1123,6 +1155,7 @@ async function runAgentLoop(
             });
             segmentEvents = [];
             readPaths.clear();
+            writeRetriesAwaitingRead.clear();
             recoveryResponseFormat = undefined;
             guard.resetActionHistory();
             spinner.log(`Compacted agent context; continuing segment ${segment}/${maxSegments}.`);
@@ -1204,7 +1237,7 @@ async function runAgentLoop(
             });
             trace.save();
             if (choice.finish_reason === "length") {
-                recoveryResponseFormat = getAgentRecoveryResponseFormat(workflow.kind, "write_file");
+                recoveryResponseFormat = recoveryFormat("write_file");
                 messages.push({
                     role: "user",
                     content: "Your response reached the completion limit and was cut off. Do not resend the full file. For an existing file, use edit_file with a small exact old_text/new_text replacement. Read the file again first if needed."
@@ -1222,6 +1255,7 @@ async function runAgentLoop(
         // then each action becomes an observation for the next reasoning step.
         if (action.action === "final") {
             const rejectFinal = (summary: string, feedback: string): void => {
+                recoveryResponseFormat = recoveryFormat("final");
                 spinner.log(`[${turn}/${maxTurns}] Final blocked: ${summary}`);
                 trace.add({
                     turn,
@@ -1249,13 +1283,6 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            if (unresolvedVerificationFailure) {
-                rejectFinal(
-                    "the latest verification command failed",
-                    `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Inspect the error and run an OS-compatible verification command successfully. A read_file or search_files action can diagnose the problem but does not clear the failed verification. Do not assume a localhost server exists.`
-                );
-                continue;
-            }
             if (projectRequirement) {
                 const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
                 if (missingArtifacts.length > 0) {
@@ -1274,6 +1301,14 @@ async function runAgentLoop(
                     );
                     continue;
                 }
+            }
+            if (unresolvedVerificationFailure) {
+                recoveryResponseFormat = recoveryFormat(["run_command", "final"]);
+                rejectFinal(
+                    "the latest verification command failed",
+                    `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Inspect the error and run an OS-compatible verification command successfully. A read_file or search_files action can diagnose the problem but does not clear the failed verification. Do not assume a localhost server exists.`
+                );
+                continue;
             }
             const proposedAnswer = action.answer?.trim() || "Done.";
             if (projectRequirement && answerDefersRequiredWork(proposedAnswer)) {
@@ -1318,8 +1353,89 @@ async function runAgentLoop(
             return { answer: finalAnswer, trace };
         }
 
-        if ((action.action === "write_file" || action.action === "edit_file") && action.path
+        if (action.action === "run_command" && action.command && lastFailedCommand
+            && unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure)
+            && normalizeCommandSignature(action.command) !== normalizeCommandSignature(lastFailedCommand)) {
+            guard.resetActionHistory();
+        }
+        const guardDecision = guard.registerAction(action as Record<string, unknown>);
+        if (guardDecision.status === "replan") {
+            const invocationCorrection = action.action === "run_command"
+                && Boolean(unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure));
+            const failureReview = action.action === "run_command" && unresolvedVerificationFailure
+                ? ` Review the previous failure before choosing another action:\n${unresolvedVerificationFailure}`
+                : "";
+            const repeatObservation = `${guardDecision.message}${failureReview}`;
+            spinner.log(`[${turn}/${maxTurns}] ${guardDecision.message}`);
+            trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: repeatObservation });
+            trace.save();
+            recoveryResponseFormat = invocationCorrection
+                ? recoveryFormat("final")
+                : getAgentMutationResponseFormat(
+                    ["edit_file", "write_file", "delete_file"].includes(action.action ?? "") ? action.action : undefined
+                );
+            const completedWrites = writtenPaths.size > 0
+                ? ` Successful writes so far: ${Array.from(writtenPaths).join(", ")}.`
+                : "";
+            messages.push({
+                role: "user",
+                content: invocationCorrection
+                    ? `Observation: ${repeatObservation} Correct the rejected command or option and run a finite verification command with a different invocation. Do not edit source/configuration just to preserve the invalid command.`
+                    : `Observation: ${repeatObservation} The repeated ${action.action} action is unavailable for your next response.${completedWrites} Use the files and errors already observed to make a concrete write_file, edit_file, or delete_file correction now.`
+            });
+            continue;
+        }
+        if (guardDecision.status === "stop") {
+            const invocationCorrection = action.action === "run_command"
+                && Boolean(unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure));
+            const failureSummary = unresolvedVerificationFailure
+                ? ` Last unresolved command failure: ${unresolvedVerificationFailure}`
+                : "";
+            const observation = `${guardDecision.message}${failureSummary} This action is quarantined until a successful file mutation resets the progress window.`;
+            trace.add({ turn, status: "error", action: "repeat_quarantine", arguments: action, observation });
+            trace.save();
+            recoveryResponseFormat = invocationCorrection
+                ? recoveryFormat("final")
+                : getAgentMutationResponseFormat(
+                    ["edit_file", "write_file", "delete_file"].includes(action.action ?? "") ? action.action : undefined
+                );
+            messages.push({
+                role: "user",
+                content: invocationCorrection
+                    ? `Observation: ${observation} Use a corrected finite verification command with a different invocation. Do not mutate project files merely to preserve the rejected command or option.`
+                    : `Observation: ${observation} Use the files and errors already observed to make a concrete write_file, edit_file, or delete_file correction now. Do not retry the quarantined action before the workspace changes.`
+            });
+            continue;
+        }
+
+        if (action.action === "run_command" && action.command
+            && unresolvedMissingCommandTarget
+            && commandAddsTooling(action.command)
+            && !/(?:\blint(?:er|ing)?\b|\btooling\b|\bplugin\b|ติดตั้ง|เพิ่ม.*(?:เครื่องมือ|ปลั๊กอิน))/i.test(userMessage)) {
+            const output = "Blocked scope expansion: a missing optional command target does not authorize installing new tooling. Use a finite verification command already declared by the project, or inspect the manifest to find one.";
+            spinner.log(`[${turn}/${maxTurns}] ${output}`);
+            trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
+            trace.save();
+            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+            continue;
+        }
+
+        if (action.action === "delete_file" && action.path) {
+            const protectedDeletion = protectedProjectDeletionReason(activeWorkspace, action.path, userMessage);
+            if (protectedDeletion) {
+                const output = `Blocked deletion: ${protectedDeletion}. Inspect the co-located project files and make a different correction.`;
+                recoveryResponseFormat = recoveryFormat(["delete_file", "final"]);
+                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
+        }
+
+        if ((action.action === "write_file" || action.action === "edit_file" || action.action === "delete_file") && action.path
             && writeValidator.exists(action.path) && !readPaths.has(path.resolve(activeWorkspace, action.path).toLowerCase())) {
+            writeRetriesAwaitingRead.add(path.resolve(activeWorkspace, action.path).toLowerCase());
             const output = `Blocked write: read the existing file first (${action.path}).`;
             spinner.log(`[${turn}/${maxTurns}] ${output}`);
             trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
@@ -1328,30 +1444,21 @@ async function runAgentLoop(
             continue;
         }
 
-        const guardDecision = guard.registerAction(action as Record<string, unknown>);
-        if (guardDecision.status === "replan") {
-            spinner.log(`[${turn}/${maxTurns}] ${guardDecision.message}`);
-            trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: guardDecision.message });
-            trace.save();
-            recoveryResponseFormat = getAgentRecoveryResponseFormat(workflow.kind, action.action ?? "unknown");
-            const completedWrites = writtenPaths.size > 0
-                ? ` Successful writes so far: ${Array.from(writtenPaths).join(", ")}.`
-                : "";
-            messages.push({
-                role: "user",
-                content: `Observation: ${guardDecision.message} The repeated ${action.action} action is unavailable for your next response; use the observation already in context.${completedWrites} Choose a different action that makes progress, or return final if the request is complete.`
-            });
-            continue;
-        }
-        if (guardDecision.status === "stop") {
-            const answer = `${guardDecision.message} Agent stopped to avoid an unproductive loop. Review the trace or continue with a more specific request.`;
-            trace.add({ turn, status: "error", action: "repeat_stop", arguments: action, observation: answer });
-            trace.save();
-            return { answer, trace };
-        }
-
+        const validationBeforeMutation = (action.action === "write_file" || action.action === "edit_file") && action.path
+            ? writeValidator.validateProjectFor(action.path)
+            : undefined;
+        const packageManifestBeforeMutation = (action.action === "write_file" || action.action === "edit_file") && action.path
+            && path.basename(action.path).toLowerCase() === "package.json"
+            && writeValidator.exists(action.path)
+            ? fs.readFileSync(path.resolve(activeWorkspace, action.path), "utf8")
+            : undefined;
+        const completionBeforeDelete = action.action === "delete_file" && projectRequirement
+            ? evaluateProjectCompletion(activeWorkspace, projectRequirement)
+            : undefined;
+        let mutationCheckpointId: string | undefined;
         if (action.action === "write_file" && action.path && typeof action.content === "string") {
             const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, action.content);
+            mutationCheckpointId = checkpoint.id;
             spinner.log(checkpoint.preview);
             spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
         }
@@ -1359,9 +1466,16 @@ async function runAgentLoop(
             const prepared = agentTool.prepareEdit(action.path, action.old_text, action.new_text);
             if (prepared.ok && prepared.content !== undefined) {
                 const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, prepared.content);
+                mutationCheckpointId = checkpoint.id;
                 spinner.log(checkpoint.preview);
                 spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
             }
+        }
+        if (action.action === "delete_file" && action.path && writeValidator.exists(action.path)) {
+            const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, "");
+            mutationCheckpointId = checkpoint.id;
+            spinner.log(checkpoint.preview);
+            spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
         }
         spinner.log(agentTool.formatActionStatus(action, segmentTurn, maxTurnsPerSegment));
         spinner.update(`Executing ${action.action}...`);
@@ -1383,44 +1497,121 @@ async function runAgentLoop(
             };
         }
         if (action.action === "read_file" && result.ok && action.path) {
-            readPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
+            const resolvedReadPath = path.resolve(activeWorkspace, action.path).toLowerCase();
+            readPaths.add(resolvedReadPath);
+            if (writeRetriesAwaitingRead.delete(resolvedReadPath)) {
+                guard.resetActionHistory();
+            }
         }
-        if (action.action === "run_command" && result.ok && commandCreatesWorkspaceFiles(action.command ?? "")) {
-            writtenPaths.add("[project scaffold generated by command]");
+        if (action.action === "run_command" && result.ok && commandMutatesWorkspaceFiles(action.command ?? "")) {
+            guard.resetActionHistory();
+            writtenPaths.add(commandCreatesWorkspaceFiles(action.command ?? "")
+                ? "[project scaffold generated by command]"
+                : "[dependency metadata updated by command]");
             successfulProjectChecks.delete("node");
             if (verificationRequirement !== "none") verificationSatisfied = false;
         }
         if ((action.action === "write_file" || action.action === "edit_file") && result.ok && action.path) {
-            const validation = writeValidator.validate(action.path);
+            let validation = writeValidator.validate(action.path);
+            if (validation.ok && packageManifestBeforeMutation
+                && !/(?:\bscript\b|\bcommand\b|\bnpm run\b|คำสั่ง|สคริปต์)/i.test(userMessage)) {
+                const afterContent = fs.readFileSync(path.resolve(activeWorkspace, action.path), "utf8");
+                const changedRoles = packageLifecycleRoleChanges(packageManifestBeforeMutation, afterContent);
+                if (changedRoles.length > 0) {
+                    validation = {
+                        ok: false,
+                        validator: "manifest lifecycle semantics",
+                        output: `Lifecycle script role changed without an explicit request: ${changedRoles.join(", ")}. Preserve existing runtime/build/test behavior and choose a compatible finite verification command instead.`
+                    };
+                }
+            }
+            const beforeDiagnostics = validationBeforeMutation ? countCompilerDiagnostics(validationBeforeMutation.output) : 0;
+            const afterDiagnostics = countCompilerDiagnostics(validation.output);
+            const beforeFingerprint = validationBeforeMutation ? compilerDiagnosticFingerprint(validationBeforeMutation.output) : [];
+            const afterFingerprint = compilerDiagnosticFingerprint(validation.output);
+            const replacedDiagnostics = afterDiagnostics >= beforeDiagnostics
+                && JSON.stringify(afterFingerprint) !== JSON.stringify(beforeFingerprint);
+            const worsenedProject = validation.validator === "TypeScript" && !validation.ok
+                && (validationBeforeMutation?.ok !== false || afterDiagnostics > beforeDiagnostics || replacedDiagnostics);
+            const shouldRollback = !validation.ok && (validation.validator !== "TypeScript" || worsenedProject);
+            const rollback = shouldRollback && mutationCheckpointId
+                ? checkpointStore.undoLatest(activeWorkspace, mutationCheckpointId)
+                : undefined;
+            const diagnosticGuidance = validation.ok ? undefined : diagnosticRecoveryGuidance(validation.output);
+            const diagnosticSourceContext = validation.ok ? undefined : agentTool.diagnosticSourceContext(validation.output);
+            if (rollback?.ok) {
+                recoveryResponseFormat = getAgentMutationResponseFormat();
+            }
             result = {
                 ok: validation.ok,
-                output: `${result.output}\nValidator: ${validation.validator}\n${validation.output}`
+                output: `${result.output}\nValidator: ${validation.validator}\n${validation.output}${diagnosticGuidance ? `\nRecovery guidance: ${diagnosticGuidance}` : ""}${diagnosticSourceContext ? `\n${diagnosticSourceContext}` : ""}${rollback?.ok ? `\nMutation rolled back because it introduced additional validation failures. ${rollback.message} The failed ${action.action} action is quarantined until a different mutation persists.` : ""}`
             };
-            if (validation.ok) validationFailures.delete(action.path);
+            if (validation.ok || rollback?.ok) validationFailures.delete(action.path);
             else validationFailures.add(action.path);
-            writtenPaths.add(action.path);
-            projectChecksAffectedByPath(action.path).forEach((check) => successfulProjectChecks.delete(check));
-            if (verificationRequirement !== "none") verificationSatisfied = false;
-            if (workflow.kind === "mcp_creation") {
-                successfulMcpDiscovery = false;
-                successfulMcpCall = false;
+            if (!rollback?.ok) {
+                guard.resetActionHistory();
+                writtenPaths.add(action.path);
+                projectChecksAffectedByPath(action.path).forEach((check) => successfulProjectChecks.delete(check));
+                if (verificationRequirement !== "none") verificationSatisfied = false;
+                if (workflow.kind === "mcp_creation") {
+                    successfulMcpDiscovery = false;
+                    successfulMcpCall = false;
+                }
+            }
+        }
+        if (action.action === "delete_file" && result.ok && action.path) {
+            const completionAfterDelete = projectRequirement
+                ? evaluateProjectCompletion(activeWorkspace, projectRequirement)
+                : [];
+            const introducedBlockers = completionBeforeDelete
+                ? completionAfterDelete.filter((reason) => !completionBeforeDelete.includes(reason))
+                : [];
+            const protectedDeletion = protectedProjectDeletionReason(activeWorkspace, action.path, userMessage);
+            if (protectedDeletion) introducedBlockers.push(protectedDeletion);
+            const rollback = introducedBlockers.length > 0 && mutationCheckpointId
+                ? checkpointStore.undoLatest(activeWorkspace, mutationCheckpointId)
+                : undefined;
+            if (rollback?.ok) {
+                recoveryResponseFormat = recoveryFormat(["delete_file", "final"]);
+                result = {
+                    ok: false,
+                    output: `${result.output}\nDeletion rolled back because it introduced unmet task requirements: ${introducedBlockers.join("; ")}. ${rollback.message} The delete_file action is quarantined until a different mutation persists.`
+                };
+            } else {
+                guard.resetActionHistory();
+                validationFailures.delete(action.path);
+                writtenPaths.add(action.path);
+                projectChecksAffectedByPath(action.path).forEach((check) => successfulProjectChecks.delete(check));
+                if (verificationRequirement !== "none") verificationSatisfied = false;
+                if (workflow.kind === "mcp_creation") {
+                    successfulMcpDiscovery = false;
+                    successfulMcpCall = false;
+                }
             }
         }
         if (action.action === "mcp_list_tools" && result.ok) successfulMcpDiscovery = true;
         if (action.action === "mcp_call_tool" && result.ok) successfulMcpCall = true;
         if (action.action === "run_command" && !result.ok) {
-            unresolvedVerificationFailure = result.output.slice(0, 500);
+            lastFailedCommand = action.command;
+            unresolvedMissingCommandTarget = missingCommandTargetError(result.output);
+            unresolvedVerificationFailure = result.output.slice(0, 2000);
+            if (commandInvocationError(result.output)) {
+                recoveryResponseFormat = recoveryFormat(["edit_file", "write_file", "delete_file", "final"]);
+            }
             if (verificationRequirement !== "none") verificationSatisfied = false;
         } else if (action.action === "run_command" && result.ok) {
+            lastFailedCommand = undefined;
             const completedProjectChecks = projectChecksForCommand(action.command ?? "");
             completedProjectChecks.forEach((check) => successfulProjectChecks.add(check));
             const satisfiesRequiredCheck = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
             if (completedProjectChecks.length > 0) {
                 unresolvedVerificationFailure = undefined;
+                unresolvedMissingCommandTarget = false;
             }
             if (satisfiesRequiredCheck) {
                 verificationSatisfied = true;
                 unresolvedVerificationFailure = undefined;
+                unresolvedMissingCommandTarget = false;
             }
         }
         spinner.update(result.ok
@@ -1759,10 +1950,18 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             let requestedContextFiles: string[] = [];
             let contextReason = "";
             const sessionHistory = sessionTool.getContextMessages(activeSession.id, historyMessageLimit, contextStartedAt);
+            // Task inference is cheap and does not enter the model prompt. Keep a
+            // much longer window than conversational context so repeated
+            // continuation requests cannot erase the original acceptance scope.
+            const taskHistory = sessionTool.getContextMessages(activeSession.id, 160, contextStartedAt);
             const historyForModel = toModelMessages(sessionHistory);
+            const historyForTask = [
+                ...(activeSession.title ? [{ role: "user" as const, content: `Build task: ${activeSession.title}` }] : []),
+                ...toModelMessages(taskHistory)
+            ];
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
-                const result = await runAgentLoop(trimmed, historyForModel, spinner, activeSession.id, requestController.signal);
+                const result = await runAgentLoop(trimmed, historyForModel, historyForTask, spinner, activeSession.id, requestController.signal);
                 const elapsedMs = spinner.stop();
                 if (debugEnabled) {
                     result.trace.print();

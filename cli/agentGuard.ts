@@ -10,6 +10,7 @@ class AgentGuard {
     private readonly startedAt = Date.now();
     private completionTokens = 0;
     private readonly actionCounts = new Map<string, number>();
+    private inspectionEpoch = 0;
 
     constructor(readonly settings: GuardSettings) {}
 
@@ -26,14 +27,9 @@ class AgentGuard {
 
     registerAction(action: Record<string, unknown>): GuardDecision {
         const signature = this.signature(action);
-        if ((action.action === "write_file" || action.action === "edit_file")
-            && !this.actionCounts.has(signature)) {
-            // A file mutation starts a new progress window. Keep the mutation
-            // itself so an immediately repeated identical write is still caught.
-            this.actionCounts.clear();
-        }
         const count = (this.actionCounts.get(signature) ?? 0) + 1;
         this.actionCounts.set(signature, count);
+        if (!this.isInspectionAction(action.action)) this.inspectionEpoch += 1;
         if (count === this.settings.repeatLimit) {
             return { status: "replan", message: `Repeated equivalent action ${count} times without file progress; choose a different action or return final.` };
         }
@@ -57,6 +53,9 @@ class AgentGuard {
 
     private signature(action: Record<string, unknown>): string {
         const canonicalAction = { ...action };
+        if (this.isInspectionAction(action.action)) {
+            canonicalAction.inspection_epoch = this.inspectionEpoch;
+        }
         if (action.action === "run_command" && typeof action.workdir !== "string") {
             canonicalAction.workdir = ".";
         }
@@ -80,6 +79,10 @@ class AgentGuard {
                 return [key, value];
             }));
         return JSON.stringify(normalized);
+    }
+
+    private isInspectionAction(action: unknown): boolean {
+        return action === "read_file" || action === "list_files" || action === "search_files";
     }
 }
 

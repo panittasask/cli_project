@@ -32,6 +32,11 @@ const variants: Record<string, Record<string, unknown>> = {
         properties: { action: { const: "edit_file" }, path: stringProperty, old_text: stringProperty, new_text: stringProperty, reason: stringProperty },
         required: ["action", "path", "old_text", "new_text", "reason"], additionalProperties: false
     },
+    delete_file: {
+        type: "object",
+        properties: { action: { const: "delete_file" }, path: stringProperty, reason: stringProperty },
+        required: ["action", "path", "reason"], additionalProperties: false
+    },
     run_command: {
         type: "object",
         properties: { action: { const: "run_command" }, command: stringProperty, workdir: stringProperty, reason: stringProperty },
@@ -53,19 +58,25 @@ const workflowActions: Record<WorkflowKind, string[]> = {
     // General agent requests keep local tools available so the model can use
     // conversational context instead of relying on an exhaustive intent regex.
     // Runtime guards still enforce workspace boundaries and safe mutations.
-    general: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "final"],
-    web_research: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "final"],
-    coding: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "final"],
-    mcp_creation: ["read_file", "edit_file", "write_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "final"]
+    general: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "final"],
+    web_research: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "final"],
+    coding: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "final"],
+    mcp_creation: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "final"]
 };
 
 function getAgentResponseFormat(workflow: WorkflowKind): Record<string, unknown> {
     return formatForActions(workflowActions[workflow]);
 }
 
-function getAgentRecoveryResponseFormat(workflow: WorkflowKind, blockedAction: string): Record<string, unknown> {
-    const actions = workflowActions[workflow].filter((action) => action !== blockedAction);
+function getAgentRecoveryResponseFormat(workflow: WorkflowKind, blockedAction: string | string[]): Record<string, unknown> {
+    const blocked = new Set(Array.isArray(blockedAction) ? blockedAction : [blockedAction]);
+    const actions = workflowActions[workflow].filter((action) => !blocked.has(action));
     return formatForActions(actions.length > 0 ? actions : ["final"]);
+}
+
+function getAgentMutationResponseFormat(blockedAction?: string): Record<string, unknown> {
+    const actions = ["edit_file", "write_file", "delete_file"].filter((action) => action !== blockedAction);
+    return formatForActions(actions.length > 0 ? actions : ["write_file"]);
 }
 
 function getAgentLocalResponseFormat(workflow: WorkflowKind): Record<string, unknown> {
@@ -75,7 +86,7 @@ function getAgentLocalResponseFormat(workflow: WorkflowKind): Record<string, unk
 
 function getInitialAgentResponseFormat(workflow: WorkflowKind, message: string, requiresWrite = false): Record<string, unknown> {
     if ((workflow === "coding" || workflow === "mcp_creation") && requiresWrite) {
-        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file"]);
+        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file", "delete_file"]);
     }
     if (workflow === "coding" && /(?:^|[\s"'`])(?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml)(?=$|[\s"'`,)])/i.test(message)) {
         return formatForActions(["read_file"]);
@@ -103,4 +114,4 @@ function formatForActions(actions: string[]): Record<string, unknown> {
     };
 }
 
-module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat };
+module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat };
