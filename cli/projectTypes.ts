@@ -9,6 +9,15 @@ export type ProjectCheck = {
     affectedFiles: string[];
 };
 
+export type ProjectCheckProvider = {
+    manifest: string;
+    command: string;
+    label?: string;
+    ecosystem?: string;
+    affectedExtensions?: string[];
+    affectedFiles?: string[];
+};
+
 export type ProjectCompletionRequirement = {
     label: string;
     requireGoModule: boolean;

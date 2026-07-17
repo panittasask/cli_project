@@ -6,6 +6,9 @@ Set-Location -LiteralPath $appRoot
 function Get-CliSettings {
     $settingsPath = Join-Path $PSScriptRoot "..\.cli\settings.json"
     if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        $settingsPath = Join-Path $PSScriptRoot "..\.cli\settings.example.json"
+    }
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
         return [pscustomobject]@{}
     }
 
@@ -30,6 +33,7 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
 
 $llamaDevice = Resolve-LlamaDevice -ServerExecutable $launcher -RequestedDevice $requestedLlamaDevice
 $runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
+$memoryProfile = Get-LlamaMemoryProfile -Device $llamaDevice
 
 $models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
 if ($models.Count -eq 0) {
@@ -68,15 +72,14 @@ if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 
 $selectedModel = $models[$selectedNumber - 1]
 $speculativeProfile = Get-LlamaSpeculativeProfile -ServerExecutable $launcher -ModelPath $selectedModel.FullName
 $serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080")
-if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) {
-    $serverArguments += @("--device", $llamaDevice, "-ngl", "all")
-}
+$serverArguments += @($memoryProfile.Arguments)
 $serverArguments += @($speculativeProfile.Arguments)
 
 Write-Host "Starting llama.cpp from: $llamaDirectory"
 Write-Host "Model: $($selectedModel.Name)"
 Write-Host "Device: $(if ($llamaDevice) { $llamaDevice } else { 'auto' })"
 Write-Host "Runtime profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
+Write-Host "Memory profile: $($memoryProfile.Description)"
 Write-Host "Speculative decoding: $($speculativeProfile.Description)"
 Write-Host ("Configured context: {0:N0} tokens" -f $parsedContextLength)
 Write-Host "The CLI will connect to: http://127.0.0.1:8080"

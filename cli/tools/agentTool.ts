@@ -5,6 +5,7 @@ const { normalizeClarificationRequest } = require("../clarification") as {
     normalizeClarificationRequest: (
         question: unknown,
         options: unknown,
+        decision: unknown,
         reason?: string
     ) => import("../clarificationTypes").ClarificationRequest | undefined;
 };
@@ -106,6 +107,15 @@ class AgentTool {
         this.mcpTool = new McpTool(configRoot);
     }
 
+    async inspectCapabilities(): Promise<{ servers: Array<Record<string, unknown>> }> {
+        try {
+            const parsed = JSON.parse(await this.mcpTool.listTools()) as { servers?: unknown };
+            return { servers: Array.isArray(parsed.servers) ? parsed.servers as Array<Record<string, unknown>> : [] };
+        } catch (error) {
+            return { servers: [{ name: "MCP discovery", error: error instanceof Error ? error.message : String(error) }] };
+        }
+    }
+
     async buildSystemPrompt(workflowInstructions = ""): Promise<string> {
         const mcpSection = await this.mcpTool.buildPromptSection();
         const runtimeSection = process.platform === "win32"
@@ -138,7 +148,7 @@ Available actions:
 {"action":"edit_file","path":"relative path","old_text":"exact existing text","new_text":"replacement text","reason":"brief rationale"}
 {"action":"delete_file","path":"relative file path","reason":"brief rationale"}
 {"action":"run_command","command":"safe read-only or verification command","workdir":"optional relative directory","reason":"brief rationale"}
-{"action":"ask_user","question":"one concrete decision needed","options":[{"id":"stable_id","label":"short choice","description":"impact of choosing it"},{"id":"second_id","label":"another choice","description":"impact of choosing it"}],"reason":"why this ambiguity blocks a correct action"}
+{"action":"ask_user","decision":"target|scope|compatibility|destructive|cost|external|preference","question":"one concrete decision needed","options":[{"id":"stable_id","label":"short choice","description":"impact of choosing it"},{"id":"second_id","label":"another choice","description":"impact of choosing it"}],"reason":"why this ambiguity blocks a correct action"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
 Call discovered MCP tools through mcp_call_tool using the exact configured server and tool names.
@@ -150,9 +160,11 @@ Rules:
 - For current, niche, or external information, call a relevant MCP search tool before answering. Base the answer on its observation and include the returned source URLs.
 - If a required tool is unavailable or its call fails, say so plainly. Do not fabricate results and do not pretend that telling the user to search is equivalent to searching.
 - Prefer reading relevant files before editing.
-- Resolve uncertainty from accessible conversation, files, manifests, configuration, and tool observations first. If a remaining ambiguity would materially change the target, package, scope, behavior, data, cost, compatibility, or destructive effect, use ask_user before acting.
+- Resolve uncertainty from accessible conversation, files, manifests, configuration, and tool observations first. Uncertainty by itself is not a blocker. Use ask_user only when required information is absent after inspection and choosing incorrectly would materially change scope, compatibility, cost, data, or an irreversible effect.
 - Use ask_user instead of final for a blocking clarification. Offer 2-6 concrete, mutually distinct choices grounded in observed facts. Do not add an "Other" option; the CLI always accepts free-text answers outside the choices.
-- Do not ask about details that are safely inferable, reversible, or non-blocking. Ask one decision at a time and continue the same task after the answer.
+- Classify every clarification by its actual decision type. Use preference only for naming, styling, layout, or minor implementation details; preference questions are rejected because they are safely inferable and reversible. Never mislabel a preference as scope or target.
+- For workspace mutations, inspect before asking. Ask only when inspection reveals at least two genuinely plausible targets or a required value is still missing. Never ask whether to create a new project or use an existing one before inspecting manifests; use the single existing matching project, and create a new one only when requested or when none exists.
+- Normally ask at most once per task. A second clarification is allowed only after a new command, validation, or missing-target blocker appears. Ask one decision at a time and continue the same task after the answer.
 - A tool, validation, build, or dependency error is diagnostic evidence, not a new product decision. Inspect the referenced files and manifests, correct or revert the incompatible approach, and retry safely. Do not ask the user to choose troubleshooting commands, retry flags, or dependency-conflict workarounds.
 - For package operations, establish the exact package name, target project root, package manager, and production versus development role from the request and manifests. Inspect first, then use ask_user if any material choice remains or multiple project roots are plausible.
 - If the user names an exact file path, act on that path directly instead of listing the workspace to look for it.
@@ -207,7 +219,7 @@ ${mcpSection}`;
         }
 
         if (action === "ask_user") {
-            const request = normalizeClarificationRequest(data.question, data.options, reason);
+            const request = normalizeClarificationRequest(data.question, data.options, data.decision, reason);
             return request ? { action, ...request } : undefined;
         }
 
@@ -374,7 +386,7 @@ ${mcpSection}`;
     private isSupportedAction(action: string, data: Record<string, unknown>): boolean {
         if (action === "ask_user") {
             const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
-            return Boolean(normalizeClarificationRequest(data.question, data.options, reason));
+            return Boolean(normalizeClarificationRequest(data.question, data.options, data.decision, reason));
         }
         const builtInActions = new Set([
             "final",

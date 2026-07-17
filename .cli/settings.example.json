@@ -1,0 +1,43 @@
+{
+  "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
+  "modelPath": "D:\\Model",
+  "defaultModel": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+  "contextLength": 16384,
+  "device": "auto",
+  "debug": false,
+  "historyMessages": 6,
+  "agent": {
+    "maxTurns": 12,
+    "maxSegments": 1,
+    "maxDurationMinutes": 8,
+    "maxCompletionTokens": 8000,
+    "repeatLimit": 2,
+    "maxClarifications": 2,
+    "requireInspectionBeforeClarification": true,
+    "secondClarificationRequiresBlocker": true
+  },
+  "projectChecks": [],
+  "sampling": {
+    "chat": {
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "top_k": 40,
+      "repeat_penalty": 1.08,
+      "max_tokens": 2048
+    },
+    "planner": {
+      "temperature": 0.1,
+      "top_p": 0.9,
+      "top_k": 20,
+      "repeat_penalty": 1.05,
+      "max_tokens": 1024
+    },
+    "action": {
+      "temperature": 0.1,
+      "top_p": 0.9,
+      "top_k": 20,
+      "repeat_penalty": 1.05,
+      "max_tokens": 2048
+    }
+  }
+}

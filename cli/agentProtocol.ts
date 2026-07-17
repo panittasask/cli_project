@@ -47,6 +47,7 @@ const variants: Record<string, Record<string, unknown>> = {
         properties: {
             action: { const: "ask_user" },
             question: stringProperty,
+            decision: { enum: ["target", "scope", "compatibility", "destructive", "cost", "external", "preference"] },
             options: {
                 type: "array",
                 minItems: 2,
@@ -60,7 +61,7 @@ const variants: Record<string, Record<string, unknown>> = {
             },
             reason: stringProperty
         },
-        required: ["action", "question", "options", "reason"],
+        required: ["action", "question", "decision", "options", "reason"],
         additionalProperties: false
     },
     mcp_list_tools: {
@@ -107,9 +108,19 @@ function getAgentLocalResponseFormat(workflow: WorkflowKind): Record<string, unk
     return formatForActions(actions.length > 0 ? actions : ["final"]);
 }
 
+function getAgentReadOnlyResponseFormat(workflow: WorkflowKind, allowCommands = false): Record<string, unknown> {
+    const blocked = new Set(["edit_file", "write_file", "delete_file", ...(allowCommands ? [] : ["run_command"])]);
+    const actions = workflowActions[workflow].filter((action) => !blocked.has(action));
+    return formatForActions(actions.length > 0 ? actions : ["final"]);
+}
+
+function getAgentFinalResponseFormat(): Record<string, unknown> {
+    return formatForActions(["final"]);
+}
+
 function getInitialAgentResponseFormat(workflow: WorkflowKind, message: string, requiresWrite = false): Record<string, unknown> {
     if ((workflow === "coding" || workflow === "mcp_creation") && requiresWrite) {
-        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file", "delete_file", "ask_user"]);
+        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file", "delete_file"]);
     }
     if (workflow === "coding" && /(?:^|[\s"'`])(?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml)(?=$|[\s"'`,)])/i.test(message)) {
         return formatForActions(["read_file"]);
@@ -137,4 +148,4 @@ function formatForActions(actions: string[]): Record<string, unknown> {
     };
 }
 
-module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getInitialAgentResponseFormat };
+module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat };

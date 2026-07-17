@@ -4,7 +4,7 @@ import http = require("node:http");
 import net = require("node:net");
 import os = require("node:os");
 import path = require("node:path");
-const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require("../cli/config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, initializeCliSettings, validateCliSettings, validateCliSettingsFile } = require("../cli/config") as {
     loadCliSettings: (root?: string) => Record<string, unknown>;
     getSamplingSettings: (settings: Record<string, unknown>, kind: "action") => Record<string, number>;
     getAgentGuardSettings: (settings: Record<string, unknown>) => {
@@ -14,6 +14,11 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings } = require(
         maxCompletionTokens: number;
         repeatLimit: number;
     };
+    getClarificationSettings: (settings: Record<string, unknown>) => { maxClarifications: number; requireInspection: boolean; secondRequiresBlocker: boolean };
+    getProjectCheckProviders: (settings: Record<string, unknown>) => Array<Record<string, unknown>>;
+    initializeCliSettings: (root?: string) => { created: boolean; path: string; message: string };
+    validateCliSettings: (settings: unknown) => string[];
+    validateCliSettingsFile: (root?: string) => { ok: boolean; source: string; errors: string[] };
 };
 const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number) => {
     parseAction: (content: string) => { action?: string; reason?: string; path?: string; old_text?: string; new_text?: string; workdir?: string } | undefined;
@@ -152,6 +157,43 @@ async function main(): Promise<void> {
     const settings = loadCliSettings(path.resolve(__dirname, ".."));
     const configuredContextLength = settings.contextLength;
     assert.ok(typeof configuredContextLength === "number" && configuredContextLength > 0);
+    const settingsInitRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cli-settings-init-"));
+    try {
+        const prototypeDirectory = path.join(settingsInitRoot, ".cli");
+        fs.mkdirSync(prototypeDirectory, { recursive: true });
+        fs.copyFileSync(path.resolve(__dirname, "..", ".cli", "settings.example.json"), path.join(prototypeDirectory, "settings.example.json"));
+        const prototypeSettings = loadCliSettings(settingsInitRoot);
+        assert.deepEqual(getAgentGuardSettings(prototypeSettings), {
+            maxTurns: 12,
+            maxSegments: 1,
+            maxDurationMs: 480_000,
+            maxCompletionTokens: 8000,
+            repeatLimit: 2
+        });
+        assert.deepEqual(getClarificationSettings(prototypeSettings), {
+            maxClarifications: 2,
+            requireInspection: true,
+            secondRequiresBlocker: true
+        });
+        assert.equal(getSamplingSettings(prototypeSettings, "action").max_tokens, 2048);
+        assert.deepEqual(validateCliSettings(prototypeSettings), []);
+        assert.equal(validateCliSettingsFile(settingsInitRoot).source, "settings.example.json");
+        const initialized = initializeCliSettings(settingsInitRoot);
+        assert.equal(initialized.created, true);
+        assert.equal((loadCliSettings(settingsInitRoot).agent as Record<string, unknown>).maxSegments, 1);
+        fs.writeFileSync(initialized.path, "{\"preserved\":true}\n", "utf8");
+        const repeated = initializeCliSettings(settingsInitRoot);
+        assert.equal(repeated.created, false);
+        assert.deepEqual(loadCliSettings(settingsInitRoot), { preserved: true });
+        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, agent: { maxSegments: 0 }, sampling: { action: { top_p: 3 } } }), "utf8");
+        const invalidSettings = validateCliSettingsFile(settingsInitRoot);
+        assert.equal(invalidSettings.ok, false);
+        assert.match(invalidSettings.errors.join("\n"), /contextLength/);
+        assert.match(invalidSettings.errors.join("\n"), /agent\.maxSegments/);
+        assert.match(invalidSettings.errors.join("\n"), /sampling\.action\.top_p/);
+    } finally {
+        fs.rmSync(settingsInitRoot, { recursive: true, force: true });
+    }
     const actionSampling = getSamplingSettings({ sampling: { action: { max_tokens: 4096 } } }, "action");
     assert.equal(actionSampling.temperature, 0.1);
     assert.equal(actionSampling.max_tokens, 4096);
@@ -170,6 +212,22 @@ async function main(): Promise<void> {
         maxCompletionTokens: 8000,
         repeatLimit: 2
     });
+    assert.deepEqual(getClarificationSettings({ agent: {
+        maxClarifications: 3,
+        requireInspectionBeforeClarification: false,
+        secondClarificationRequiresBlocker: false
+    } }), { maxClarifications: 3, requireInspection: false, secondRequiresBlocker: false });
+    assert.deepEqual(getProjectCheckProviders({ projectChecks: [{
+        manifest: "deno.json",
+        command: "deno test",
+        affectedExtensions: ["ts"]
+    }] }), [{
+        manifest: "deno.json",
+        command: "deno test",
+        affectedExtensions: [".ts"],
+        affectedFiles: []
+    }]);
+    assert.deepEqual(getProjectCheckProviders({ projectChecks: [{ manifest: "../outside.json", command: "bad\ncommand" }] }), []);
 
     const agent = new AgentTool();
     const action = agent.parseAction(JSON.stringify({

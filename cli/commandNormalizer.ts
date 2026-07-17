@@ -412,6 +412,108 @@ function packageLifecycleRoleChanges(beforeContent: string, afterContent: string
     }
 }
 
+type PackageMutation = {
+    manager: "npm" | "pnpm" | "yarn" | "bun";
+    operation: "add" | "remove" | "install_declared";
+    packages: Array<{ spec: string; name: string; version?: string }>;
+    development: boolean;
+};
+
+function parsePackageSpec(spec: string): { spec: string; name: string; version?: string } | undefined {
+    const clean = spec.trim().replace(/^['"]|['"]$/g, "");
+    const match = clean.startsWith("@")
+        ? clean.match(/^(@[\w.-]+\/[\w.-]+)(?:@(.+))?$/)
+        : clean.match(/^([\w.-]+)(?:@(.+))?$/);
+    if (!match?.[1]) return undefined;
+    return { spec: clean, name: match[1].toLowerCase(), ...(match[2] ? { version: match[2] } : {}) };
+}
+
+function parsePackageMutation(command: string): PackageMutation | undefined {
+    const normalized = unwrapWindowsPowerShellCommand(command).trim();
+    if (/[\r\n;&|]/.test(normalized)) return undefined;
+    const tokens = normalized.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+    const managerToken = tokens[0]?.toLowerCase().replace(/\.cmd$/, "");
+    if (!managerToken || !["npm", "pnpm", "yarn", "bun"].includes(managerToken)) return undefined;
+    const manager = managerToken as PackageMutation["manager"];
+    const verb = tokens[1]?.toLowerCase();
+    const addVerbs = manager === "yarn" || manager === "bun" ? ["add"] : ["install", "i", "add"];
+    const removeVerbs = ["remove", "uninstall", "rm"];
+    if (!verb || (!addVerbs.includes(verb) && !removeVerbs.includes(verb) && verb !== "install" && verb !== "ci")) return undefined;
+    const operation: PackageMutation["operation"] = removeVerbs.includes(verb)
+        ? "remove" : tokens.slice(2).some((token) => !token.startsWith("-")) ? "add" : "install_declared";
+    const flagsWithValues = new Set(["--registry", "--workspace", "--filter", "--config", "--cache"]);
+    const packageTokens: string[] = [];
+    for (let index = 2; index < tokens.length; index += 1) {
+        const token = tokens[index] ?? "";
+        if (flagsWithValues.has(token.toLowerCase())) {
+            index += 1;
+            continue;
+        }
+        if (!token.startsWith("-")) packageTokens.push(token);
+    }
+    const packages = packageTokens.flatMap((token) => {
+        const parsed = parsePackageSpec(token);
+        return parsed ? [parsed] : [];
+    });
+    if (operation !== "install_declared" && packages.length !== packageTokens.length) return undefined;
+    return {
+        manager,
+        operation,
+        packages,
+        development: tokens.some((token) => /^(?:-d|--save-dev|--dev)$/i.test(token))
+    };
+}
+
+function packageMutationRisk(workspace: string, userMessage: string, command: string, requestedWorkdir?: string): string | undefined {
+    const mutation = parsePackageMutation(command);
+    if (!mutation) return undefined;
+    const manifests = findManifestDirectories(workspace, "package.json", 30);
+    if (manifests.length > 1 && !requestedWorkdir?.trim()) {
+        return `multiple package roots were found (${manifests.map((directory) => path.relative(workspace, directory) || ".").join(", ")}); set run_command.workdir to one inspected target`;
+    }
+    const resolved = resolveCommandWorkdir(workspace, command, requestedWorkdir);
+    const root = path.resolve(workspace, resolved.workdir);
+    const relativeRoot = path.relative(workspace, root);
+    if (relativeRoot.startsWith("..") || path.isAbsolute(relativeRoot)) return `selected workdir '${resolved.workdir}' is outside the workspace`;
+    const manifestPath = path.join(root, "package.json");
+    if (!fs.existsSync(manifestPath)) return `no package.json exists in the selected workdir '${resolved.workdir}'`;
+
+    const lockManagers = [
+        fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? "pnpm" : "",
+        fs.existsSync(path.join(root, "yarn.lock")) ? "yarn" : "",
+        fs.existsSync(path.join(root, "bun.lock")) || fs.existsSync(path.join(root, "bun.lockb")) ? "bun" : "",
+        fs.existsSync(path.join(root, "package-lock.json")) ? "npm" : ""
+    ].filter(Boolean);
+    if (lockManagers.length === 1 && lockManagers[0] !== mutation.manager) {
+        return `package manager '${mutation.manager}' does not match the existing ${lockManagers[0]} lockfile in '${resolved.workdir}'`;
+    }
+
+    let declared: Record<string, string> = {};
+    try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+        declared = { ...manifest.dependencies, ...manifest.devDependencies };
+    } catch {
+        return `package.json in '${resolved.workdir}' is invalid; inspect and repair it before changing dependencies`;
+    }
+    for (const dependency of mutation.packages) {
+        const escapedName = dependency.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const explicitlyNamed = new RegExp(`(^|[^\\w@./-])${escapedName}(?=$|[^\\w./-])`, "i").test(userMessage);
+        const alreadyDeclared = Object.keys(declared).some((name) => name.toLowerCase() === dependency.name);
+        if (mutation.operation === "add" && !explicitlyNamed && !alreadyDeclared) {
+            return `package '${dependency.name}' was not explicitly named by the user and is not already declared; inspect requirements or ask a target/scope clarification before installing it`;
+        }
+        if (mutation.operation === "add" && dependency.version) {
+            const requestedSpec = `${dependency.name}@${dependency.version}`.toLowerCase();
+            const userRequestedVersion = userMessage.toLowerCase().includes(requestedSpec);
+            const declaredVersion = Object.entries(declared).find(([name]) => name.toLowerCase() === dependency.name)?.[1];
+            if (!userRequestedVersion && declaredVersion !== dependency.version) {
+                return `version '${dependency.version}' for '${dependency.name}' was not requested or established by the manifest; use the unversioned package name so the configured registry resolves it, or inspect authoritative compatibility evidence`;
+            }
+        }
+    }
+    return undefined;
+}
+
 module.exports = {
     commandFailureGuidance,
     commandInvocationError,
@@ -425,6 +527,8 @@ module.exports = {
     normalizeCommandSignature,
     missingCommandTargetError,
     packageLifecycleRoleChanges,
+    packageMutationRisk,
+    parsePackageMutation,
     packageContentAddsBrowserAutoOpen,
     resolveCommandWorkdir,
     unwrapWindowsPowerShellCommand
