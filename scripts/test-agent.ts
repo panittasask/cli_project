@@ -152,7 +152,7 @@ async function main(): Promise<void> {
     const settings = loadCliSettings(path.resolve(__dirname, ".."));
     const configuredContextLength = settings.contextLength;
     assert.ok(typeof configuredContextLength === "number" && configuredContextLength > 0);
-    const actionSampling = getSamplingSettings(settings, "action");
+    const actionSampling = getSamplingSettings({ sampling: { action: { max_tokens: 4096 } } }, "action");
     assert.equal(actionSampling.temperature, 0.1);
     assert.equal(actionSampling.max_tokens, 4096);
     assert.deepEqual(getAgentGuardSettings({

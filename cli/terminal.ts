@@ -1196,6 +1196,7 @@ async function runAgentLoop(
     const writeRetriesAwaitingRead = new Set<string>();
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
+    let unresolvedToolFailure: { action: string; output: string } | undefined;
     let unresolvedMissingCommandTarget = false;
     let lastFailedCommand: string | undefined;
     let verificationSatisfied = verificationRequirement === "none";
@@ -1355,6 +1356,24 @@ async function runAgentLoop(
         // The loop ends only when the model explicitly returns final. Until
         // then each action becomes an observation for the next reasoning step.
         if (action.action === "ask_user") {
+            if (unresolvedToolFailure) {
+                const failure = unresolvedToolFailure.output.slice(0, 1400);
+                const output = `Blocked recovery clarification: ${unresolvedToolFailure.action} is still failing. Tool failures must be diagnosed and corrected autonomously; do not ask the user to choose retry flags, troubleshooting commands, or implementation workarounds.`;
+                recoveryResponseFormat = recoveryFormat(["ask_user", "final"]);
+                trace.add({
+                    turn,
+                    status: "error",
+                    action: "ask_user_recovery_blocked",
+                    reason: action.reason,
+                    observation: output
+                });
+                trace.save();
+                messages.push({
+                    role: "user",
+                    content: `${output}\nReview the failure evidence below, inspect referenced files or manifests if needed, then make a compatible correction or revert the failed approach. A successful read alone does not resolve the failure.\n${failure}`
+                });
+                continue;
+            }
             const request: ClarificationRequest = {
                 question: action.question ?? "",
                 options: action.options ?? [],
@@ -1460,6 +1479,13 @@ async function runAgentLoop(
                 rejectFinal(
                     "blocking clarification must use the interactive choice action",
                     "Do not return a blocking question as final. Use ask_user with 2-6 concrete choices grounded in the context you already inspected; the CLI automatically accepts a free-text answer outside those choices."
+                );
+                continue;
+            }
+            if (unresolvedToolFailure) {
+                rejectFinal(
+                    `latest ${unresolvedToolFailure.action} action is still failing`,
+                    `You cannot return final while the latest tool failure is unresolved. Inspect the error and make a concrete correction or run a successful corrective command. A read-only inspection does not clear this failure. Failure evidence: ${unresolvedToolFailure.output.slice(0, 1400)}`
                 );
                 continue;
             }
@@ -1819,7 +1845,13 @@ async function runAgentLoop(
         if (action.action === "run_command" && !result.ok) {
             lastFailedCommand = action.command;
             unresolvedMissingCommandTarget = missingCommandTargetError(result.output);
-            unresolvedVerificationFailure = result.output.slice(0, 2000);
+            const effectiveWorkdir = action.workdir
+                ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
+            const failedKnownCheck = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir).length > 0;
+            const failedRequiredVerification = commandSatisfiesVerification(action.command ?? "", verificationRequirement);
+            if (failedKnownCheck || failedRequiredVerification) {
+                unresolvedVerificationFailure = result.output.slice(0, 2000);
+            }
             if (commandInvocationError(result.output)) {
                 recoveryResponseFormat = recoveryFormat(["edit_file", "write_file", "delete_file", "final"]);
             }
@@ -1841,6 +1873,14 @@ async function runAgentLoop(
                 unresolvedVerificationFailure = undefined;
                 unresolvedMissingCommandTarget = false;
             }
+        }
+        if (!result.ok) {
+            unresolvedToolFailure = {
+                action: action.action ?? "unknown_action",
+                output: result.output
+            };
+        } else if (["write_file", "edit_file", "delete_file", "run_command"].includes(action.action ?? "")) {
+            unresolvedToolFailure = undefined;
         }
         spinner.update(result.ok
             ? `Completed ${action.action}; reviewing result...`

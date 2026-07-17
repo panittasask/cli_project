@@ -417,13 +417,15 @@ async function main(): Promise<void> {
     assert.ok(repeatedReadRecoveryActions.includes("write_file"));
     assert.ok(repeatedReadRecoveryActions.includes("edit_file"));
     assert.ok(repeatedReadRecoveryActions.includes("final"));
+    assert.ok(!repeatedReadRecoveryActions.includes("ask_user"));
     const forcedDiagnosticActions = getAgentRecoveryResponseFormat("coding", ["run_command", "final"]).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(!forcedDiagnosticActions.includes("run_command"));
     assert.ok(!forcedDiagnosticActions.includes("final"));
     assert.ok(forcedDiagnosticActions.includes("read_file"));
     assert.ok(forcedDiagnosticActions.includes("delete_file"));
+    assert.ok(!forcedDiagnosticActions.includes("ask_user"));
     const forcedMutationActions = getAgentMutationResponseFormat("edit_file").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(forcedMutationActions, ["write_file", "delete_file", "ask_user"]);
+    assert.deepEqual(forcedMutationActions, ["write_file", "delete_file"]);
     const askUserSchema = getAgentResponseFormat("coding").schema.oneOf.find((variant) => variant.properties.action.const === "ask_user");
     assert.equal(askUserSchema?.properties.options.minItems, 2);
     assert.equal(askUserSchema?.properties.options.maxItems, 6);
