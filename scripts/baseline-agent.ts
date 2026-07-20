@@ -20,7 +20,14 @@ const appRoot = path.resolve(__dirname, "..");
 const settings = loadCliSettings(appRoot);
 const apiUrl = process.env.LLAMA_API_URL?.trim() || "http://127.0.0.1:8080/v1/chat/completions";
 const sampling = getSamplingSettings(settings, "action");
-const attempts = 5;
+const configuredAttempts = Number(process.env.BASELINE_AGENT_ATTEMPTS);
+const attempts = Number.isFinite(configuredAttempts)
+    ? Math.min(10, Math.max(1, Math.floor(configuredAttempts)))
+    : 5;
+const configuredRequestTimeoutMs = Number(process.env.BASELINE_REQUEST_TIMEOUT_MS);
+const requestTimeoutMs = Number.isFinite(configuredRequestTimeoutMs)
+    ? Math.min(600_000, Math.max(10_000, Math.floor(configuredRequestTimeoutMs)))
+    : 120_000;
 
 function endpoint(route: string): string {
     return new URL(route, apiUrl).toString();
@@ -57,7 +64,7 @@ async function main(): Promise<void> {
                 ],
                 response_format: responseFormat,
                 ...sampling
-            }, { timeout: 120000 });
+            }, { timeout: requestTimeoutMs });
             const raw = response.data?.choices?.[0]?.message?.content?.trim() ?? "";
             const parsed = agent.parseAction(raw);
             results.push({
@@ -76,6 +83,7 @@ async function main(): Promise<void> {
             prompt,
             sampling,
             attempts,
+            requestTimeoutMs,
             validJsonActions: results.filter((result) => result.valid).length,
             readFileActions: results.filter((result) => result.action === "read_file").length,
             reasonsIncluded: results.filter((result) => Boolean(result.reason)).length,

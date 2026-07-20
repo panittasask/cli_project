@@ -9,6 +9,7 @@ const { runAgentCliHarness } = require("./agent-cli-harness") as {
 
 async function main(): Promise<void> {
     const apiUrl = process.env.LLAMA_API_URL?.trim() || "http://127.0.0.1:8080/v1/chat/completions";
+    const qualityMode = process.env.LOCAL_EVAL_MODE?.trim().toLowerCase() === "quality";
     try {
         await axios.get(new URL("/health", apiUrl).toString(), { timeout: 2000 });
     } catch {
@@ -35,8 +36,14 @@ async function main(): Promise<void> {
             workspace: root,
             apiUrl,
             prompt: "อ่าน README.md แล้วสรุปสั้นๆ ว่า workspace นี้ใช้ทดสอบอะไร ห้ามแก้ไฟล์",
-            timeoutMs: 150_000,
-            environment: { CLI_AGENT_MAX_TURNS: "4", CLI_AGENT_MAX_MINUTES: "2", LLAMA_ACTION_MAX_TOKENS: "512" }
+            timeoutMs: qualityMode ? 16 * 60_000 : 150_000,
+            environment: {
+                CLI_AGENT_PROFILE: qualityMode ? "deep" : "standard",
+                CLI_AGENT_MAX_TURNS: qualityMode ? "12" : "4",
+                CLI_AGENT_MAX_SEGMENTS: "1",
+                CLI_AGENT_MAX_MINUTES: qualityMode ? "15" : "2",
+                LLAMA_ACTION_MAX_TOKENS: process.env.LLAMA_ACTION_MAX_TOKENS || "512"
+            }
         });
         assert.equal(result.exitCode, 0, result.stderr);
         assert.match(result.output, /Reading file: README\.md/i);

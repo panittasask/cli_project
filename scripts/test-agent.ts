@@ -8,6 +8,7 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarific
     loadCliSettings: (root?: string) => Record<string, unknown>;
     getSamplingSettings: (settings: Record<string, unknown>, kind: "action") => Record<string, number>;
     getAgentGuardSettings: (settings: Record<string, unknown>) => {
+        profile: "quick" | "standard" | "deep";
         maxTurns: number;
         maxSegments: number;
         maxDurationMs: number;
@@ -24,8 +25,8 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (con
     parseAction: (content: string) => { action?: string; reason?: string; path?: string; old_text?: string; new_text?: string; workdir?: string } | undefined;
     explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
-    execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
-    prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string };
+    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean }>;
+    prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     close: () => Promise<void>;
 } };
 const { AgentResponseLog } = require("../cli/agentResponseLog") as { AgentResponseLog: new (logTarget?: string | { directory: string; basename: string }) => {
@@ -76,6 +77,24 @@ const { LlamaClient } = require("../cli/llamaClient") as { LlamaClient: new (api
     formatError: (error: unknown) => string;
     close: () => void;
 } };
+const { aggregateTraceSummaries, parseTraceJsonl, summarizeTraceEvents } = require("../cli/traceSummary") as {
+    parseTraceJsonl: (content: string) => Array<Record<string, unknown>>;
+    summarizeTraceEvents: (events: Array<Record<string, unknown>>) => Array<{
+        outcome: string;
+        durationMs: number;
+        modelCalls: number;
+        toolActions: number;
+        errors: number;
+        repeatedOrNoProgress: number;
+    }>;
+    aggregateTraceSummaries: (summaries: Array<Record<string, unknown>>) => {
+        tasks: number;
+        successful: number;
+        successRate: number;
+        medianSuccessfulModelCalls: number;
+        repeatedOrNoProgress: number;
+    };
+};
 
 async function testRequestCancellation(): Promise<void> {
     const server = http.createServer((_request, _response) => {
@@ -154,6 +173,36 @@ async function main(): Promise<void> {
     await testConnectionResetRetry();
     await testRequestCancellation();
 
+    const traceEvents = parseTraceJsonl([
+        JSON.stringify({ taskId: "one", turn: 1, timestamp: "2026-07-20T00:00:00.000Z", status: "ok", action: "read_file" }),
+        JSON.stringify({ taskId: "one", turn: 2, timestamp: "2026-07-20T00:01:00.000Z", status: "error", action: "repeat_guard", observation: "without file progress" }),
+        JSON.stringify({ taskId: "one", turn: 3, timestamp: "2026-07-20T00:02:00.000Z", status: "final", action: "final" }),
+        JSON.stringify({ taskId: "two", turn: 1, timestamp: "2026-07-20T00:03:00.000Z", status: "error", action: "incomplete_after_tool_limit" }),
+        "not-json"
+    ].join("\n"));
+    const traceSummaries = summarizeTraceEvents(traceEvents);
+    assert.equal(traceSummaries.length, 2);
+    assert.deepEqual(traceSummaries[0], {
+        taskId: "one",
+        outcome: "success",
+        firstTimestamp: "2026-07-20T00:00:00.000Z",
+        lastTimestamp: "2026-07-20T00:02:00.000Z",
+        durationMs: 120_000,
+        modelCalls: 3,
+        toolActions: 1,
+        events: 3,
+        errors: 1,
+        repeatedOrNoProgress: 1,
+        parseErrors: 0,
+        finalBlocked: 0
+    });
+    const aggregateTrace = aggregateTraceSummaries(traceSummaries);
+    assert.equal(aggregateTrace.tasks, 2);
+    assert.equal(aggregateTrace.successful, 1);
+    assert.equal(aggregateTrace.successRate, 0.5);
+    assert.equal(aggregateTrace.medianSuccessfulModelCalls, 3);
+    assert.equal(aggregateTrace.repeatedOrNoProgress, 1);
+
     const settings = loadCliSettings(path.resolve(__dirname, ".."));
     const configuredContextLength = settings.contextLength;
     assert.ok(typeof configuredContextLength === "number" && configuredContextLength > 0);
@@ -164,6 +213,7 @@ async function main(): Promise<void> {
         fs.copyFileSync(path.resolve(__dirname, "..", ".cli", "settings.example.json"), path.join(prototypeDirectory, "settings.example.json"));
         const prototypeSettings = loadCliSettings(settingsInitRoot);
         assert.deepEqual(getAgentGuardSettings(prototypeSettings), {
+            profile: "standard",
             maxTurns: 12,
             maxSegments: 1,
             maxDurationMs: 480_000,
@@ -185,12 +235,13 @@ async function main(): Promise<void> {
         const repeated = initializeCliSettings(settingsInitRoot);
         assert.equal(repeated.created, false);
         assert.deepEqual(loadCliSettings(settingsInitRoot), { preserved: true });
-        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, agent: { maxSegments: 0 }, sampling: { action: { top_p: 3 } } }), "utf8");
+        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, hardwareProfile: "unknown", agent: { maxSegments: 0 }, sampling: { action: { top_p: 3 } } }), "utf8");
         const invalidSettings = validateCliSettingsFile(settingsInitRoot);
         assert.equal(invalidSettings.ok, false);
         assert.match(invalidSettings.errors.join("\n"), /contextLength/);
         assert.match(invalidSettings.errors.join("\n"), /agent\.maxSegments/);
         assert.match(invalidSettings.errors.join("\n"), /sampling\.action\.top_p/);
+        assert.match(invalidSettings.errors.join("\n"), /hardwareProfile/);
     } finally {
         fs.rmSync(settingsInitRoot, { recursive: true, force: true });
     }
@@ -206,10 +257,34 @@ async function main(): Promise<void> {
             repeatLimit: 2
         }
     }), {
+        profile: "standard",
         maxTurns: 12,
         maxSegments: 1,
         maxDurationMs: 480_000,
         maxCompletionTokens: 8000,
+        repeatLimit: 2
+    });
+    assert.deepEqual(getAgentGuardSettings({ agent: {
+        profile: "quick",
+        maxTurns: 50,
+        maxSegments: 3,
+        maxDurationMinutes: 60,
+        maxCompletionTokens: 16000,
+        repeatLimit: 5
+    } }), {
+        profile: "quick",
+        maxTurns: 4,
+        maxSegments: 1,
+        maxDurationMs: 180_000,
+        maxCompletionTokens: 3000,
+        repeatLimit: 2
+    });
+    assert.deepEqual(getAgentGuardSettings({ agent: { profile: "deep" } }), {
+        profile: "deep",
+        maxTurns: 12,
+        maxSegments: 2,
+        maxDurationMs: 1_200_000,
+        maxCompletionTokens: 16000,
         repeatLimit: 2
     });
     assert.deepEqual(getClarificationSettings({ agent: {
@@ -441,6 +516,13 @@ async function main(): Promise<void> {
         assert.equal(filteredListResult.ok, true);
         assert.doesNotMatch(filteredListResult.output, /noise\.txt/);
         assert.match(filteredListResult.output, /sample\.html/);
+        const missingRead = await agent.execute({
+            action: "read_file",
+            path: path.join(path.relative(process.cwd(), editDirectory), "sample.htm")
+        });
+        assert.equal(missingRead.ok, false);
+        assert.match(missingRead.output, /Closest visible files/);
+        assert.match(missingRead.output, /sample\.html/);
         const emptyListResult = await agent.execute({
             action: "list_files",
             path: path.relative(process.cwd(), emptyDirectory)
@@ -470,7 +552,24 @@ async function main(): Promise<void> {
             new_text: "margin-top: 25px"
         });
         assert.equal(editResult.ok, true);
+        assert.equal(editResult.changed, true);
         assert.match(fs.readFileSync(editPath, "utf8"), /margin-top: 25px/);
+        const repeatedEdit = await agent.execute({
+            action: "edit_file",
+            path: relativeEditPath,
+            old_text: "margin-top: 15px",
+            new_text: "margin-top: 25px"
+        });
+        assert.equal(repeatedEdit.ok, true);
+        assert.equal(repeatedEdit.changed, false);
+        assert.match(repeatedEdit.output, /No change needed/);
+        const repeatedWrite = await agent.execute({
+            action: "write_file",
+            path: relativeEditPath,
+            content: fs.readFileSync(editPath, "utf8")
+        });
+        assert.equal(repeatedWrite.ok, true);
+        assert.equal(repeatedWrite.changed, false);
         const deletePath = path.join(editDirectory, "obsolete.txt");
         fs.writeFileSync(deletePath, "obsolete", "utf8");
         const deleteResult = await agent.execute({
@@ -546,11 +645,15 @@ async function main(): Promise<void> {
             maxTurns: 12,
             requestFormat: { type: "json_object" },
             rawContent: "plain model content",
+            durationMs: 1234,
+            usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
             parseError: "no valid JSON object found in model content"
         });
         const loggedResponse = JSON.parse(fs.readFileSync(responseLogPath, "utf8"));
         assert.equal(loggedResponse.accepted, false);
         assert.equal(loggedResponse.rawContent, "plain model content");
+        assert.equal(loggedResponse.durationMs, 1234);
+        assert.equal(loggedResponse.usage.total_tokens, 12);
         assert.equal(loggedResponse.parseError, "no valid JSON object found in model content");
         const dailyResponseLog = new AgentResponseLog({ directory: tempDirectory, basename: "daily-responses" });
         dailyResponseLog.append({

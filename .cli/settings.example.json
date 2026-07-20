@@ -1,12 +1,14 @@
 {
   "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
-  "defaultModel": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+  "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
   "contextLength": 16384,
   "device": "auto",
+  "hardwareProfile": "auto",
   "debug": false,
   "historyMessages": 6,
   "agent": {
+    "profile": "standard",
     "maxTurns": 12,
     "maxSegments": 1,
     "maxDurationMinutes": 8,

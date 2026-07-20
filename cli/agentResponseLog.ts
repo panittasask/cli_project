@@ -13,6 +13,9 @@ type AgentResponseLogEntry = {
     finishReason?: unknown;
     parsedAction?: string | undefined;
     parseError?: string | undefined;
+    durationMs?: number | undefined;
+    usage?: unknown;
+    timings?: unknown;
 };
 
 class AgentResponseLog {
