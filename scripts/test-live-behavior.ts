@@ -7,9 +7,9 @@ const { runAgentCliHarness } = require("./agent-cli-harness") as {
     runAgentCliHarness: (options: Record<string, unknown>) => Promise<{ output: string; stderr: string; exitCode: number }>;
 };
 
-async function slotAvailable(): Promise<boolean> {
+async function slotAvailable(apiUrl: string): Promise<boolean> {
     return new Promise((resolve) => {
-        const request = http.get("http://127.0.0.1:8080/slots", { timeout: 3_000 }, (response) => {
+        const request = http.get(new URL("/slots", apiUrl), { timeout: 3_000 }, (response) => {
             let body = "";
             response.on("data", (chunk) => { body += chunk; });
             response.on("end", () => {
@@ -25,7 +25,9 @@ async function slotAvailable(): Promise<boolean> {
 }
 
 async function main(): Promise<void> {
-    if (!(await slotAvailable())) {
+    const apiUrl = process.env.LLAMA_API_URL?.trim() || "http://127.0.0.1:8080/v1/chat/completions";
+    const qualityMode = process.env.LOCAL_EVAL_MODE?.trim().toLowerCase() === "quality";
+    if (!(await slotAvailable(apiUrl))) {
         console.log("Live behavior replay skipped: llama.cpp is unavailable or busy.");
         return;
     }
@@ -69,14 +71,15 @@ async function main(): Promise<void> {
         const result = await runAgentCliHarness({
             appRoot: root,
             workspace,
-            apiUrl: "http://127.0.0.1:8080/v1/chat/completions",
+            apiUrl,
             prompt: "แก้ปัญหาที่กด Details แล้วหน้าไม่เปลี่ยน ตรวจ implementation ที่เกี่ยวข้อง แก้ให้เสร็จ และรัน interaction test ยืนยันผล",
-            timeoutMs: 300_000,
+            timeoutMs: qualityMode ? 16 * 60_000 : 300_000,
             environment: {
-                CLI_AGENT_MAX_TURNS: "30",
+                CLI_AGENT_PROFILE: qualityMode ? "deep" : "standard",
+                CLI_AGENT_MAX_TURNS: "12",
                 CLI_AGENT_MAX_SEGMENTS: "1",
-                CLI_AGENT_MAX_MINUTES: "4",
-                LLAMA_ACTION_MAX_TOKENS: "1024"
+                CLI_AGENT_MAX_MINUTES: qualityMode ? "15" : "4",
+                LLAMA_ACTION_MAX_TOKENS: process.env.LLAMA_ACTION_MAX_TOKENS || "512"
             }
         });
         assert.equal(result.exitCode, 0, result.stderr);

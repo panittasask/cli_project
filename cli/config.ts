@@ -17,9 +17,11 @@ type CliSettings = {
     defaultModel?: string;
     contextLength?: number;
     device?: string;
+    hardwareProfile?: "auto" | "intel-arc" | "rtx-4070-super" | "default";
     debug?: boolean;
     historyMessages?: number;
     agent?: {
+        profile?: AgentBudgetProfile;
         maxTurns?: number;
         maxSegments?: number;
         maxDurationMinutes?: number;
@@ -47,6 +49,40 @@ type ProjectCheckProvider = {
 };
 
 type SamplingKind = "chat" | "planner" | "action";
+type AgentBudgetProfile = "quick" | "standard" | "deep";
+
+type AgentBudgetSettings = {
+    profile: AgentBudgetProfile;
+    maxTurns: number;
+    maxSegments: number;
+    maxDurationMs: number;
+    maxCompletionTokens: number;
+    repeatLimit: number;
+};
+
+const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, "profile">> = {
+    quick: {
+        maxTurns: 4,
+        maxSegments: 1,
+        maxDurationMs: 3 * 60_000,
+        maxCompletionTokens: 3000,
+        repeatLimit: 2
+    },
+    standard: {
+        maxTurns: 12,
+        maxSegments: 1,
+        maxDurationMs: 8 * 60_000,
+        maxCompletionTokens: 8000,
+        repeatLimit: 2
+    },
+    deep: {
+        maxTurns: 12,
+        maxSegments: 2,
+        maxDurationMs: 20 * 60_000,
+        maxCompletionTokens: 16000,
+        repeatLimit: 2
+    }
+};
 
 const defaults: Record<SamplingKind, SamplingSettings> = {
     chat: {
@@ -140,12 +176,27 @@ function validateCliSettings(input: unknown): string[] {
     for (const field of ["llamaCppPath", "modelPath", "defaultModel", "device"]) {
         if (settings[field] !== undefined && (typeof settings[field] !== "string" || !String(settings[field]).trim())) errors.push(`${field} must be a non-empty string`);
     }
+    if (settings.hardwareProfile !== undefined && (typeof settings.hardwareProfile !== "string"
+        || !["auto", "intel-arc", "rtx-4070-super", "default"].includes(settings.hardwareProfile))) {
+        errors.push("hardwareProfile must be auto, intel-arc, rtx-4070-super, or default");
+    }
 
     if (settings.agent !== undefined && (!settings.agent || typeof settings.agent !== "object" || Array.isArray(settings.agent))) {
         errors.push("agent must be an object");
     } else if (settings.agent) {
         const agent = settings.agent as Record<string, unknown>;
-        for (const field of ["maxTurns", "maxSegments", "maxDurationMinutes", "maxCompletionTokens", "repeatLimit"]) numberField(agent, field, `agent.${field}`, 1);
+        const profile = typeof agent.profile === "string" && ["quick", "standard", "deep"].includes(agent.profile)
+            ? agent.profile as AgentBudgetProfile
+            : "standard";
+        if (agent.profile !== undefined && (typeof agent.profile !== "string" || !["quick", "standard", "deep"].includes(agent.profile))) {
+            errors.push("agent.profile must be quick, standard, or deep");
+        }
+        const budget = agentBudgetProfiles[profile];
+        numberField(agent, "maxTurns", "agent.maxTurns", 1, budget.maxTurns);
+        numberField(agent, "maxSegments", "agent.maxSegments", 1, budget.maxSegments);
+        numberField(agent, "maxDurationMinutes", "agent.maxDurationMinutes", 1, budget.maxDurationMs / 60_000);
+        numberField(agent, "maxCompletionTokens", "agent.maxCompletionTokens", 256, budget.maxCompletionTokens);
+        numberField(agent, "repeatLimit", "agent.repeatLimit", 2, budget.repeatLimit);
         numberField(agent, "maxClarifications", "agent.maxClarifications", 0);
         booleanField(agent, "requireInspectionBeforeClarification", "agent.requireInspectionBeforeClarification");
         booleanField(agent, "secondClarificationRequiresBlocker", "agent.secondClarificationRequiresBlocker");
@@ -231,14 +282,34 @@ function getSamplingSettings(settings: CliSettings, kind: SamplingKind): Samplin
     };
 }
 
-function getAgentGuardSettings(settings: CliSettings): { maxTurns: number; maxSegments: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number } {
+function getAgentGuardSettings(settings: CliSettings): AgentBudgetSettings {
     const configured = settings.agent ?? {};
+    const requestedProfile = process.env.CLI_AGENT_PROFILE?.trim().toLowerCase() || configured.profile || "standard";
+    const profile: AgentBudgetProfile = requestedProfile === "quick" || requestedProfile === "deep"
+        ? requestedProfile
+        : "standard";
+    const budget = agentBudgetProfiles[profile];
+    const boundedInteger = (envName: string, configuredValue: number | undefined, fallback: number, maximum: number, minimum = 1): number => (
+        Math.min(maximum, Math.max(minimum, Math.floor(readNumber(envName, configuredValue ?? fallback))))
+    );
     return {
-        maxTurns: Math.max(1, Math.floor(readNumber("CLI_AGENT_MAX_TURNS", configured.maxTurns ?? 12))),
-        maxSegments: Math.max(1, Math.floor(readNumber("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments ?? 1))),
-        maxDurationMs: Math.max(10_000, readNumber("CLI_AGENT_MAX_MINUTES", configured.maxDurationMinutes ?? 8) * 60_000),
-        maxCompletionTokens: Math.max(256, Math.floor(readNumber("CLI_AGENT_MAX_COMPLETION_TOKENS", configured.maxCompletionTokens ?? 8000))),
-        repeatLimit: Math.max(2, Math.floor(readNumber("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit ?? 2)))
+        profile,
+        maxTurns: boundedInteger("CLI_AGENT_MAX_TURNS", configured.maxTurns, budget.maxTurns, budget.maxTurns),
+        maxSegments: boundedInteger("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments, budget.maxSegments, budget.maxSegments),
+        maxDurationMs: boundedInteger(
+            "CLI_AGENT_MAX_MINUTES",
+            configured.maxDurationMinutes,
+            budget.maxDurationMs / 60_000,
+            budget.maxDurationMs / 60_000
+        ) * 60_000,
+        maxCompletionTokens: boundedInteger(
+            "CLI_AGENT_MAX_COMPLETION_TOKENS",
+            configured.maxCompletionTokens,
+            budget.maxCompletionTokens,
+            budget.maxCompletionTokens,
+            256
+        ),
+        repeatLimit: boundedInteger("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit, budget.repeatLimit, budget.repeatLimit, 2)
     };
 }
 

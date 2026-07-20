@@ -55,12 +55,14 @@ Prototype contents:
 {
   "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
-  "defaultModel": "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+  "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
   "contextLength": 16384,
   "device": "auto",
+  "hardwareProfile": "auto",
   "debug": true,
   "historyMessages": 6,
   "agent": {
+    "profile": "standard",
     "maxTurns": 12,
     "maxSegments": 1,
     "maxDurationMinutes": 8,
@@ -83,7 +85,7 @@ Prototype contents:
   "sampling": {
     "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
     "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
-    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 4096 }
+    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 2048 }
   }
 }
 ```
@@ -94,7 +96,7 @@ exists. Important built-in path defaults are:
 
 - llama.cpp directory: `D:\llama.cpp\llama-b10012-bin-win-sycl-x64`
 - API URL: `http://127.0.0.1:8080/v1/chat/completions`
-- model: `qwen2.5-coder-14b-instruct-q4_k_m.gguf`
+- model: `Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf`
 
 Optional overrides:
 
@@ -102,9 +104,11 @@ Optional overrides:
 $env:LLAMA_CPP_DIR = "D:\path\to\llama.cpp"
 $env:LLAMA_MODEL_DIR = "D:\path\to\models"
 $env:LLAMA_DEVICE = "CUDA0"
+$env:LLAMA_HARDWARE_PROFILE = "rtx-4070-super"
 $env:LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 $env:LLAMA_MODEL = "another-model.gguf"
 $env:LLAMA_CONTEXT_LENGTH = "65536"
+$env:CLI_AGENT_PROFILE = "deep"
 $env:CLI_AGENT_MAX_SEGMENTS = "2"
 $env:CLI_AGENT_MAX_CLARIFICATIONS = "2"
 ```
@@ -119,26 +123,48 @@ With `device` set to `auto`, the launcher asks the configured `llama-server.exe`
 which accelerator devices it provides and selects the first one. This lets the
 same setting work with CUDA, Vulkan, and SYCL builds. Set `LLAMA_DEVICE` to a
 specific ID such as `CUDA0`, `Vulkan0`, or `SYCL0` when an explicit override is
-needed.
+needed. The selected llama.cpp build must support that backend: use a SYCL build
+for Intel Arc or a CUDA build for the RTX 4070 SUPER, and point
+`LLAMA_CPP_DIR` at the matching build when switching cards.
 
 Sampling values can be overridden per profile with variables such as
 `LLAMA_CHAT_TEMPERATURE`, `LLAMA_PLANNER_MAX_TOKENS`, and
 `LLAMA_ACTION_TOP_K`. Set `CLI_DEBUG=1` to show the concise agent trace.
-Agent loop limits live under `agent` in settings and can be overridden with
+Agent budgets use `quick`, `standard`, and `deep` profiles. `standard` is the
+normal 12-turn, 8-minute profile; `deep` is explicit and bounded to two
+12-turn segments and 20 minutes. Values above the selected profile's ceiling
+are clamped rather than allowing a task to loop indefinitely. Agent loop limits
+live under `agent` in settings and can be overridden within the selected profile with
 `CLI_AGENT_MAX_TURNS`, `CLI_AGENT_MAX_SEGMENTS`, `CLI_AGENT_MAX_MINUTES`,
 `CLI_AGENT_MAX_COMPLETION_TOKENS`, and `CLI_AGENT_REPEAT_LIMIT`.
 The HTTP client timeout is kept slightly above the wall-clock budget so the
 user-visible Agent guard, rather than a generic five-minute Axios timeout,
 explains why a long request stopped.
 
-Launchers apply conservative runtime profiles after device auto-detection:
-CUDA uses batch/ubatch `1024/512`, SYCL uses `256/128`, and Vulkan uses
-`512/256`. Accelerator launches leave GPU layers on llama.cpp's automatic
-setting, enable memory fitting with a 1024 MiB margin, and allow context fitting
-down to 4,096 tokens. SYCL also uses q8 KV caches so long contexts consume less
-device memory. The launchers never force full `-ngl all` offload because that
+Launchers inspect both the backend ID and device description. They automatically
+select `intel-arc` for an Intel Arc device and `rtx-4070-super` for that NVIDIA
+card; set `hardwareProfile` or `LLAMA_HARDWARE_PROFILE` to force one. Recommended
+starting values are:
+
+| Hardware preset | Backend | Context | Batch / ubatch | KV cache |
+| --- | --- | ---: | ---: | --- |
+| Intel Arc | SYCL | 16,384 | 512 / 256 | q8_0 |
+| RTX 4070 SUPER | CUDA | 16,384 | 1024 / 512 | q8_0 |
+| Generic Vulkan | Vulkan | measured per device | 512 / 256 | f16 |
+
+The Arc value was measured on the local Arc 140T 16 GB: changing ubatch from
+128 to 256 raised pp512 from 86.02 to 116.65 tokens/second while tg128 remained
+stable at 7.63–7.74 tokens/second. The RTX preset uses q8 KV because the card has
+12 GB VRAM and the selected 14B-class Q4 model plus a long f16 KV cache can leave
+little room for compute buffers. Intel Arc desktop cards vary between 8 GB and
+16 GB; on an 8 GB model, prefer a 7B-class Q4 model or expect partial CPU offload.
+
+Accelerator launches leave GPU layers on llama.cpp's automatic setting, enable
+memory fitting with a 1024 MiB margin, and allow context fitting down to 4,096
+tokens. The launchers never force full `-ngl all` offload because that
 prevents recovery when model weights, KV cache, and compute buffers do not fit.
-`LLAMA_BATCH_SIZE` and `LLAMA_UBATCH_SIZE` override these values. Run
+`LLAMA_BATCH_SIZE`, `LLAMA_UBATCH_SIZE`, `LLAMA_KV_CACHE_TYPE`,
+`LLAMA_FIT_TARGET_MIB`, and `LLAMA_FIT_CONTEXT` override these values. Run
 `npm run benchmark:hardware` for an opt-in llama-bench run; startup never
 benchmarks automatically.
 
@@ -278,8 +304,36 @@ npm run baseline:agent
 The first command tests the baseline questions and stores model, server
 properties, chat template information exposed by llama.cpp, sampling, and
 answers under `.cli/logs/baseline-model-*.json`. The second repeats the same
-agent action request five times and records JSON validity, tool selection
+agent action request five times by default and records JSON validity, tool selection
 stability, and concise-reason coverage under `.cli/logs/baseline-agent-*.json`.
+
+Run the bounded local evaluation suite with an isolated llama.cpp server:
+
+```powershell
+npm run eval:local -- --model qwen2.5-coder-14b-instruct-q4_k_m.gguf
+```
+
+Use `--probes protocol,read,coding,invoice` to select individual probes when reproducing
+a failure; the three core probes run by default.
+
+Add `--mode quality` to compare correctness with equal 12-turn/action-token
+budgets and a generous 15-minute task limit. Quality mode still records duration
+but does not use it as the model-ranking signal. Practical mode remains the
+default and uses the normal wall-clock budgets.
+
+The runner selects a free localhost port, waits for both `/health` and
+`/v1/models`, runs the agent-protocol, read-only E2E, and focused coding E2E
+probes, then terminates the server process tree. It writes one comparison report
+plus server logs under `.cli/logs/`; startup failures and probe timeouts are
+reported separately from model failures.
+
+Summarize all dated agent traces into task-level success, duration, model-call,
+tool-action, error, and no-progress metrics with:
+
+```powershell
+npm run report:agent
+npm run report:agent -- --json
+```
 
 Run `npm test` for the complete offline suite: agent protocol, context/router,
 write validators, web relevance, MCP discovery/tool invocation, deterministic

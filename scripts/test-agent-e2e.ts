@@ -69,6 +69,21 @@ async function main(): Promise<void> {
         fs.rmSync(mutation.root, { recursive: true, force: true });
     }
 
+    const alreadySatisfied = await runScenario([
+        { action: "read_file", path: "status.txt", reason: "Inspect the requested target." },
+        { action: "edit_file", path: "status.txt", old_text: "status=old", new_text: "status=ready", reason: "Apply the requested state if needed." },
+        { action: "final", answer: "status.txt อยู่ในสถานะ ready อยู่แล้ว จึงไม่ต้องเขียนซ้ำ", reason: "The requested state is already verified." }
+    ], "ตั้ง status.txt ให้เป็น status=ready", (root) => {
+        fs.writeFileSync(path.join(root, "status.txt"), "status=ready", "utf8");
+    });
+    try {
+        assert.equal(fs.readFileSync(path.join(alreadySatisfied.root, "status.txt"), "utf8"), "status=ready");
+        assert.match(alreadySatisfied.output, /AI: status\.txt อยู่ในสถานะ ready อยู่แล้ว/);
+        assert.equal(fs.existsSync(path.join(alreadySatisfied.root, ".cli", "checkpoints.json")), false);
+    } finally {
+        fs.rmSync(alreadySatisfied.root, { recursive: true, force: true });
+    }
+
     const clarification = await runScenario([
         { action: "read_file", path: "README.md", reason: "Inspect general documentation." },
         {

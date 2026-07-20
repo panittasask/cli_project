@@ -2,6 +2,7 @@ type CompactState = {
     segment: number;
     maxSegments: number;
     writtenPaths: string[];
+    satisfiedPaths?: string[];
     validationFailures: string[];
     unresolvedVerificationFailure?: string;
     verificationRequirement?: "none" | "command" | "runtime";
@@ -20,6 +21,7 @@ function buildCompactedAgentMessages(
         `Original user request: ${originalRequest}`,
         `Continuation segment: ${state.segment}/${state.maxSegments}`,
         `Successful file changes: ${state.writtenPaths.join(", ") || "none"}`,
+        `Requested file state already satisfied without a write: ${state.satisfiedPaths?.join(", ") || "none"}`,
         `Validation failures: ${state.validationFailures.join(", ") || "none"}`,
         `Unresolved verification failure: ${state.unresolvedVerificationFailure || "none"}`,
         `Required verification: ${state.verificationRequirement || "none"}`,

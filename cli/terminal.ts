@@ -54,7 +54,7 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarific
     initializeCliSettings: (appRoot?: string) => { created: boolean; path: string; message: string };
     validateCliSettingsFile: (appRoot?: string) => { ok: boolean; path: string; source: string; errors: string[] };
 };
-type AgentGuardSettings = { maxTurns: number; maxSegments: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
+type AgentGuardSettings = { profile: "quick" | "standard" | "deep"; maxTurns: number; maxSegments: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
 type ClarificationSettings = { maxClarifications: number; requireInspection: boolean; secondRequiresBlocker: boolean };
 type ProjectCheckProvider = import("./projectTypes").ProjectCheckProvider;
 const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: AgentGuardSettings) => {
@@ -110,6 +110,9 @@ const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog
         finishReason?: unknown;
         parsedAction?: string | undefined;
         parseError?: string | undefined;
+        durationMs?: number | undefined;
+        usage?: unknown;
+        timings?: unknown;
     }) => void;
 } };
 const { resolveJsonlLogPath } = require("./dailyLog") as {
@@ -123,6 +126,7 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
             segment: number;
             maxSegments: number;
             writtenPaths: string[];
+            satisfiedPaths?: string[];
             validationFailures: string[];
             unresolvedVerificationFailure?: string;
             verificationRequirement?: "none" | "command" | "runtime";
@@ -255,9 +259,9 @@ const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRo
     buildSystemPrompt: (workflowInstructions?: string) => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
-    execute: (action: unknown) => Promise<{ ok: boolean; output: string }>;
+    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean }>;
     inspectCapabilities: () => Promise<{ servers: Array<Record<string, unknown>> }>;
-    prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string };
+    prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     formatObservation: (action: unknown, result: { ok: boolean; output: string }) => string;
@@ -325,9 +329,10 @@ type CliSettings = {
     defaultModel?: string;
     contextLength?: number;
     device?: string;
+    hardwareProfile?: "auto" | "intel-arc" | "rtx-4070-super" | "default";
     debug?: boolean;
     historyMessages?: number;
-    agent?: { maxTurns?: number; maxSegments?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number; maxClarifications?: number; requireInspectionBeforeClarification?: boolean; secondClarificationRequiresBlocker?: boolean };
+    agent?: { profile?: "quick" | "standard" | "deep"; maxTurns?: number; maxSegments?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number; maxClarifications?: number; requireInspectionBeforeClarification?: boolean; secondClarificationRequiresBlocker?: boolean };
     projectChecks?: ProjectCheckProvider[];
     sampling?: Partial<Record<"chat" | "planner" | "action", Partial<SamplingSettings>>>;
 };
@@ -450,7 +455,7 @@ const llamaClient = new LlamaClient(apiUrl, agentGuardSettings.maxDurationMs + 5
 const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
-    || "qwen2.5-coder-14b-instruct-q4_k_m.gguf";
+    || "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf";
 const configuredContextValue = Number(
     process.env.LLAMA_CONTEXT_LENGTH?.trim() || cliSettings.contextLength || 16384
 );
@@ -678,6 +683,7 @@ function settingSource(envName: string, configured: boolean): string {
 function printEffectiveSettings(): void {
     const agent = cliSettings.agent ?? {};
     const rows: Array<[string, string | number | boolean, string]> = [
+        ["agent.profile", agentGuardSettings.profile, settingSource("CLI_AGENT_PROFILE", agent.profile !== undefined)],
         ["agent.maxTurns", agentGuardSettings.maxTurns, settingSource("CLI_AGENT_MAX_TURNS", agent.maxTurns !== undefined)],
         ["agent.maxSegments", agentGuardSettings.maxSegments, settingSource("CLI_AGENT_MAX_SEGMENTS", agent.maxSegments !== undefined)],
         ["agent.maxDurationMinutes", Math.round(agentGuardSettings.maxDurationMs / 60_000), settingSource("CLI_AGENT_MAX_MINUTES", agent.maxDurationMinutes !== undefined)],
@@ -686,7 +692,8 @@ function printEffectiveSettings(): void {
         ["agent.maxClarifications", clarificationSettings.maxClarifications, settingSource("CLI_AGENT_MAX_CLARIFICATIONS", agent.maxClarifications !== undefined)],
         ["agent.requireInspectionBeforeClarification", clarificationSettings.requireInspection, settingSource("CLI_AGENT_REQUIRE_INSPECTION_BEFORE_CLARIFICATION", agent.requireInspectionBeforeClarification !== undefined)],
         ["agent.secondClarificationRequiresBlocker", clarificationSettings.secondRequiresBlocker, settingSource("CLI_AGENT_SECOND_CLARIFICATION_REQUIRES_BLOCKER", agent.secondClarificationRequiresBlocker !== undefined)],
-        ["contextLength", configuredContextLength, settingSource("LLAMA_CONTEXT_LENGTH", cliSettings.contextLength !== undefined)]
+        ["contextLength", configuredContextLength, settingSource("LLAMA_CONTEXT_LENGTH", cliSettings.contextLength !== undefined)],
+        ["hardwareProfile", process.env.LLAMA_HARDWARE_PROFILE?.trim() || cliSettings.hardwareProfile || "auto", settingSource("LLAMA_HARDWARE_PROFILE", cliSettings.hardwareProfile !== undefined)]
     ];
     console.log("Effective settings:");
     rows.forEach(([name, value, source]) => console.log(`  ${name}: ${value} [${source}]`));
@@ -1307,6 +1314,7 @@ async function runAgentLoop(
     const answeredClarifications = new Map<string, Record<string, unknown>>();
     const contextInspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }> = [];
     const writtenPaths = new Set<string>();
+    const satisfiedPaths = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
     let mcpCallsDisabled = false;
@@ -1317,6 +1325,22 @@ async function runAgentLoop(
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
     const trace = new AgentTrace(traceTarget, taskId);
     const responseLog = new AgentResponseLog(responseTarget, taskId);
+    trace.add({
+        turn: 0,
+        status: "action",
+        action: "task_start",
+        observation: JSON.stringify({
+            workflow: workflow.kind,
+            verificationRequirement,
+            evidence: acceptance.evidence,
+            model,
+            contextLength: activeContextLength,
+            agentProfile: agentGuardSettings.profile,
+            maxTurns,
+            maxDurationMs: agentGuardSettings.maxDurationMs
+        })
+    });
+    trace.save();
     const responseLogDisplayPath = path.relative(appRoot, resolveJsonlLogPath(responseTarget));
     const buildCurrentSystemPrompt = (): Promise<string> => agentTool.buildSystemPrompt([
         workflowInstructions(workflow.kind),
@@ -1352,6 +1376,7 @@ async function runAgentLoop(
                 segment,
                 maxSegments,
                 writtenPaths: Array.from(writtenPaths),
+                satisfiedPaths: Array.from(satisfiedPaths),
                 validationFailures: Array.from(validationFailures),
                 ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {}),
                 verificationRequirement,
@@ -1384,6 +1409,7 @@ async function runAgentLoop(
             ? `Planning next action (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`
             : `Reviewing results (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`);
 
+        const modelStartedAt = Date.now();
         const response = await llamaClient.post({
             model,
             messages,
@@ -1425,7 +1451,10 @@ async function runAgentLoop(
             reasoningContent: choice.message.reasoning_content,
             finishReason: choice.finish_reason,
             parsedAction: action?.action,
-            parseError
+            parseError,
+            durationMs: Date.now() - modelStartedAt,
+            usage: response.data.usage,
+            timings: response.data.timings
         });
 
         messages.push({
@@ -1635,7 +1664,7 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            if (mustWrite && writtenPaths.size === 0) {
+            if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0) {
                 rejectFinal(
                     "this request requires a successful file write",
                     "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
@@ -1886,14 +1915,19 @@ async function runAgentLoop(
             : undefined;
         let mutationCheckpointId: string | undefined;
         if (action.action === "write_file" && action.path && typeof action.content === "string") {
-            const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, action.content);
-            mutationCheckpointId = checkpoint.id;
-            spinner.log(checkpoint.preview);
-            spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+            const absolute = path.resolve(activeWorkspace, action.path);
+            const alreadyMatches = fs.existsSync(absolute) && fs.statSync(absolute).isFile()
+                && fs.readFileSync(absolute, "utf8") === action.content;
+            if (!alreadyMatches) {
+                const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, action.content);
+                mutationCheckpointId = checkpoint.id;
+                spinner.log(checkpoint.preview);
+                spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+            }
         }
         if (action.action === "edit_file" && action.path && typeof action.old_text === "string" && typeof action.new_text === "string") {
             const prepared = agentTool.prepareEdit(action.path, action.old_text, action.new_text);
-            if (prepared.ok && prepared.content !== undefined) {
+            if (prepared.ok && prepared.content !== undefined && prepared.changed !== false) {
                 const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, prepared.content);
                 mutationCheckpointId = checkpoint.id;
                 spinner.log(checkpoint.preview);
@@ -1991,11 +2025,12 @@ async function runAgentLoop(
             }
             result = {
                 ok: validation.ok,
+                ...(result.changed !== undefined ? { changed: result.changed } : {}),
                 output: `${result.output}\nValidator: ${validation.validator}\n${validation.output}${diagnosticGuidance ? `\nRecovery guidance: ${diagnosticGuidance}` : ""}${diagnosticSourceContext ? `\n${diagnosticSourceContext}` : ""}${rollback?.ok ? `\nMutation rolled back because it introduced additional validation failures. ${rollback.message} The failed ${action.action} action is quarantined until a different mutation persists.` : ""}`
             };
             if (validation.ok || rollback?.ok) validationFailures.delete(action.path);
             else validationFailures.add(action.path);
-            if (!rollback?.ok) {
+            if (!rollback?.ok && result.changed !== false) {
                 guard.recordFileProgress();
                 writtenPaths.add(action.path);
                 projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
@@ -2008,6 +2043,11 @@ async function runAgentLoop(
                 if (workflow.kind === "mcp_creation") {
                     successfulMcpDiscovery = false;
                     successfulMcpCall = false;
+                }
+            } else if (validation.ok && result.changed === false) {
+                satisfiedPaths.add(action.path);
+                if (verificationRequirement === "none" && !projectRequirement) {
+                    recoveryResponseFormat = getAgentFinalResponseFormat();
                 }
             }
         }
@@ -2116,7 +2156,7 @@ async function runAgentLoop(
     }
 
     const toolLimitBlockers: string[] = [];
-    if (mustWrite && writtenPaths.size === 0) toolLimitBlockers.push("no successful workspace change was recorded");
+    if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0) toolLimitBlockers.push("no successful workspace change or already-satisfied target was recorded");
     if (validationFailures.size > 0) toolLimitBlockers.push(`validation failing for ${Array.from(validationFailures).join(", ")}`);
     if (unresolvedVerificationFailure) toolLimitBlockers.push(`latest verification failed: ${unresolvedVerificationFailure}`);
     projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
@@ -2165,6 +2205,7 @@ Do not call another tool. Do not claim unverified success.`
     });
 
     try {
+        const modelStartedAt = Date.now();
         const response = await llamaClient.post({
             model,
             messages,
@@ -2191,7 +2232,10 @@ Do not call another tool. Do not claim unverified success.`
             reasoningContent: choice.message.reasoning_content,
             finishReason: choice.finish_reason,
             parsedAction: finalAction?.action,
-            parseError: finalAction ? undefined : agentTool.explainParseFailure(assistantContent)
+            parseError: finalAction ? undefined : agentTool.explainParseFailure(assistantContent),
+            durationMs: Date.now() - modelStartedAt,
+            usage: response.data.usage,
+            timings: response.data.timings
         });
 
         if (finalAction?.action === "final" && finalAction.answer?.trim()) {

@@ -84,6 +84,7 @@ type AgentAction = (
 type AgentToolResult = {
     ok: boolean;
     output: string;
+    changed?: boolean;
 };
 
 class AgentTool {
@@ -452,11 +453,11 @@ ${mcpSection}`;
                 const writeTarget = this.resolveInsideWorkspace(action.path);
                 if (fs.existsSync(writeTarget) && fs.statSync(writeTarget).isFile()
                     && fs.readFileSync(writeTarget, "utf8") === action.content) {
-                    return { ok: false, output: `No file change: ${action.path} already has the requested content.` };
+                    return { ok: true, changed: false, output: `No change needed: ${action.path} already has the requested content.` };
                 }
 
                 this.writeFile(action.path, action.content);
-                return { ok: true, output: `Wrote ${action.path}` };
+                return { ok: true, changed: true, output: `Wrote ${action.path}` };
             }
 
             if (action.action === "edit_file") {
@@ -469,19 +470,19 @@ ${mcpSection}`;
                 }
                 const editTarget = this.resolveInsideWorkspace(action.path);
                 if (fs.readFileSync(editTarget, "utf8") === prepared.content) {
-                    return { ok: false, output: `No file change: ${action.path} already has the requested content.` };
+                    return { ok: true, changed: false, output: `No change needed: ${action.path} already contains the requested replacement.` };
                 }
                 this.writeFile(action.path, prepared.content);
-                return { ok: true, output: `Edited ${action.path} with one exact replacement` };
+                return { ok: true, changed: true, output: `Edited ${action.path} with one exact replacement` };
             }
 
             if (action.action === "delete_file") {
                 if (!action.path.trim()) return { ok: false, output: "Missing file path." };
                 const resolved = this.resolveInsideWorkspace(action.path);
-                if (!fs.existsSync(resolved)) return { ok: false, output: `File not found: ${action.path}` };
+                if (!fs.existsSync(resolved)) return { ok: false, output: this.missingFileMessage(action.path) };
                 if (!fs.statSync(resolved).isFile()) return { ok: false, output: `delete_file only removes files: ${action.path}` };
                 fs.rmSync(resolved);
-                return { ok: true, output: `Deleted ${action.path}` };
+                return { ok: true, changed: true, output: `Deleted ${action.path}` };
             }
 
             if (action.action === "mcp_list_tools") {
@@ -518,16 +519,27 @@ ${mcpSection}`;
         await this.mcpTool.close();
     }
 
-    prepareEdit(inputPath: string, oldText: string, newText: string): { ok: boolean; output: string; content?: string } {
+    prepareEdit(inputPath: string, oldText: string, newText: string): { ok: boolean; output: string; content?: string; changed?: boolean } {
         if (!inputPath.trim()) return { ok: false, output: "Missing file path." };
         if (!oldText) return { ok: false, output: "edit_file old_text must not be empty." };
 
         const resolved = this.resolveInsideWorkspace(inputPath);
         if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-            return { ok: false, output: `File not found: ${inputPath}` };
+            return { ok: false, output: this.missingFileMessage(inputPath) };
         }
         const current = fs.readFileSync(resolved, "utf8");
         const matchCount = current.split(oldText).length - 1;
+        if (matchCount === 0 && newText) {
+            const replacementCount = current.split(newText).length - 1;
+            if (replacementCount === 1) {
+                return {
+                    ok: true,
+                    changed: false,
+                    output: `Replacement is already present in ${inputPath}.`,
+                    content: current
+                };
+            }
+        }
         if (matchCount !== 1) {
             return {
                 ok: false,
@@ -536,7 +548,13 @@ ${mcpSection}`;
                     : `edit_file old_text matched ${matchCount} locations in ${inputPath}; provide more surrounding text so it matches exactly once.`
             };
         }
-        return { ok: true, output: "Exact replacement prepared.", content: current.replace(oldText, newText) };
+        const content = current.replace(oldText, newText);
+        return {
+            ok: true,
+            changed: content !== current,
+            output: content === current ? `Replacement is already present in ${inputPath}.` : "Exact replacement prepared.",
+            content
+        };
     }
 
     formatActionStatus(action: AgentAction, turn: number, maxTurns: number): string {
@@ -579,6 +597,7 @@ ${mcpSection}`;
             status,
             output
         };
+        if (result.changed !== undefined) observation.changed = result.changed;
 
         if (action.action === "mcp_call_tool" && action.tool.toLowerCase().includes("search")) {
             observation.requiredFollowup = result.ok
@@ -639,7 +658,7 @@ ${mcpSection}`;
         const resolved = this.resolveInsideWorkspace(inputPath);
 
         if (!fs.existsSync(resolved)) {
-            throw new Error(`File not found: ${inputPath}`);
+            throw new Error(this.missingFileMessage(inputPath));
         }
 
         const stat = fs.statSync(resolved);
@@ -954,6 +973,55 @@ ${mcpSection}`;
         } catch {
             return false;
         }
+    }
+
+    private missingFileMessage(inputPath: string): string {
+        const files: string[] = [];
+        this.walk(process.cwd(), files);
+        const normalizedTarget = inputPath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+        const targetName = path.posix.basename(normalizedTarget);
+        const targetDirectory = path.posix.dirname(normalizedTarget);
+        const targetExtension = path.posix.extname(targetName);
+        const targetSegments = targetDirectory === "." ? [] : targetDirectory.split("/");
+        const commonDirectorySuffix = (candidate: string): number => {
+            const candidateSegments = path.posix.dirname(candidate).split("/");
+            let shared = 0;
+            while (shared < targetSegments.length && shared < candidateSegments.length
+                && targetSegments[targetSegments.length - shared - 1] === candidateSegments[candidateSegments.length - shared - 1]) {
+                shared += 1;
+            }
+            return shared;
+        };
+        const distance = (left: string, right: string): number => {
+            const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+            for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+                const current = [leftIndex];
+                for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+                    current[rightIndex] = Math.min(
+                        (current[rightIndex - 1] ?? 0) + 1,
+                        (previous[rightIndex] ?? 0) + 1,
+                        (previous[rightIndex - 1] ?? 0) + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1)
+                    );
+                }
+                previous.splice(0, previous.length, ...current);
+            }
+            return previous[right.length] ?? Math.max(left.length, right.length);
+        };
+        const candidates = files
+            .map((file) => file.replace(/\\/g, "/"))
+            .map((file) => {
+                const name = path.posix.basename(file).toLowerCase();
+                const exactNameBonus = name === targetName ? -30 : 0;
+                const extensionBonus = targetExtension && path.posix.extname(name) === targetExtension ? -4 : 0;
+                const directoryBonus = commonDirectorySuffix(file.toLowerCase()) * -5;
+                return { file, score: distance(targetName, name) * 4 + exactNameBonus + extensionBonus + directoryBonus };
+            })
+            .sort((left, right) => left.score - right.score || left.file.length - right.file.length || left.file.localeCompare(right.file))
+            .slice(0, 5)
+            .map((candidate) => candidate.file);
+        return candidates.length > 0
+            ? `File not found: ${inputPath}\nClosest visible files (verify the intended target before editing):\n${candidates.map((file) => `- ${file}`).join("\n")}`
+            : `File not found: ${inputPath}`;
     }
 
     private resolveInsideWorkspace(inputPath: string): string {

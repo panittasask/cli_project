@@ -19,6 +19,7 @@ $settings = Get-CliSettings
 $llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b10012-bin-win-sycl-x64" }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($settings.modelPath) { $settings.modelPath } else { "D:\Model" }
 $requestedLlamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "auto" }
+$requestedHardwareProfile = if ($env:LLAMA_HARDWARE_PROFILE) { $env:LLAMA_HARDWARE_PROFILE } elseif ($settings.hardwareProfile) { $settings.hardwareProfile } else { "auto" }
 $contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 16384 }
 $parsedContextLength = 0
 if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
@@ -32,8 +33,9 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
 }
 
 $llamaDevice = Resolve-LlamaDevice -ServerExecutable $launcher -RequestedDevice $requestedLlamaDevice
-$runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice
-$memoryProfile = Get-LlamaMemoryProfile -Device $llamaDevice
+$llamaDeviceDescription = Get-LlamaDeviceDescription -ServerExecutable $launcher -Device $llamaDevice
+$runtimeProfile = Get-LlamaRuntimeProfile -Device $llamaDevice -HardwareProfile $requestedHardwareProfile -DeviceDescription $llamaDeviceDescription
+$memoryProfile = Get-LlamaMemoryProfile -Device $llamaDevice -HardwareProfile $runtimeProfile.Name -DeviceDescription $llamaDeviceDescription
 
 $models = @(Get-ChildItem -LiteralPath $modelDirectory -File -Filter "*.gguf" | Sort-Object Name)
 if ($models.Count -eq 0) {
@@ -77,8 +79,8 @@ $serverArguments += @($speculativeProfile.Arguments)
 
 Write-Host "Starting llama.cpp from: $llamaDirectory"
 Write-Host "Model: $($selectedModel.Name)"
-Write-Host "Device: $(if ($llamaDevice) { $llamaDevice } else { 'auto' })"
-Write-Host "Runtime profile: $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
+Write-Host "Device: $(if ($llamaDevice) { "$llamaDevice $llamaDeviceDescription" } else { 'auto' })"
+Write-Host "Runtime profile: $($runtimeProfile.Name) / $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
 Write-Host "Memory profile: $($memoryProfile.Description)"
 Write-Host "Speculative decoding: $($speculativeProfile.Description)"
 Write-Host ("Configured context: {0:N0} tokens" -f $parsedContextLength)

@@ -207,9 +207,12 @@ async function main(): Promise<void> {
     assert.match(startScript, /ProcessName -ne "llama-server"/);
     assert.match(deviceScript, /function Get-LlamaSpeculativeProfile/);
     assert.match(deviceScript, /function Get-LlamaMemoryProfile/);
+    assert.match(deviceScript, /function Resolve-LlamaHardwareProfile/);
+    assert.match(deviceScript, /"intel-arc" \{ @\{ BatchSize = 512; UBatchSize = 256 \} \}/);
+    assert.match(deviceScript, /"rtx-4070-super" \{ @\{ BatchSize = 1024; UBatchSize = 512 \} \}/);
     assert.match(deviceScript, /"SYCL" \{ @\{ BatchSize = 256; UBatchSize = 128 \} \}/);
-    assert.match(deviceScript, /"--fit", "on", "-fitc", "4096", "-fitt", "1024"/);
-    assert.match(deviceScript, /"-ctk", "q8_0", "-ctv", "q8_0"/);
+    assert.match(deviceScript, /"--fit", "on", "-fitc", \$fitContext\.ToString\(\), "-fitt", \$fitTarget\.ToString\(\)/);
+    assert.match(deviceScript, /"-ctk", \$cacheType, "-ctv", \$cacheType/);
     assert.doesNotMatch(startScript, /"-ngl", "all"/);
     assert.doesNotMatch(standaloneStartScript, /"-ngl", "all"/);
     assert.match(startScript, /Get-LlamaMemoryProfile/);
