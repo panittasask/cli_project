@@ -56,6 +56,9 @@ Prototype contents:
   "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
   "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
+  "serverHost": "127.0.0.1",
+  "serverPort": 8080,
+  "apiUrl": "http://127.0.0.1:8080/v1/chat/completions",
   "contextLength": 16384,
   "device": "auto",
   "hardwareProfile": "auto",
@@ -105,6 +108,8 @@ $env:LLAMA_CPP_DIR = "D:\path\to\llama.cpp"
 $env:LLAMA_MODEL_DIR = "D:\path\to\models"
 $env:LLAMA_DEVICE = "CUDA0"
 $env:LLAMA_HARDWARE_PROFILE = "rtx-4070-super"
+$env:LLAMA_ARG_HOST = "0.0.0.0"
+$env:LLAMA_ARG_PORT = "8080"
 $env:LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 $env:LLAMA_MODEL = "another-model.gguf"
 $env:LLAMA_CONTEXT_LENGTH = "65536"
@@ -118,6 +123,28 @@ from the environment, `settings.json`, or a default. Run `/settings validate`
 to report invalid ranges, types, unsafe provider paths, or malformed JSON. Run `/capabilities` to see
 the active mode's local actions, discovered project checks, MCP servers, and
 whether a real MCP web-search tool is currently available.
+
+To use one machine as the inference server for other copies of this repo on a
+trusted LAN, set `serverHost` to `0.0.0.0` on the server, allow `serverPort`
+through that machine's private-network firewall, and set each client's `apiUrl`
+to `http://<server-ip>:<serverPort>/v1/chat/completions`. Run `npm run llama` on
+the server and `npm run dev:cli` on clients so clients do not launch their own
+model server.
+
+For machines at different locations, do not expose port 8080 directly to the
+public internet. Install Tailscale on both machines, sign them into the same
+tailnet, and keep the server's `serverHost` set to `127.0.0.1`. After starting
+`npm run llama`, run this in a second server terminal:
+
+```powershell
+npm run serve:tailscale
+```
+
+Tailscale prints a private HTTPS URL such as
+`https://server-name.tailnet-name.ts.net`. Set the client machine's `apiUrl` to
+`https://server-name.tailnet-name.ts.net/v1/chat/completions`, then run
+`npm run dev:cli`. Only devices authorized by that tailnet can reach the
+Tailscale Serve URL.
 
 With `device` set to `auto`, the launcher asks the configured `llama-server.exe`
 which accelerator devices it provides and selects the first one. This lets the
