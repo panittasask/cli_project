@@ -18,11 +18,11 @@ function readJson(filePath: string): Record<string, unknown> {
 }
 
 const traceFiles = fs.existsSync(logsDirectory)
-    ? fs.readdirSync(logsDirectory).filter((name) => /^agent-trace(?:-\d{4}-\d{2}-\d{2})?\.jsonl$/i.test(name))
+    ? fs.readdirSync(logsDirectory).filter((name) => /^agent-trace-\d{4}-\d{2}-\d{2}\.jsonl$/i.test(name))
     : [];
 const traces = traceFiles.flatMap((name) => readJsonl(path.join(logsDirectory, name)));
 const responseFiles = fs.existsSync(logsDirectory)
-    ? fs.readdirSync(logsDirectory).filter((name) => /^agent-model-responses(?:-\d{4}-\d{2}-\d{2})?\.jsonl$/i.test(name))
+    ? fs.readdirSync(logsDirectory).filter((name) => /^agent-model-responses-\d{4}-\d{2}-\d{2}\.jsonl$/i.test(name))
     : [];
 const responses = responseFiles.flatMap((name) => readJsonl(path.join(logsDirectory, name)));
 const sessions = readJson(path.join(root, ".cli-sessions.json"));
