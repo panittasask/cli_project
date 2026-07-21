@@ -41,4 +41,18 @@ $overridden = Get-LlamaRuntimeProfile -Device "SYCL0" -HardwareProfile "intel-ar
 Assert-Equal $overridden.BatchSize 384 "Batch override"
 Assert-Equal $overridden.UBatchSize 96 "Ubatch override"
 
+$presetTestDirectory = Join-Path ([IO.Path]::GetTempPath()) ("llama-router-preset-" + [guid]::NewGuid().ToString("N"))
+try {
+    New-Item -ItemType Directory -Path $presetTestDirectory -Force | Out-Null
+    $alpha = New-Item -ItemType File -Path (Join-Path $presetTestDirectory "alpha.gguf")
+    $beta = New-Item -ItemType File -Path (Join-Path $presetTestDirectory "beta.gguf")
+    $presetPath = Join-Path $presetTestDirectory "models.ini"
+    New-LlamaRouterPreset -ServerExecutable "unused.exe" -Models @($alpha, $beta) -DefaultModelName "beta.gguf" -OutputPath $presetPath | Out-Null
+    $preset = Get-Content -LiteralPath $presetPath -Raw
+    if ($preset -notmatch '(?s)\[alpha\].*load-on-startup = false') { throw "Router preset did not keep alpha unloaded." }
+    if ($preset -notmatch '(?s)\[beta\].*load-on-startup = true') { throw "Router preset did not mark beta for startup." }
+} finally {
+    Remove-Item -LiteralPath $presetTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "Intel Arc and RTX 4070 SUPER hardware profile tests passed."

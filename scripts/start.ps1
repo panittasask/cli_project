@@ -128,7 +128,8 @@ if ($portInUse) {
         "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString()
     )
     if ($routerMode) {
-        $serverArguments += @("--models-dir", ('"{0}"' -f $modelDirectory), "--models-max", $parsedModelsMax.ToString())
+        $routerPreset = New-LlamaRouterPreset -ServerExecutable $serverExecutable -Models $models -DefaultModelName $models[$defaultModelIndex].Name -OutputPath (Join-Path $appRoot ".cli\router-models.ini")
+        $serverArguments += @("--models-preset", ('"{0}"' -f $routerPreset), "--models-max", $parsedModelsMax.ToString())
     } else {
         $serverArguments = @("-m", ('"{0}"' -f $selectedModel.FullName)) + $serverArguments
     }
@@ -136,7 +137,7 @@ if ($portInUse) {
     $serverArguments += @($speculativeProfile.Arguments)
 
     Write-Host ""
-    Write-Host $(if ($routerMode) { "Starting llama.cpp router for: $modelDirectory (max loaded: $parsedModelsMax)" } else { "Starting llama.cpp with: $($selectedModel.Name)" })
+    Write-Host $(if ($routerMode) { "Starting llama.cpp router for: $modelDirectory (default: $($models[$defaultModelIndex].Name), max loaded: $parsedModelsMax)" } else { "Starting llama.cpp with: $($selectedModel.Name)" })
     Write-Host "llama.cpp path: $llamaDirectory"
     Write-Host ("llama.cpp configured context: {0:N0} tokens" -f $parsedContextLength)
     if (-not [string]::IsNullOrWhiteSpace($llamaDevice)) { Write-Host "llama.cpp device: $llamaDevice $llamaDeviceDescription" }

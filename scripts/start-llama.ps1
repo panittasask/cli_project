@@ -75,7 +75,8 @@ for ($index = 0; $index -lt $models.Count; $index += 1) {
 $selectedModel = $null
 $serverArguments = @("-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString())
 if ($routerMode) {
-    $serverArguments += @("--models-dir", $modelDirectory, "--models-max", $parsedModelsMax.ToString())
+    $routerPreset = New-LlamaRouterPreset -ServerExecutable $launcher -Models $models -DefaultModelName $models[$defaultModelIndex].Name -OutputPath (Join-Path $appRoot ".cli\router-models.ini")
+    $serverArguments += @("--models-preset", $routerPreset, "--models-max", $parsedModelsMax.ToString())
     $speculativeProfile = [pscustomobject]@{ Arguments = @(); Description = "off (router mode; configure per-model presets for MTP)" }
 } else {
     $defaultNumber = $defaultModelIndex + 1
@@ -93,7 +94,7 @@ $serverArguments += @($memoryProfile.Arguments)
 $serverArguments += @($speculativeProfile.Arguments)
 
 Write-Host "Starting llama.cpp from: $llamaDirectory"
-Write-Host $(if ($routerMode) { "Model router: $modelDirectory (max loaded: $parsedModelsMax)" } else { "Model: $($selectedModel.Name)" })
+Write-Host $(if ($routerMode) { "Model router: $modelDirectory (default: $($models[$defaultModelIndex].Name), max loaded: $parsedModelsMax)" } else { "Model: $($selectedModel.Name)" })
 Write-Host "Device: $(if ($llamaDevice) { "$llamaDevice $llamaDeviceDescription" } else { 'auto' })"
 Write-Host "Runtime profile: $($runtimeProfile.Name) / $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
 Write-Host "Memory profile: $($memoryProfile.Description)"
