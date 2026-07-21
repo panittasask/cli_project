@@ -24,4 +24,3 @@ try {
 } finally {
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 }
-
