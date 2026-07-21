@@ -60,15 +60,18 @@ class AgentTrace {
             directory: path.resolve(process.cwd(), ".cli", "logs"),
             basename: "agent-trace"
         },
-        private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+        private readonly taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+        private readonly onEntry?: (entry: TraceEntry) => void
     ) {}
 
     add(entry: Omit<TraceEntry, "taskId" | "timestamp">): void {
-        this.entries.push({
+        const recorded = {
             ...entry,
             taskId: this.taskId,
             timestamp: new Date().toISOString()
-        });
+        };
+        this.entries.push(recorded);
+        this.onEntry?.(recorded);
     }
 
     save(): void {

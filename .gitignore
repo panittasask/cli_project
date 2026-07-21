@@ -3,6 +3,7 @@ node_modules/
 
 # Runtime state
 .cli/logs/
+.cli/log-viewer.html
 .cli/checkpoints.json
 .cli/settings.json
 .cli/router-models.ini

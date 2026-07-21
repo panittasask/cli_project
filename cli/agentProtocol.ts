@@ -77,12 +77,16 @@ const variants: Record<string, Record<string, unknown>> = {
 };
 
 const workflowActions: Record<WorkflowKind, string[]> = {
-    // General agent requests keep local tools available so the model can use
-    // conversational context instead of relying on an exhaustive intent regex.
-    // Runtime guards still enforce workspace boundaries and safe mutations.
-    general: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"],
+    // General requests retain every non-destructive capability. The model can
+    // therefore refine ambiguous natural language semantically (for example,
+    // choosing web search for an external fact) instead of being constrained
+    // by a keyword classifier before its first action.
+    general: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
     web_research: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
-    coding: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"],
+    // A coding-shaped request can still require external evidence (for
+    // example, researching a dependency or a model).  Do not let a lexical
+    // workflow hint remove the model's ability to select a discovered tool.
+    coding: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
     mcp_creation: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "ask_user", "final"]
 };
 

@@ -48,7 +48,11 @@ const { formatLocalDate, resolveJsonlLogPath } = require("../cli/dailyLog") as {
     formatLocalDate: (date?: Date) => string;
     resolveJsonlLogPath: (target: string | { directory: string; basename: string }, date?: Date) => string;
 };
-const { AgentTrace } = require("../cli/agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }) => {
+const { AgentTrace } = require("../cli/agentTrace") as { AgentTrace: new (
+    logTarget?: string | { directory: string; basename: string },
+    taskId?: string,
+    onEntry?: (entry: { action?: string }) => void
+) => {
     add: (entry: Record<string, unknown>) => void;
     save: () => void;
 } };
@@ -723,7 +727,8 @@ async function main(): Promise<void> {
             parsedAction: "final"
         });
         assert.ok(fs.existsSync(path.join(tempDirectory, `daily-responses-${formatLocalDate()}.jsonl`)));
-        const trace = new AgentTrace(tracePath);
+        const liveTraceEntries: Array<{ action?: string }> = [];
+        const trace = new AgentTrace(tracePath, undefined, (entry) => liveTraceEntries.push(entry));
         trace.add({
             turn: 1,
             status: "ok",
@@ -732,6 +737,8 @@ async function main(): Promise<void> {
             observation: "token=secret-value"
         });
         trace.save();
+        assert.equal(liveTraceEntries.length, 1);
+        assert.equal(liveTraceEntries[0]?.action, "write_file");
         trace.add({
             turn: 2,
             status: "parse_error",

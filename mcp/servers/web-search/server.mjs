@@ -1,98 +1,25 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import DDG from "duck-duck-scrape";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { runSearchPipeline } from "./searchPipeline.mjs";
+import { htmlToText, searchBingHtml, searchBingRss } from "./htmlSearch.mjs";
 
 const server = new McpServer({
     name: "web-search",
-    version: "1.0.0"
+    version: "1.1.0"
 }, {
     instructions: "Use search_web for current, niche, or external information. Base answers on returned snippets and cite the returned source URLs."
 });
 
-function cleanText(value) {
-    return String(value || "")
-        .replace(/<\/?b>/gi, "")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function decodeXml(value) {
-    return cleanText(String(value || "")
-        .replace(/^<!\[CDATA\[|\]\]>$/g, "")
-        .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
-        .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCodePoint(Number.parseInt(code, 16)))
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/<[^>]+>/g, " "));
-}
-
-function readXmlField(item, field) {
-    const match = item.match(new RegExp(`<${field}>([\\s\\S]*?)<\\/${field}>`, "i"));
-    return decodeXml(match?.[1] || "");
-}
-
-async function searchBingRss(query, maxResults) {
-    const url = new URL("https://www.bing.com/search");
-    url.searchParams.set("format", "rss");
-    url.searchParams.set("q", query);
-    const response = await fetch(url, {
-        headers: { "user-agent": "Mozilla/5.0 local-agent-cli/1.0" },
-        signal: AbortSignal.timeout(15000)
-    });
-    if (!response.ok) {
-        throw new Error(`Bing RSS returned HTTP ${response.status}`);
-    }
-
-    const xml = await response.text();
-    return Array.from(xml.matchAll(/<item>([\s\S]*?)<\/item>/gi))
-        .slice(0, maxResults)
-        .map((match, index) => {
-            const resultUrl = readXmlField(match[1], "link");
-            let source = "";
-            try {
-                source = new URL(resultUrl).hostname;
-            } catch {
-                source = "unknown";
-            }
-            return {
-                rank: index + 1,
-                title: readXmlField(match[1], "title"),
-                snippet: readXmlField(match[1], "description"),
-                url: resultUrl,
-                source
-            };
-        });
-}
-
 async function searchOnce(query, maxResults) {
-    try {
-        const response = await DDG.search(query, {
-            safeSearch: DDG.SafeSearchType.MODERATE,
-            locale: "th-th",
-            region: "th-en",
-            marketRegion: "TH"
-        });
-        return {
-            provider: "DuckDuckGo",
-            results: response.results.slice(0, maxResults).map((result, index) => ({
-                rank: index + 1,
-                title: cleanText(result.title),
-                snippet: cleanText(result.description),
-                url: result.url,
-                source: result.hostname
-            }))
-        };
-    } catch (duckDuckGoError) {
-        const results = await searchBingRss(query, maxResults);
-        return { provider: "Bing RSS fallback", results, fallbackReason: duckDuckGoError instanceof Error ? duckDuckGoError.message : String(duckDuckGoError) };
+    const [html, rss] = await Promise.all([searchBingHtml(query, maxResults), searchBingRss(query, maxResults)]);
+    const gathered = new Map();
+    for (const result of [...html.results, ...rss.results]) {
+        if (!gathered.has(result.url)) gathered.set(result.url, result);
     }
+    return { provider: "Bing HTML + RSS", results: [...gathered.values()].slice(0, maxResults * 2) };
 }
 
 function isPrivateAddress(address) {
@@ -114,13 +41,6 @@ async function assertPublicUrl(rawUrl) {
     const addresses = await dns.lookup(url.hostname, { all: true });
     if (addresses.length === 0 || addresses.some(({ address }) => isPrivateAddress(address))) throw new Error("Private or local network URLs are blocked.");
     return url;
-}
-
-function htmlToText(html) {
-    return cleanText(html
-        .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
-        .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
-        .replace(/<[^>]+>/g, " "));
 }
 
 async function openPublicPage(rawUrl) {

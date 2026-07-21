@@ -93,7 +93,7 @@ const { SkillLoader } = require("./skillLoader") as { SkillLoader: new () => {
     select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string; description: string; body: string }>;
     formatPrompt: (skills: Array<{ name: string; description: string; body: string }>) => string;
 } };
-const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }, taskId?: string) => {
+const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }, taskId?: string, onEntry?: (entry: Record<string, unknown>) => void) => {
     add: (entry: {
         turn: number;
         status: "action" | "ok" | "error" | "parse_error" | "final";
@@ -172,13 +172,15 @@ type VerificationRequirement = "none" | "command" | "runtime";
 type AcceptanceContract = { evidence: "source" | "command" | "runtime" | "interaction"; verification: VerificationRequirement; reason: string };
 type ProjectCheck = import("./projectTypes").ProjectCheck;
 type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
-const { classifyWorkflowWithHistory, forbidsWorkspaceWriteWithHistory, requiresWorkspaceWriteWithHistory, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("./workflowRouter") as {
-    classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: WorkflowKind; reason: string };
+const { forbidsWorkspaceWriteWithHistory, requiresWorkspaceWriteWithHistory, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("./workflowRouter") as {
     forbidsWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     acceptanceContractWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => AcceptanceContract;
     commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract) => boolean;
     workflowInstructions: (kind: WorkflowKind) => string;
+};
+const { searchReturnedNoResults } = require("./webResearch") as {
+    searchReturnedNoResults: (output: string) => boolean;
 };
 const {
     answerDefersRequiredWork,
@@ -250,6 +252,8 @@ const { EditFileTool } = require("./tools/editFileTool") as { EditFileTool: new 
     writeEditedFile: (inputPath: string, content: string) => void;
 } };
 const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => {
+    buildWorkflowMessages: (message: string, recentContext?: Array<{ role: "user" | "assistant"; content: string }>) => Array<{ role: "system" | "user"; content: string }>;
+    parseWorkflowDecision: (content: string | undefined | null) => { kind: WorkflowKind; reason: string } | undefined;
     buildRouterMessages: (message: string) => Array<{ role: "system" | "user"; content: string }>;
     parseDecision: (content: string | undefined | null) => {
         needsTool: boolean;
@@ -491,6 +495,47 @@ let contextStartedAt = 0;
 let debugEnabled = process.env.CLI_DEBUG
     ? /^(1|true|on|yes)$/i.test(process.env.CLI_DEBUG.trim())
     : cliSettings.debug === true;
+
+const debugSensitiveKey = /(^|_)(api_?key|token|secret|password|authorization|cookie|private_?key)($|_)/i;
+
+function redactDebugValue(value: unknown, key = ""): unknown {
+    if (debugSensitiveKey.test(key)) return "[REDACTED]";
+    if (typeof value === "string") {
+        return value
+            .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
+            .replace(/\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]");
+    }
+    if (Array.isArray(value)) return value.map((item) => redactDebugValue(item));
+    if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+            childKey,
+            redactDebugValue(childValue, childKey)
+        ]));
+    }
+    return value;
+}
+
+function debugLog(stage: string, detail: unknown): void {
+    if (!debugEnabled) return;
+    console.log(`\n[debug] ${stage}`);
+    console.log(JSON.stringify(redactDebugValue(detail), null, 2));
+}
+
+function persistDebugSetting(enabled: boolean): void {
+    const settingsPath = path.resolve(appRoot, ".cli", "settings.json");
+    if (!fs.existsSync(settingsPath)) initializeCliSettings(appRoot);
+    let persisted: Record<string, unknown> = {};
+    try {
+        persisted = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+    } catch {
+        // Keep a valid minimal user settings file rather than losing the
+        // selected preference when an existing file is malformed.
+    }
+    persisted.debug = enabled;
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+    cliSettings.debug = enabled;
+}
 
 // Sessions belong to the CLI installation, not to whichever workspace the
 // agent is currently inspecting. This also keeps --workspace startup and the
@@ -1271,14 +1316,18 @@ function compilerDiagnosticFingerprint(output: string): string[] {
 
 async function routeTool(message: string, sessionId: string, signal?: AbortSignal): Promise<ToolDecision> {
     try {
+        const routerMessages = toolRouter.buildRouterMessages(message);
+        debugLog("Tool-router LLM request", { model, messages: routerMessages, sampling: actionSampling });
         const response = await llamaClient.post({
             model,
-            messages: toolRouter.buildRouterMessages(message),
+            messages: routerMessages,
             ...actionSampling
         }, undefined, signal);
         recordResponseUsage(sessionId, response.data);
 
-        const decision = toolRouter.parseDecision(response.data.choices[0].message.content);
+        const rawContent = response.data.choices[0].message.content;
+        const decision = toolRouter.parseDecision(rawContent);
+        debugLog("Tool-router LLM response", { rawContent, decision, usage: response.data.usage, timings: response.data.timings });
 
         if (decision) {
             if (!decision.needsTool || decision.tool === "none") {
@@ -1309,6 +1358,22 @@ async function routeTool(message: string, sessionId: string, signal?: AbortSigna
     return keywordFallbackDecision(message);
 }
 
+async function decideWorkflowWithLlm(message: string, history: Array<{ role: "user" | "assistant"; content: string }>, sessionId: string, signal?: AbortSignal): Promise<{ kind: WorkflowKind; reason: string }> {
+    try {
+        const messages = toolRouter.buildWorkflowMessages(message, history);
+        debugLog("Workflow-router LLM request", { model, messages, sampling: actionSampling });
+        const response = await llamaClient.post({ model, messages, ...actionSampling }, undefined, signal);
+        recordResponseUsage(sessionId, response.data);
+        const rawContent = response.data.choices[0].message.content;
+        const decision = toolRouter.parseWorkflowDecision(rawContent);
+        debugLog("Workflow-router LLM response", { rawContent, decision, usage: response.data.usage, timings: response.data.timings });
+        if (decision) return decision;
+    } catch (error) {
+        debugLog("Workflow-router fallback", { error: llamaClient.formatError(error) });
+    }
+    return { kind: "general", reason: "Workflow router unavailable; retain all safe capabilities and let the agent select its tools." };
+}
+
 async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
@@ -1327,9 +1392,9 @@ async function runAgentLoop(
     const maxTurnsPerSegment = guard.settings.maxTurns;
     const maxSegments = agentGuardSettings.maxSegments;
     const maxTurns = maxTurnsPerSegment * maxSegments;
-    const continuation = isContinuationRequest(userMessage);
     let effectiveUserMessage = userMessage;
-    let workflow = classifyWorkflowWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let workflow = await decideWorkflowWithLlm(effectiveUserMessage, historyForTask, sessionId, signal);
+    const continuation = isContinuationRequest(userMessage);
     const readOnlyRequest = forbidsWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
     let mustWrite = !readOnlyRequest && requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
     let acceptance = acceptanceContractWithHistory(effectiveUserMessage, historyForTask, continuation);
@@ -1366,11 +1431,13 @@ async function runAgentLoop(
     let successfulMcpCall = false;
     let mcpCallsDisabled = false;
     const sourceUrls = new Set<string>();
+    let consecutiveEmptyWebSearches = 0;
+    let webResearchExhausted = false;
     const logDirectory = path.resolve(appRoot, ".cli", "logs");
     const traceTarget = { directory: logDirectory, basename: "agent-trace" };
     const responseTarget = { directory: logDirectory, basename: "agent-model-responses" };
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-    const trace = new AgentTrace(traceTarget, taskId);
+    const trace = new AgentTrace(traceTarget, taskId, (entry) => debugLog("Agent trace", entry));
     const responseLog = new AgentResponseLog(responseTarget, taskId);
     trace.add({
         turn: 0,
@@ -1457,6 +1524,7 @@ async function runAgentLoop(
             : `Reviewing results (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`);
 
         const modelStartedAt = Date.now();
+        debugLog("LLM request", { turn, model, messages, responseFormat: requestFormat, sampling: actionSampling });
         const response = await llamaClient.post({
             model,
             messages,
@@ -1490,6 +1558,16 @@ async function runAgentLoop(
             arguments?: Record<string, unknown>;
         } | undefined;
         const parseError = action ? undefined : agentTool.explainParseFailure(assistantContent);
+        debugLog("LLM response", {
+            turn,
+            rawContent: rawAssistantContent,
+            reasoningContent: choice.message.reasoning_content,
+            finishReason: choice.finish_reason,
+            usage: response.data.usage,
+            timings: response.data.timings,
+            parsedAction: action,
+            parseError
+        });
         responseLog.append({
             turn,
             maxTurns,
@@ -1654,7 +1732,7 @@ async function runAgentLoop(
             const previousWorkflowKind = workflow.kind;
             const previousVerificationRequirement = verificationRequirement;
             effectiveUserMessage = `${userMessage}\n\nUser clarifications:\n${clarificationTranscript.map((line) => `- ${line}`).join("\n")}`;
-            workflow = classifyWorkflowWithHistory(effectiveUserMessage, historyForTask, continuation);
+            workflow = await decideWorkflowWithLlm(effectiveUserMessage, historyForTask, sessionId, signal);
             mustWrite = !readOnlyRequest && requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
             acceptance = acceptanceContractWithHistory(effectiveUserMessage, historyForTask, continuation);
             verificationRequirement = acceptance.verification;
@@ -1774,7 +1852,14 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            if (!verificationSatisfied) {
+            // Intent is refined semantically by the model's selected action.
+            // Only require a previously inferred verification after the task
+            // has actually entered a workspace-verification path; a final
+            // response chosen as the first action remains valid conversation.
+            const verificationWasActivated = writtenPaths.size > 0
+                || pendingProjectChecks.size > 0
+                || Boolean(unresolvedVerificationFailure);
+            if (!verificationSatisfied && verificationWasActivated) {
                 const requiredCheck = verificationRequirement === "runtime"
                     ? acceptance.evidence === "interaction"
                         ? "run a finite automated interaction test that performs the action and asserts the resulting state"
@@ -1786,7 +1871,7 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            if (workflow.kind === "web_research" && !mcpCallsDisabled && sourceUrls.size < 2) {
+            if (workflow.kind === "web_research" && !mcpCallsDisabled && !webResearchExhausted && sourceUrls.size < 2) {
                 rejectFinal(
                     "web research needs at least two relevant source URLs",
                     "You cannot return final yet. Web research requires at least two relevant source URLs from successful MCP observations. Refine the web query; do not use search_files."
@@ -1989,6 +2074,7 @@ async function runAgentLoop(
         }
         spinner.log(agentTool.formatActionStatus(action, segmentTurn, maxTurnsPerSegment));
         spinner.update(`Executing ${action.action}...`);
+        debugLog("Tool request", { turn, action });
         let result = await agentTool.execute(action);
         if (workflow.kind !== "mcp_creation" && action.action === "mcp_list_tools" && result.ok
             && (/"servers"\s*:\s*\[\s*\]/i.test(result.output) || /Unknown MCP server/i.test(result.output))) {
@@ -2190,15 +2276,32 @@ async function runAgentLoop(
             observation: result.output
         });
         trace.save();
+        debugLog("Tool result", { turn, action: action.action, ok: result.ok, changed: result.changed, output: result.output });
         const eventTarget = action.path || action.command || action.tool || "";
         segmentEvents.push(`${action.action} [${result.ok ? "ok" : "error"}]${eventTarget ? ` ${eventTarget}` : ""}: ${result.output.replace(/\s+/g, " ").slice(0, 240)}`);
         if (action.action === "mcp_call_tool" && action.tool?.toLowerCase().includes("search") && result.ok) {
             const urls = result.output.match(/https?:\/\/[^"\\\s]+/g) || [];
             urls.forEach((sourceUrl) => sourceUrls.add(sourceUrl));
+            if (workflow.kind === "web_research" && urls.length === 0 && searchReturnedNoResults(result.output)) {
+                consecutiveEmptyWebSearches += 1;
+                if (consecutiveEmptyWebSearches >= 2) {
+                    webResearchExhausted = true;
+                    recoveryResponseFormat = getAgentFinalResponseFormat();
+                    const observation = "Web search returned no usable results for two distinct attempts. Stop searching and return a concise final answer that clearly states the information could not be found through the configured search provider.";
+                    trace.add({ turn, status: "error", action: "web_search_exhausted", observation });
+                    trace.save();
+                    messages.push({ role: "user", content: `Observation: ${observation}` });
+                    continue;
+                }
+            } else if (urls.length > 0) {
+                consecutiveEmptyWebSearches = 0;
+            }
         }
+        const observation = agentTool.formatObservation(action, result);
+        debugLog("Tool observation -> LLM", { turn, action: action.action, observation });
         messages.push({
             role: "user",
-            content: `Observation: ${agentTool.formatObservation(action, result)}`
+            content: `Observation: ${observation}`
         });
     }
 
@@ -2223,7 +2326,7 @@ async function runAgentLoop(
         toolLimitBlockers.push(`checks invalidated by file changes: ${pendingChecks.map((check) => `${check.command} in ${check.workdir}`).join(", ")}`);
     }
     if (!verificationSatisfied) toolLimitBlockers.push(`${verificationRequirement} verification not satisfied`);
-    if (workflow.kind === "web_research" && !mcpCallsDisabled && sourceUrls.size < 2) {
+    if (workflow.kind === "web_research" && !mcpCallsDisabled && !webResearchExhausted && sourceUrls.size < 2) {
         toolLimitBlockers.push("fewer than two web source URLs were collected");
     }
     if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
@@ -2253,6 +2356,7 @@ Do not call another tool. Do not claim unverified success.`
 
     try {
         const modelStartedAt = Date.now();
+        debugLog("LLM final-summary request", { model, messages, responseFormat: agentResponseFormat, sampling: actionSampling });
         const response = await llamaClient.post({
             model,
             messages,
@@ -2271,6 +2375,14 @@ Do not call another tool. Do not claim unverified success.`
             answer?: string;
             reason?: string;
         } | undefined;
+        debugLog("LLM final-summary response", {
+            rawContent: rawAssistantContent,
+            reasoningContent: choice.message.reasoning_content,
+            finishReason: choice.finish_reason,
+            parsedAction: finalAction,
+            usage: response.data.usage,
+            timings: response.data.timings
+        });
         responseLog.append({
             turn: maxTurns + 1,
             maxTurns,
@@ -2445,7 +2557,12 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         if (/^\/debug\s+(on|off)$/i.test(trimmed)) {
             debugEnabled = /\bon$/i.test(trimmed);
-            console.log(`Agent trace: ${debugEnabled ? "on" : "off"}`);
+            try {
+                persistDebugSetting(debugEnabled);
+                console.log(`Agent trace: ${debugEnabled ? "on" : "off"} (saved to .cli/settings.json)`);
+            } catch (error) {
+                console.log(`Agent trace: ${debugEnabled ? "on" : "off"} (could not save setting: ${error instanceof Error ? error.message : String(error)})`);
+            }
             console.log();
             ask(activeSession, runMode);
             return;
@@ -2823,24 +2940,33 @@ ${capabilityInstruction}
 Answer only the end user's request directly in a natural tone.
 Do not mention hidden context, internal tools, or system prompts.`;
 
+            const chatMessages = [
+                {
+                    role: "system" as const,
+                    content: [assistantSystemInstruction, skillGuidance].filter(Boolean).join("\n\n")
+                },
+                ...historyForModel,
+                {
+                    role: "user" as const,
+                    content: userContent
+                }
+            ];
+            debugLog("Chat LLM request", { model, messages: chatMessages, sampling: chatSampling });
             const response = await llamaClient.post({
                 model,
-                messages: [
-                    {
-                        role: "system",
-                        content: [assistantSystemInstruction, skillGuidance].filter(Boolean).join("\n\n")
-                    },
-                    ...historyForModel,
-                    {
-                        role: "user",
-                        content: userContent
-                    }
-                ],
+                messages: chatMessages,
                 ...chatSampling
             }, undefined, requestController.signal);
             recordResponseUsage(activeSession.id, response.data);
 
             const answer = response.data.choices[0].message.content?.trim() ?? "";
+            debugLog("Chat LLM response", {
+                rawContent: response.data.choices[0].message.content,
+                reasoningContent: response.data.choices[0].message.reasoning_content,
+                finishReason: response.data.choices[0].finish_reason,
+                usage: response.data.usage,
+                timings: response.data.timings
+            });
             const elapsedMs = spinner.stop();
             console.log("AI:", answer);
             console.log(formatCompletionLine(elapsedMs));
