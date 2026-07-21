@@ -990,6 +990,7 @@ async function main(): Promise<void> {
     };
     const htmlSearch = await import("../mcp/servers/web-search/htmlSearch.mjs") as {
         extractBingSearchResults: (html: string, maxResults: number) => Array<{ title: string; snippet: string; url: string; source: string }>;
+        extractDuckDuckGoSearchResults: (html: string, maxResults: number) => Array<{ title: string; snippet: string; url: string; source: string }>;
     };
     const scrapedResults = htmlSearch.extractBingSearchResults(`
         <li class="b_algo"><h2><a href="https://example.com/qwen2.5-coder">Qwen2.5-Coder</a></h2><div class="b_caption"><p>Model &amp; tooling overview.</p></div></li>
@@ -997,6 +998,8 @@ async function main(): Promise<void> {
     `, 5);
     assert.deepEqual(scrapedResults.map((result) => result.url), ["https://example.com/qwen2.5-coder", "https://docs.example.com/guide"]);
     assert.equal(scrapedResults[0]?.snippet, "Model & tooling overview.");
+    const duckResults = htmlSearch.extractDuckDuckGoSearchResults('<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fgguf">GGUF Models</a><a class="result__snippet">Browse local models.</a></div>', 5);
+    assert.deepEqual(duckResults.map((result) => result.url), ["https://example.com/gguf"]);
     assert.ok(pipeline.tokenize("Qwen2.5-Coder").includes("qwen2.5-coder"));
     assert.ok(pipeline.rewriteQueries("Meme 67 คืออะไร").length >= 2);
     assert.ok(!pipeline.rewriteQueries("best local AI models for GGUF").some((query) => /meaning origin context/i.test(query)));

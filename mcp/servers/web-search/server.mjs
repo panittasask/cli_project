@@ -4,7 +4,7 @@ import { z } from "zod";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { runSearchPipeline } from "./searchPipeline.mjs";
-import { htmlToText, searchBingHtml, searchBingRss } from "./htmlSearch.mjs";
+import { htmlToText, searchBingHtml, searchBingRss, searchDuckDuckGoHtml } from "./htmlSearch.mjs";
 
 const server = new McpServer({
     name: "web-search",
@@ -14,12 +14,18 @@ const server = new McpServer({
 });
 
 async function searchOnce(query, maxResults) {
-    const [html, rss] = await Promise.all([searchBingHtml(query, maxResults), searchBingRss(query, maxResults)]);
+    const settled = await Promise.allSettled([
+        searchDuckDuckGoHtml(query, maxResults),
+        searchBingHtml(query, maxResults),
+        searchBingRss(query, maxResults)
+    ]);
+    const successful = settled.flatMap((entry) => entry.status === "fulfilled" ? [entry.value] : []);
+    if (successful.length === 0) throw new Error("All configured web search providers failed.");
     const gathered = new Map();
-    for (const result of [...html.results, ...rss.results]) {
+    for (const result of successful.flatMap((entry) => entry.results)) {
         if (!gathered.has(result.url)) gathered.set(result.url, result);
     }
-    return { provider: "Bing HTML + RSS", results: [...gathered.values()].slice(0, maxResults * 2) };
+    return { provider: successful.map((entry) => entry.provider).join(" + "), results: [...gathered.values()].slice(0, maxResults * 3) };
 }
 
 function isPrivateAddress(address) {

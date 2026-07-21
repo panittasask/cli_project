@@ -65,6 +65,50 @@ export function extractBingSearchResults(html, maxResults) {
     return results;
 }
 
+function decodeDuckDuckGoUrl(rawUrl) {
+    const value = String(rawUrl || "").replace(/&amp;/gi, "&").trim();
+    try {
+        const url = new URL(value, "https://duckduckgo.com");
+        if (/(^|\.)duckduckgo\.com$/i.test(url.hostname) && url.pathname.startsWith("/l/")) {
+            return url.searchParams.get("uddg") || "";
+        }
+        return /^https?:\/\//i.test(url.toString()) ? url.toString() : "";
+    } catch {
+        return "";
+    }
+}
+
+export function extractDuckDuckGoSearchResults(html, maxResults) {
+    const results = [];
+    const blocks = String(html || "").matchAll(/<div\b[^>]*class=(["'])[^"']*\bresult\b[^"']*\1[^>]*>([\s\S]*?)(?=<div\b[^>]*class=(["'])[^"']*\bresult\b|$)/gi);
+    for (const block of blocks) {
+        const content = block[2] || "";
+        const anchor = content.match(/<a\b[^>]*class=(["'])[^"']*\bresult__a\b[^"']*\1[^>]*>/i)?.[0] || "";
+        const url = decodeDuckDuckGoUrl(attributeValue(anchor, "href"));
+        if (!/^https?:\/\//i.test(url)) continue;
+        const title = content.match(/<a\b[^>]*class=(["'])[^"']*\bresult__a\b[^"']*\1[^>]*>([\s\S]*?)<\/a>/i)?.[2] || "";
+        const snippet = content.match(/<[^>]*class=(["'])[^"']*\bresult__snippet\b[^"']*\1[^>]*>([\s\S]*?)<\//i)?.[2] || "";
+        results.push({ rank: results.length + 1, title: htmlToText(title), snippet: htmlToText(snippet), url, source: new URL(url).hostname });
+        if (results.length >= maxResults) break;
+    }
+    return results;
+}
+
+export async function searchDuckDuckGoHtml(query, maxResults, request = fetch) {
+    const url = new URL("https://html.duckduckgo.com/html/");
+    url.searchParams.set("q", query);
+    const response = await request(url, {
+        headers: {
+            "accept": "text/html,application/xhtml+xml",
+            "accept-language": "en-US,en;q=0.9",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+        },
+        signal: AbortSignal.timeout(15000)
+    });
+    if (!response.ok) throw new Error(`DuckDuckGo HTML returned HTTP ${response.status}`);
+    return { provider: "DuckDuckGo HTML", results: extractDuckDuckGoSearchResults(await response.text(), maxResults) };
+}
+
 export async function searchBingHtml(query, maxResults, request = fetch) {
     const url = new URL("https://www.bing.com/search");
     url.searchParams.set("q", query);
