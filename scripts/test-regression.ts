@@ -210,7 +210,7 @@ async function main(): Promise<void> {
     assert.match(startScript, /elseif \(\$settings\.serverPort\)/);
     assert.match(startScript, /"--host", \$serverHost, "--port", \$parsedServerPort\.ToString\(\)/);
     assert.match(standaloneStartScript, /"--host", \$serverHost, "--port", \$parsedServerPort\.ToString\(\)/);
-    assert.equal(packageJson.scripts["serve:tailscale"], "tailscale serve --bg 8080");
+    assert.equal(packageJson.scripts["serve:tailscale"], "tailscale serve --bg --tcp=8080 tcp://127.0.0.1:8080");
     assert.match(deviceScript, /function Get-LlamaSpeculativeProfile/);
     assert.match(deviceScript, /function Get-LlamaMemoryProfile/);
     assert.match(deviceScript, /function Resolve-LlamaHardwareProfile/);
