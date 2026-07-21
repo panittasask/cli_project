@@ -482,6 +482,7 @@ const configuredContextLength = Number.isFinite(configuredContextValue) && confi
 let activeContextLength = configuredContextLength;
 let model = defaultModel;
 let plannerModel = defaultModel;
+let serverModelSynced = false;
 const chatSampling = getSamplingSettings(cliSettings, "chat");
 const plannerSampling = getSamplingSettings(cliSettings, "planner");
 const actionSampling = getSamplingSettings(cliSettings, "action");
@@ -506,7 +507,7 @@ let activeRequestController: AbortController | undefined;
 let activeRequestSpinner: InstanceType<typeof Spinner> | undefined;
 let statusSessionId: string | undefined;
 const statusBar = new StatusBar(() => ({
-    model,
+    model: serverModelSynced ? model : "server unavailable",
     contextUsed: statusSessionId ? sessionTool.getUsage(statusSessionId).activeContextTokens : 0,
     contextLimit: activeContextLength,
     workspace: activeWorkspace
@@ -613,6 +614,7 @@ async function syncModelFromServer(): Promise<boolean> {
 
     model = loadedModel;
     plannerModel = loadedModel;
+    serverModelSynced = true;
     return true;
 }
 
@@ -624,7 +626,16 @@ async function printModelInfo(): Promise<void> {
     ]);
     const availableFiles = getAvailableModelFiles();
 
-    console.log(`CLI request model: ${model}`);
+    if (loadedModels[0]) {
+        model = loadedModels[0];
+        plannerModel = loadedModels[0];
+        serverModelSynced = true;
+        statusBar.render();
+    }
+
+    console.log(serverModelSynced
+        ? `CLI request model: ${model}`
+        : `Configured fallback model: ${model} (server model unavailable)`);
     console.log(loadedModels.length > 0
         ? `Loaded by llama.cpp: ${loadedModels.join(", ")}`
         : "Loaded by llama.cpp: unavailable (server is not running or still loading)");
@@ -2459,6 +2470,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
                 const result = await modelRouterClient.switch(modelCommand.model);
                 model = result.model.id;
                 plannerModel = result.model.id;
+                serverModelSynced = true;
                 const serverContext = await getServerContextInfo(model);
                 activeContextLength = serverContext?.contextLength ?? configuredContextLength;
                 contextStartedAt = Date.now();
@@ -2904,7 +2916,9 @@ async function start(): Promise<void> {
 
     const initialMode: RunMode = "agent";
     console.log(`Current mode: ${initialMode}`);
-    console.log(`Current model: ${model}`);
+    console.log(modelSynced
+        ? `Current model: ${model}`
+        : `Current model: unavailable (configured fallback: ${model})`);
     console.log();
 
     statusSessionId = activeSession.id;
