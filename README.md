@@ -2,6 +2,9 @@
 
 This CLI uses the OpenAI-compatible API exposed by `llama-server`.
 
+คู่มือการติดตั้ง Server autostart, การใช้งานจากเครื่อง Office และการเปลี่ยนโมเดล:
+[วิธีการใช้งาน.md](./วิธีการใช้งาน.md)
+
 ## One-terminal start
 
 Run:
@@ -30,6 +33,12 @@ session whose directory is unavailable, prompt for a valid workspace first.
 
 The separate two-terminal workflow below remains available when server logs
 need to stay visible.
+
+For a server that starts automatically with Windows and does not require a
+logged-in terminal, run `npm run server:install` once as described in
+`วิธีการใช้งาน.md`. Use `npm run server:status` to inspect the scheduled task,
+health, and loaded models, or `npm run server:restart` after configuration and
+code updates.
 
 1. Start llama.cpp and select a GGUF model:
 

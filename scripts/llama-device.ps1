@@ -201,3 +201,44 @@ function Get-LlamaSpeculativeProfile {
         Description = "draft-mtp (auto, draft max 6)"
     }
 }
+
+function New-LlamaRouterPreset {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerExecutable,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo[]]$Models,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DefaultModelName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($model in $Models) {
+        $modelId = [IO.Path]::GetFileNameWithoutExtension($model.Name)
+        $speculative = Get-LlamaSpeculativeProfile -ServerExecutable $ServerExecutable -ModelPath $model.FullName
+        $lines.Add("[$modelId]")
+        $lines.Add("model = $($model.FullName)")
+        $loadOnStartup = ($model.Name -ieq $DefaultModelName).ToString().ToLowerInvariant()
+        $lines.Add("load-on-startup = $loadOnStartup")
+        $lines.Add("stop-timeout = 15")
+        if ($speculative.Arguments.Count -gt 0) {
+            foreach ($index in 0..($speculative.Arguments.Count - 1)) {
+                if ($index % 2 -ne 0) { continue }
+                $key = $speculative.Arguments[$index].TrimStart("-")
+                $value = $speculative.Arguments[$index + 1]
+                $lines.Add("$key = $value")
+            }
+        }
+        $lines.Add("")
+    }
+
+    $outputDirectory = Split-Path -Parent $OutputPath
+    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    [IO.File]::WriteAllLines($OutputPath, $lines, [Text.UTF8Encoding]::new($false))
+    return $OutputPath
+}

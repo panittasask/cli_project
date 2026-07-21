@@ -5,6 +5,7 @@ node_modules/
 .cli/logs/
 .cli/checkpoints.json
 .cli/settings.json
+.cli/router-models.ini
 
 # Environment and local secrets
 .env
