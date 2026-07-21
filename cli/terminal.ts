@@ -2177,6 +2177,9 @@ async function runAgentLoop(
             if (validation.ok || rollback?.ok) validationFailures.delete(action.path);
             else validationFailures.add(action.path);
             if (!rollback?.ok && result.changed !== false) {
+                // A write changes the file version. Do not let an earlier read
+                // authorize a later mutation against stale contents.
+                readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                 guard.recordFileProgress();
                 writtenPaths.add(action.path);
                 projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
@@ -2216,6 +2219,8 @@ async function runAgentLoop(
                     output: `${result.output}\nDeletion rolled back because it introduced unmet task requirements: ${introducedBlockers.join("; ")}. ${rollback.message} The delete_file action is quarantined until a different mutation persists.`
                 };
             } else {
+                // A deleted file likewise invalidates any prior read evidence.
+                readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                 guard.recordFileProgress();
                 validationFailures.delete(action.path);
                 writtenPaths.add(action.path);
