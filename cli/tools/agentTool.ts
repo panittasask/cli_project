@@ -449,6 +449,8 @@ ${mcpSection}`;
                 if (packageContentAddsBrowserAutoOpen(action.path, action.content)) {
                     return { ok: false, output: "Blocked package script: automatic browser-opening flags such as --open are not allowed. Use a normal start script without auto-open." };
                 }
+                const mcpConfigError = this.mcpConfigWriteError(action.path, action.content);
+                if (mcpConfigError) return { ok: false, output: mcpConfigError };
 
                 const writeTarget = this.resolveInsideWorkspace(action.path);
                 if (fs.existsSync(writeTarget) && fs.statSync(writeTarget).isFile()
@@ -468,6 +470,8 @@ ${mcpSection}`;
                 if (packageContentAddsBrowserAutoOpen(action.path, prepared.content)) {
                     return { ok: false, output: "Blocked package script: automatic browser-opening flags such as --open are not allowed. Use a normal start script without auto-open." };
                 }
+                const mcpConfigError = this.mcpConfigWriteError(action.path, prepared.content);
+                if (mcpConfigError) return { ok: false, output: mcpConfigError };
                 const editTarget = this.resolveInsideWorkspace(action.path);
                 if (fs.readFileSync(editTarget, "utf8") === prepared.content) {
                     return { ok: true, changed: false, output: `No change needed: ${action.path} already contains the requested replacement.` };
@@ -758,6 +762,22 @@ ${mcpSection}`;
         const resolved = this.resolveInsideWorkspace(inputPath);
         fs.mkdirSync(path.dirname(resolved), { recursive: true });
         fs.writeFileSync(resolved, content, "utf8");
+    }
+
+    private mcpConfigWriteError(inputPath: string, content: string): string | undefined {
+        const normalizedPath = inputPath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+        if (normalizedPath !== ".cli/mcp.json") return undefined;
+
+        try {
+            const parsed = JSON.parse(content) as { mcpServers?: unknown };
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+                || !parsed.mcpServers || typeof parsed.mcpServers !== "object" || Array.isArray(parsed.mcpServers)) {
+                return "Invalid .cli/mcp.json: it must be a JSON object with an object-valued mcpServers field. Use {\"mcpServers\":{...}}.";
+            }
+        } catch {
+            return "Invalid .cli/mcp.json: content must be valid JSON with an object-valued mcpServers field.";
+        }
+        return undefined;
     }
 
     private async runCommand(command: string, workdir?: string): Promise<string> {
