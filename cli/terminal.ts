@@ -1417,6 +1417,7 @@ async function runAgentLoop(
     const explicitlyRequestedFiles = Array.from(effectiveUserMessage.matchAll(/(?:^|[\s"'`])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go))(?=$|[\s"'`,)])/gi))
         .map((match) => path.resolve(activeWorkspace, match[1] ?? "").toLowerCase());
     const writeRetriesAwaitingRead = new Set<string>();
+    const noOpMutationPaths = new Set<string>();
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
     let unresolvedToolFailure: { action: string; output: string } | undefined;
@@ -1915,11 +1916,12 @@ async function runAgentLoop(
             spinner.log(`[${turn}/${maxTurns}] ${guardDecision.message}`);
             trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: repeatObservation });
             trace.save();
+            const repeatedMutation = ["edit_file", "write_file", "delete_file"].includes(action.action ?? "");
             recoveryResponseFormat = invocationCorrection
                 ? recoveryFormat("final")
-                : getAgentMutationResponseFormat(
-                    ["edit_file", "write_file", "delete_file"].includes(action.action ?? "") ? action.action : undefined
-                );
+                : repeatedMutation
+                    ? recoveryFormat(["edit_file", "write_file", "delete_file"])
+                    : getAgentMutationResponseFormat();
             const completedWrites = writtenPaths.size > 0
                 ? ` Successful writes so far: ${Array.from(writtenPaths).join(", ")}.`
                 : "";
@@ -1927,7 +1929,9 @@ async function runAgentLoop(
                 role: "user",
                 content: invocationCorrection
                     ? `Observation: ${repeatObservation} Correct the rejected command or option and run a finite verification command with a different invocation. Do not edit source/configuration just to preserve the invalid command.`
-                    : `Observation: ${repeatObservation} The repeated ${action.action} action is unavailable for your next response.${completedWrites} Use the files and errors already observed to make a concrete write_file, edit_file, or delete_file correction now.`
+                    : repeatedMutation
+                        ? `Observation: ${repeatObservation} Further file mutations are unavailable for your next response.${completedWrites} Read the current file, run a finite verification command, or return final. Do not delete a file as recovery from a repeated mutation.`
+                        : `Observation: ${repeatObservation} The repeated ${action.action} action is unavailable for your next response.${completedWrites} Use the files and errors already observed to make a concrete correction now.`
             });
             continue;
         }
@@ -1972,6 +1976,16 @@ async function runAgentLoop(
         }
 
         if (["write_file", "edit_file", "delete_file"].includes(action.action ?? "") && action.path) {
+            const mutationPathKey = path.resolve(activeWorkspace, action.path).toLowerCase();
+            if (noOpMutationPaths.has(mutationPathKey)) {
+                const output = `Blocked mutation: ${action.path} already has the requested state. Read its current contents before any further mutation, or verify/finalize the task. Deletion is not a recovery for a no-op change.`;
+                recoveryResponseFormat = recoveryFormat(["write_file", "edit_file", "delete_file"]);
+                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                trace.add({ turn, status: "error", action: "no_op_mutation_blocked", reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
             const normalizedMutationPath = action.path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
             if (normalizedMutationPath === ".cli/mcp.json" && workflow.kind !== "mcp_creation") {
                 const output = "Blocked MCP config mutation: .cli/mcp.json is only changed for an explicit MCP-server creation task. Keep the existing configuration while working on this project.";
@@ -2115,6 +2129,7 @@ async function runAgentLoop(
         if (action.action === "read_file" && result.ok && action.path) {
             const resolvedReadPath = path.resolve(activeWorkspace, action.path).toLowerCase();
             readPaths.add(resolvedReadPath);
+            noOpMutationPaths.delete(resolvedReadPath);
             if (readOnlyRequest && verificationRequirement === "none" && explicitlyRequestedFiles.length > 0
                 && explicitlyRequestedFiles.every((requestedPath) => readPaths.has(requestedPath))) {
                 recoveryResponseFormat = getAgentFinalResponseFormat();
@@ -2194,6 +2209,7 @@ async function runAgentLoop(
                     successfulMcpCall = false;
                 }
             } else if (validation.ok && result.changed === false) {
+                noOpMutationPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
                 satisfiedPaths.add(action.path);
                 if (verificationRequirement === "none" && !projectRequirement) {
                     recoveryResponseFormat = getAgentFinalResponseFormat();
