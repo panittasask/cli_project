@@ -659,6 +659,13 @@ async function main(): Promise<void> {
         });
         assert.equal(repeatedWrite.ok, true);
         assert.equal(repeatedWrite.changed, false);
+        const invalidMcpConfig = await agent.execute({
+            action: "write_file",
+            path: ".cli/mcp.json",
+            content: "{\"servers\":{}}"
+        });
+        assert.equal(invalidMcpConfig.ok, false);
+        assert.match(invalidMcpConfig.output, /mcpServers field/);
         const deletePath = path.join(editDirectory, "obsolete.txt");
         fs.writeFileSync(deletePath, "obsolete", "utf8");
         const deleteResult = await agent.execute({
