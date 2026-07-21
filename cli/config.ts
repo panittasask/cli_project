@@ -87,6 +87,17 @@ const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, 
     }
 };
 
+// Profiles supply defaults only. Explicit user settings and environment
+// overrides are allowed to request a larger budget within these global safety
+// ceilings; a profile must not silently rewrite a saved user preference.
+const agentBudgetLimits = {
+    maxTurns: 100,
+    maxSegments: 20,
+    maxDurationMinutes: 720,
+    maxCompletionTokens: 128_000,
+    repeatLimit: 20
+};
+
 const defaults: Record<SamplingKind, SamplingSettings> = {
     chat: {
         temperature: 0.6,
@@ -197,11 +208,11 @@ function validateCliSettings(input: unknown): string[] {
             errors.push("agent.profile must be quick, standard, or deep");
         }
         const budget = agentBudgetProfiles[profile];
-        numberField(agent, "maxTurns", "agent.maxTurns", 1, budget.maxTurns);
-        numberField(agent, "maxSegments", "agent.maxSegments", 1, budget.maxSegments);
-        numberField(agent, "maxDurationMinutes", "agent.maxDurationMinutes", 1, budget.maxDurationMs / 60_000);
-        numberField(agent, "maxCompletionTokens", "agent.maxCompletionTokens", 256, budget.maxCompletionTokens);
-        numberField(agent, "repeatLimit", "agent.repeatLimit", 2, budget.repeatLimit);
+        numberField(agent, "maxTurns", "agent.maxTurns", 1, agentBudgetLimits.maxTurns);
+        numberField(agent, "maxSegments", "agent.maxSegments", 1, agentBudgetLimits.maxSegments);
+        numberField(agent, "maxDurationMinutes", "agent.maxDurationMinutes", 1, agentBudgetLimits.maxDurationMinutes);
+        numberField(agent, "maxCompletionTokens", "agent.maxCompletionTokens", 256, agentBudgetLimits.maxCompletionTokens);
+        numberField(agent, "repeatLimit", "agent.repeatLimit", 2, agentBudgetLimits.repeatLimit);
         numberField(agent, "maxClarifications", "agent.maxClarifications", 0);
         booleanField(agent, "requireInspectionBeforeClarification", "agent.requireInspectionBeforeClarification");
         booleanField(agent, "secondClarificationRequiresBlocker", "agent.secondClarificationRequiresBlocker");
@@ -299,22 +310,22 @@ function getAgentGuardSettings(settings: CliSettings): AgentBudgetSettings {
     );
     return {
         profile,
-        maxTurns: boundedInteger("CLI_AGENT_MAX_TURNS", configured.maxTurns, budget.maxTurns, budget.maxTurns),
-        maxSegments: boundedInteger("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments, budget.maxSegments, budget.maxSegments),
+        maxTurns: boundedInteger("CLI_AGENT_MAX_TURNS", configured.maxTurns, budget.maxTurns, agentBudgetLimits.maxTurns),
+        maxSegments: boundedInteger("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments, budget.maxSegments, agentBudgetLimits.maxSegments),
         maxDurationMs: boundedInteger(
             "CLI_AGENT_MAX_MINUTES",
             configured.maxDurationMinutes,
             budget.maxDurationMs / 60_000,
-            budget.maxDurationMs / 60_000
+            agentBudgetLimits.maxDurationMinutes
         ) * 60_000,
         maxCompletionTokens: boundedInteger(
             "CLI_AGENT_MAX_COMPLETION_TOKENS",
             configured.maxCompletionTokens,
             budget.maxCompletionTokens,
-            budget.maxCompletionTokens,
+            agentBudgetLimits.maxCompletionTokens,
             256
         ),
-        repeatLimit: boundedInteger("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit, budget.repeatLimit, budget.repeatLimit, 2)
+        repeatLimit: boundedInteger("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit, budget.repeatLimit, agentBudgetLimits.repeatLimit, 2)
     };
 }
 
