@@ -1391,7 +1391,10 @@ async function runAgentLoop(
     const guard = new AgentGuard(agentGuardSettings);
     const maxTurnsPerSegment = guard.settings.maxTurns;
     const maxSegments = agentGuardSettings.maxSegments;
-    const maxTurns = maxTurnsPerSegment * maxSegments;
+    const unboundedSegments = maxSegments === 0;
+    const maxSegmentsLabel = unboundedSegments ? "unbounded" : String(maxSegments);
+    const maxTurns = unboundedSegments ? Number.POSITIVE_INFINITY : maxTurnsPerSegment * maxSegments;
+    const maxTurnsForLog = unboundedSegments ? 0 : maxTurns;
     let effectiveUserMessage = userMessage;
     let workflow = await decideWorkflowWithLlm(effectiveUserMessage, historyForTask, sessionId, signal);
     const continuation = isContinuationRequest(userMessage);
@@ -1450,7 +1453,7 @@ async function runAgentLoop(
             model,
             contextLength: activeContextLength,
             agentProfile: agentGuardSettings.profile,
-            maxTurns,
+            maxTurns: unboundedSegments ? "unbounded" : maxTurns,
             maxDurationMs: agentGuardSettings.maxDurationMs
         })
     });
@@ -1503,8 +1506,8 @@ async function runAgentLoop(
             readPaths.clear();
             writeRetriesAwaitingRead.clear();
             recoveryResponseFormat = undefined;
-            spinner.log(`Compacted agent context; continuing segment ${segment}/${maxSegments}.`);
-            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${segment}/${maxSegments}` });
+            spinner.log(`Compacted agent context; continuing segment ${segment}/${maxSegmentsLabel}.`);
+            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${segment}/${maxSegmentsLabel}` });
             trace.save();
         }
         const budgetError = guard.checkBudget(segmentTurn);
@@ -1520,8 +1523,8 @@ async function runAgentLoop(
                 : (turn === 1 ? initialAgentResponseFormat : agentResponseFormat));
         recoveryResponseFormat = undefined;
         spinner.update(turn === 1
-            ? `Planning next action (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`
-            : `Reviewing results (segment ${segment}/${maxSegments}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`);
+            ? `Planning next action (segment ${segment}/${maxSegmentsLabel}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`
+            : `Reviewing results (segment ${segment}/${maxSegmentsLabel}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`);
 
         const modelStartedAt = Date.now();
         debugLog("LLM request", { turn, model, messages, responseFormat: requestFormat, sampling: actionSampling });
@@ -1570,7 +1573,7 @@ async function runAgentLoop(
         });
         responseLog.append({
             turn,
-            maxTurns,
+            maxTurns: maxTurnsForLog,
             requestFormat,
             rawContent: rawAssistantContent,
             reasoningContent: choice.message.reasoning_content,
@@ -2385,7 +2388,7 @@ Do not call another tool. Do not claim unverified success.`
         });
         responseLog.append({
             turn: maxTurns + 1,
-            maxTurns,
+            maxTurns: maxTurnsForLog,
             requestFormat: agentResponseFormat,
             rawContent: rawAssistantContent,
             reasoningContent: choice.message.reasoning_content,
