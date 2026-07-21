@@ -205,6 +205,7 @@ async function main(): Promise<void> {
     const deviceScript = fs.readFileSync(path.resolve(__dirname, "llama-device.ps1"), "utf8");
     const serviceScript = fs.readFileSync(path.resolve(__dirname, "start-llama-service.ps1"), "utf8");
     const installServiceScript = fs.readFileSync(path.resolve(__dirname, "install-llama-autostart.ps1"), "utf8");
+    const serverModelScript = fs.readFileSync(path.resolve(__dirname, "server-model.ts"), "utf8");
     assert.match(startScript, /Set-Location -LiteralPath \$appRoot/);
     assert.ok(startScript.indexOf("if ($portInUse)") < startScript.indexOf("Resolve-LlamaDevice"));
     assert.match(startScript, /Reusing llama-server already listening on port \$parsedServerPort/);
@@ -224,7 +225,10 @@ async function main(): Promise<void> {
     assert.match(packageJson.scripts["server:install"], /install-llama-autostart\.ps1/);
     assert.match(packageJson.scripts["server:status"], /status-llama-autostart\.ps1/);
     assert.match(packageJson.scripts["server:restart"], /restart-llama-autostart\.ps1/);
+    assert.equal(packageJson.scripts["server:model"], "tsx scripts/server-model.ts");
     assert.match(packageJson.scripts["server:uninstall"], /uninstall-llama-autostart\.ps1/);
+    assert.match(serverModelScript, /resolveRouterModel\(models, selection\)/);
+    assert.match(serverModelScript, /persistedSettings\.defaultModel = defaultModel/);
     assert.match(serviceScript, /LLAMA_ROUTER_MODE = "true"/);
     assert.match(serviceScript, /llama-autostart\.log/);
     assert.match(installServiceScript, /New-ScheduledTaskTrigger -AtStartup/);

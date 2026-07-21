@@ -11,6 +11,7 @@
     "serve:tailscale": "tailscale serve --bg --tcp=8080 tcp://127.0.0.1:8080",
     "server:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-llama-autostart.ps1",
     "server:restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart-llama-autostart.ps1",
+    "server:model": "tsx scripts/server-model.ts",
     "server:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/status-llama-autostart.ps1",
     "server:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-llama-autostart.ps1",
     "baseline:model": "tsx scripts/baseline-model.ts",
