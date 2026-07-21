@@ -77,6 +77,13 @@ const { LlamaClient } = require("../cli/llamaClient") as { LlamaClient: new (api
     formatError: (error: unknown) => string;
     close: () => void;
 } };
+const { ModelRouterClient, resolveRouterModel } = require("../cli/modelRouter") as {
+    ModelRouterClient: new (apiUrl: string, timeoutMs?: number) => {
+        list: () => Promise<Array<{ id: string; status: string }>>;
+        switch: (selection: string) => Promise<{ model: { id: string; status: string }; unloaded: string[] }>;
+    };
+    resolveRouterModel: (models: Array<{ id: string; path?: string; status: string; failed: boolean }>, selection: string) => { id: string } | undefined;
+};
 const { aggregateTraceSummaries, parseTraceJsonl, summarizeTraceEvents } = require("../cli/traceSummary") as {
     parseTraceJsonl: (content: string) => Array<Record<string, unknown>>;
     summarizeTraceEvents: (events: Array<Record<string, unknown>>) => Array<{
@@ -169,9 +176,61 @@ async function testConnectionResetRetry(): Promise<void> {
     }
 }
 
+async function testModelRouterSwitch(): Promise<void> {
+    const models = [
+        { id: "alpha.gguf", path: "C:\\Models\\alpha.gguf", status: { value: "loaded" } },
+        { id: "beta.gguf", path: "C:\\Models\\beta.gguf", status: { value: "unloaded" } }
+    ];
+    const actions: string[] = [];
+    const server = http.createServer((request, response) => {
+        if (request.method === "GET" && request.url?.startsWith("/models")) {
+            response.writeHead(200, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({ data: models }));
+            return;
+        }
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => { body += chunk; });
+        request.on("end", () => {
+            const payload = JSON.parse(body) as { model: string };
+            if (request.url === "/models/unload") {
+                actions.push(`unload:${payload.model}`);
+                const entry = models.find((candidate) => candidate.id === payload.model);
+                if (entry) entry.status.value = "unloaded";
+            } else if (request.url === "/models/load") {
+                actions.push(`load:${payload.model}`);
+                const entry = models.find((candidate) => candidate.id === payload.model);
+                if (entry) entry.status.value = "loaded";
+            }
+            response.writeHead(200, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({ success: true }));
+        });
+    });
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+        const address = server.address();
+        assert.ok(address && typeof address !== "string");
+        const client = new ModelRouterClient(`http://127.0.0.1:${address.port}/v1/chat/completions`, 5000);
+        const listed = await client.list();
+        assert.equal(resolveRouterModel(listed as any, "2")?.id, "beta.gguf");
+        assert.equal(resolveRouterModel(listed as any, "ALPHA.GGUF")?.id, "alpha.gguf");
+        assert.equal(resolveRouterModel([{ id: "gamma", status: "unloaded", failed: false }], "gamma.gguf")?.id, "gamma");
+        const result = await client.switch("beta.gguf");
+        assert.equal(result.model.id, "beta.gguf");
+        assert.deepEqual(result.unloaded, ["alpha.gguf"]);
+        assert.deepEqual(actions, ["unload:alpha.gguf", "load:beta.gguf"]);
+    } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+}
+
 async function main(): Promise<void> {
     await testConnectionResetRetry();
     await testRequestCancellation();
+    await testModelRouterSwitch();
 
     const traceEvents = parseTraceJsonl([
         JSON.stringify({ taskId: "one", turn: 1, timestamp: "2026-07-20T00:00:00.000Z", status: "ok", action: "read_file" }),

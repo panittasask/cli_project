@@ -15,6 +15,8 @@ type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
     apiUrl?: string;
+    routerMode?: boolean;
+    modelsMax?: number;
     defaultModel?: string;
     contextLength?: number;
     device?: string;
@@ -173,7 +175,9 @@ function validateCliSettings(input: unknown): string[] {
     };
     numberField(settings, "contextLength", "contextLength", 512);
     numberField(settings, "historyMessages", "historyMessages", 0);
+    numberField(settings, "modelsMax", "modelsMax", 1, 32);
     booleanField(settings, "debug");
+    booleanField(settings, "routerMode");
     for (const field of ["llamaCppPath", "modelPath", "defaultModel", "device"]) {
         if (settings[field] !== undefined && (typeof settings[field] !== "string" || !String(settings[field]).trim())) errors.push(`${field} must be a non-empty string`);
     }
