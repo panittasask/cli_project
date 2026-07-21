@@ -21,4 +21,3 @@ Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 Start-ScheduledTask -TaskName $TaskName
 Write-Host "Restart requested: $TaskName"
-

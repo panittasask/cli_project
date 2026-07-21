@@ -16,4 +16,3 @@ Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
 Write-Host "Removed scheduled task and stopped llama-server: $TaskName"
-

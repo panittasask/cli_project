@@ -22,4 +22,3 @@ try {
     Write-Host $_.Exception.Message
     exit 1
 }
-
