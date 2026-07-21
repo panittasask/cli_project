@@ -59,6 +59,8 @@ Prototype contents:
   "serverHost": "127.0.0.1",
   "serverPort": 8080,
   "apiUrl": "http://127.0.0.1:8080/v1/chat/completions",
+  "routerMode": false,
+  "modelsMax": 1,
   "contextLength": 16384,
   "device": "auto",
   "hardwareProfile": "auto",
@@ -110,6 +112,8 @@ $env:LLAMA_DEVICE = "CUDA0"
 $env:LLAMA_HARDWARE_PROFILE = "rtx-4070-super"
 $env:LLAMA_ARG_HOST = "0.0.0.0"
 $env:LLAMA_ARG_PORT = "8080"
+$env:LLAMA_ROUTER_MODE = "true"
+$env:LLAMA_MODELS_MAX = "1"
 $env:LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 $env:LLAMA_MODEL = "another-model.gguf"
 $env:LLAMA_CONTEXT_LENGTH = "65536"
@@ -371,16 +375,31 @@ safely when the server is unavailable or its slots are busy. Run
 ## Changing models
 
 Run `/model` inside the CLI to see the model currently loaded by llama.cpp and
-all `.gguf` files in `D:\Model`.
+all `.gguf` files exposed by the server.
 
-`llama-server` loads the selected GGUF at startup. To switch it:
+Enable `routerMode` on the server to switch models without restarting:
 
-1. Stop the terminal running llama.cpp with `Ctrl+C`.
-2. Run `npm run llama` again.
-3. Select the number of the new model.
+```json
+{
+  "routerMode": true,
+  "modelsMax": 1
+}
+```
 
-The CLI reads the loaded model id from llama.cpp automatically. `/model` is a
-status/list command and does not switch the running server's GGUF file.
+Start the server with `npm run llama`. From any connected CLI, use either the
+number shown by `/model` or the full model id:
+
+```text
+/model
+/model 2
+/model Qwen3-14B-Q4_K_M.gguf
+```
+
+The CLI unloads the previous model before loading the requested one, syncs the
+active model/context, and clears the active task context while preserving saved
+session history. `modelsMax: 1` prevents multiple GGUF models from filling GPU
+memory. Without router mode, `/model <name>` reports that runtime switching is
+unavailable and the original restart-and-select workflow remains available.
 
 ## MCP servers
 

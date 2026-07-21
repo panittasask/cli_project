@@ -45,6 +45,11 @@ const { LlamaClient } = require("./llamaClient") as { LlamaClient: new (apiUrl: 
     formatError: (error: unknown) => string;
     close: () => void;
 } };
+const { ModelRouterClient } = require("./modelRouter") as { ModelRouterClient: new (apiUrl: string, loadTimeoutMs?: number) => {
+    list: () => Promise<RouterModel[]>;
+    switch: (selection: string) => Promise<{ model: RouterModel; unloaded: string[] }>;
+    formatError: (error: unknown) => string;
+} };
 const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, initializeCliSettings, validateCliSettingsFile } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
@@ -297,6 +302,13 @@ type ModelCommandResult = {
     model?: string;
 } | undefined;
 
+type RouterModel = {
+    id: string;
+    path?: string;
+    status: string;
+    failed: boolean;
+};
+
 type WorkspaceCommandResult = {
     type: "show" | "set";
     workspace?: string;
@@ -327,6 +339,8 @@ type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
     apiUrl?: string;
+    routerMode?: boolean;
+    modelsMax?: number;
     defaultModel?: string;
     contextLength?: number;
     device?: string;
@@ -398,7 +412,7 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/readfile", description: "read a text/code file" },
     { command: "/editfile", description: "edit a file with AI" },
     { command: "/workspace", description: "show or change workspace" },
-    { command: "/model", description: "show loaded and available models" },
+    { command: "/model", description: "show or switch server models" },
     { command: "/settings", description: "show effective runtime settings" },
     { command: "/settings init", description: "create settings from the prototype" },
     { command: "/settings validate", description: "validate effective settings" },
@@ -454,6 +468,7 @@ const projectCheckProviders = getProjectCheckProviders(cliSettings);
 // wall-clock guard. The guard's AbortController remains the single source of
 // truth and produces the actionable timeout message.
 const llamaClient = new LlamaClient(apiUrl, agentGuardSettings.maxDurationMs + 5000);
+const modelRouterClient = new ModelRouterClient(apiUrl);
 const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
@@ -549,6 +564,13 @@ function getAvailableModelFiles(): string[] {
 
 async function getLoadedServerModels(): Promise<string[]> {
     try {
+        const routerModels = await modelRouterClient.list();
+        return routerModels.filter((entry) => entry.status === "loaded").map((entry) => entry.id);
+    } catch {
+        // A single-model llama-server does not expose the router /models API.
+    }
+
+    try {
         const modelsUrl = new URL("/v1/models", apiUrl).toString();
         const response = await axios.get(modelsUrl, { timeout: 2000 });
         const entries = Array.isArray(response.data?.data) ? response.data.data : [];
@@ -561,10 +583,12 @@ async function getLoadedServerModels(): Promise<string[]> {
     }
 }
 
-async function getServerContextInfo(): Promise<{ contextLength: number; totalSlots?: number } | undefined> {
+async function getServerContextInfo(modelId?: string): Promise<{ contextLength: number; totalSlots?: number } | undefined> {
     try {
         const propsUrl = new URL("/props", apiUrl).toString();
-        const response = await axios.get(propsUrl, { timeout: 2000 });
+        const url = new URL(propsUrl);
+        if (modelId) url.searchParams.set("model", modelId);
+        const response = await axios.get(url.toString(), { timeout: 2000 });
         const contextLength = Number(response.data?.default_generation_settings?.n_ctx);
         const totalSlots = Number(response.data?.total_slots);
 
@@ -593,9 +617,10 @@ async function syncModelFromServer(): Promise<boolean> {
 }
 
 async function printModelInfo(): Promise<void> {
-    const [loadedModels, serverContext] = await Promise.all([
+    const [loadedModels, serverContext, routerModels] = await Promise.all([
         getLoadedServerModels(),
-        getServerContextInfo()
+        getServerContextInfo(model),
+        modelRouterClient.list().catch(() => undefined)
     ]);
     const availableFiles = getAvailableModelFiles();
 
@@ -609,7 +634,14 @@ async function printModelInfo(): Promise<void> {
         : "Active server context: unavailable (use /model while llama.cpp is running)");
     console.log(`Model directory: ${modelDirectory}`);
 
-    if (availableFiles.length === 0) {
+    if (routerModels) {
+        console.log("Available server models:");
+        routerModels.forEach((entry, index) => {
+            const state = entry.failed ? "failed" : entry.status;
+            console.log(`  [${index + 1}] ${entry.id} (${state})`);
+        });
+        console.log("Switch with /model <number-or-name>.");
+    } else if (availableFiles.length === 0) {
         console.log("Available GGUF models: none found");
     } else {
         console.log("Available GGUF models:");
@@ -618,7 +650,9 @@ async function printModelInfo(): Promise<void> {
         });
     }
 
-    console.log("To load another model: stop the llama.cpp server, run npm run llama, then select its number.");
+    if (!routerModels) {
+        console.log("Runtime switching requires llama.cpp router mode. Restart the server with routerMode enabled.");
+    }
     console.log();
 }
 
@@ -656,8 +690,8 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/editfile <path> | <instruction>   Edit file with AI instruction");
     console.log("/workspace                Show current workspace");
     console.log("/workspace <path>         Change workspace for agent/files");
-    console.log("/model                    Show loaded and available GGUF models");
-    console.log("                            Switch GGUF by restarting npm run llama");
+    console.log("/model                    Show loaded and available server models");
+    console.log("/model <number-or-name>   Switch the router server to another GGUF model");
     console.log("/settings                 Show effective settings and their source");
     console.log("/settings init            Create settings.json from the tracked prototype without overwriting");
     console.log("/settings validate        Validate the effective settings file");
@@ -2420,8 +2454,22 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
         }
 
         if (modelCommand?.type === "set" && modelCommand.model) {
-            console.log("Models can only be selected when llama.cpp starts.");
-            console.log("Stop the server with Ctrl+C, run npm run llama, and select a model number.");
+            try {
+                console.log(`Switching server model to: ${modelCommand.model}`);
+                const result = await modelRouterClient.switch(modelCommand.model);
+                model = result.model.id;
+                plannerModel = result.model.id;
+                const serverContext = await getServerContextInfo(model);
+                activeContextLength = serverContext?.contextLength ?? configuredContextLength;
+                contextStartedAt = Date.now();
+                sessionTool.resetActiveContextUsage(activeSession.id);
+                statusBar.render();
+                if (result.unloaded.length > 0) console.log(`Unloaded: ${result.unloaded.join(", ")}`);
+                console.log(`Current model: ${model}`);
+                console.log("Task context cleared for the new model. Saved session history was kept.");
+            } catch (error) {
+                console.log(`Model switch failed: ${modelRouterClient.formatError(error)}`);
+            }
             console.log();
             ask(activeSession, runMode);
             return;

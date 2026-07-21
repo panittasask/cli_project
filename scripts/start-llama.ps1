@@ -23,6 +23,8 @@ $requestedHardwareProfile = if ($env:LLAMA_HARDWARE_PROFILE) { $env:LLAMA_HARDWA
 $contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 16384 }
 $serverHost = if ($env:LLAMA_ARG_HOST) { $env:LLAMA_ARG_HOST } elseif ($settings.serverHost) { $settings.serverHost } else { "127.0.0.1" }
 $serverPort = if ($env:LLAMA_ARG_PORT) { $env:LLAMA_ARG_PORT } elseif ($settings.serverPort) { $settings.serverPort } else { 8080 }
+$routerMode = if ($env:LLAMA_ROUTER_MODE) { $env:LLAMA_ROUTER_MODE -match '^(?i:1|true|on|yes)$' } elseif ($null -ne $settings.routerMode) { [bool]$settings.routerMode } else { $false }
+$modelsMax = if ($env:LLAMA_MODELS_MAX) { $env:LLAMA_MODELS_MAX } elseif ($settings.modelsMax) { $settings.modelsMax } else { 1 }
 $parsedContextLength = 0
 if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
     throw "Invalid context length: $contextLength"
@@ -30,6 +32,10 @@ if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -
 $parsedServerPort = 0
 if (-not [int]::TryParse($serverPort.ToString(), [ref]$parsedServerPort) -or $parsedServerPort -lt 1 -or $parsedServerPort -gt 65535) {
     throw "Invalid llama.cpp server port: $serverPort"
+}
+$parsedModelsMax = 0
+if (-not [int]::TryParse($modelsMax.ToString(), [ref]$parsedModelsMax) -or $parsedModelsMax -lt 1 -or $parsedModelsMax -gt 32) {
+    throw "Invalid maximum loaded models: $modelsMax"
 }
 
 $launcher = Join-Path $llamaDirectory "llama-server.exe"
@@ -66,25 +72,28 @@ for ($index = 0; $index -lt $models.Count; $index += 1) {
     Write-Host ("[{0}] {1} ({2} GB){3}" -f ($index + 1), $models[$index].Name, $sizeGb, $marker)
 }
 
-$defaultNumber = $defaultModelIndex + 1
-$choice = Read-Host "Select model [1-$($models.Count)] (default $defaultNumber)"
-if ([string]::IsNullOrWhiteSpace($choice)) {
-    $choice = $defaultNumber.ToString()
+$selectedModel = $null
+$serverArguments = @("-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString())
+if ($routerMode) {
+    $serverArguments += @("--models-dir", $modelDirectory, "--models-max", $parsedModelsMax.ToString())
+    $speculativeProfile = [pscustomobject]@{ Arguments = @(); Description = "off (router mode; configure per-model presets for MTP)" }
+} else {
+    $defaultNumber = $defaultModelIndex + 1
+    $choice = Read-Host "Select model [1-$($models.Count)] (default $defaultNumber)"
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultNumber.ToString() }
+    $selectedNumber = 0
+    if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 1 -or $selectedNumber -gt $models.Count) {
+        throw "Invalid model selection: $choice"
+    }
+    $selectedModel = $models[$selectedNumber - 1]
+    $speculativeProfile = Get-LlamaSpeculativeProfile -ServerExecutable $launcher -ModelPath $selectedModel.FullName
+    $serverArguments = @("-m", $selectedModel.FullName) + $serverArguments
 }
-
-$selectedNumber = 0
-if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 1 -or $selectedNumber -gt $models.Count) {
-    throw "Invalid model selection: $choice"
-}
-
-$selectedModel = $models[$selectedNumber - 1]
-$speculativeProfile = Get-LlamaSpeculativeProfile -ServerExecutable $launcher -ModelPath $selectedModel.FullName
-$serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString())
 $serverArguments += @($memoryProfile.Arguments)
 $serverArguments += @($speculativeProfile.Arguments)
 
 Write-Host "Starting llama.cpp from: $llamaDirectory"
-Write-Host "Model: $($selectedModel.Name)"
+Write-Host $(if ($routerMode) { "Model router: $modelDirectory (max loaded: $parsedModelsMax)" } else { "Model: $($selectedModel.Name)" })
 Write-Host "Device: $(if ($llamaDevice) { "$llamaDevice $llamaDeviceDescription" } else { 'auto' })"
 Write-Host "Runtime profile: $($runtimeProfile.Name) / $($runtimeProfile.Backend), batch $($runtimeProfile.BatchSize), ubatch $($runtimeProfile.UBatchSize)"
 Write-Host "Memory profile: $($memoryProfile.Description)"
