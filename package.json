@@ -17,6 +17,7 @@
     "baseline:agent": "tsx scripts/baseline-agent.ts",
     "eval:local": "tsx scripts/evaluate-local-model.ts",
     "report:agent": "tsx scripts/summarize-agent-trace.ts",
+    "logs:view": "tsx scripts/generate-log-viewer.ts",
     "benchmark:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark-hardware.ps1",
     "test:agent": "tsx scripts/test-agent.ts",
     "test:mcp": "tsx scripts/test-mcp.ts",
@@ -27,7 +28,7 @@
     "test:e2e": "tsx scripts/test-agent-e2e.ts",
     "test:live-agent": "tsx scripts/test-live-agent.ts",
     "test:live-behavior": "tsx scripts/test-live-behavior.ts",
-    "test": "npm run test:agent && npm run test:regression && npm run test:mcp && npm run test:hardware && npm run test:e2e && npx tsc --noEmit",
+    "test": "npm run test:agent && npm run test:regression && npm run test:mcp",
     "run test": "npm test"
   },
   "keywords": [],

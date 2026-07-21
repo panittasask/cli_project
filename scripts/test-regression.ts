@@ -3,9 +3,7 @@ import fs = require("node:fs");
 import os = require("node:os");
 import path = require("node:path");
 
-const { classifyWorkflow, classifyWorkflowWithHistory, forbidsWorkspaceWrite, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, verificationRequirement, verificationRequirementWithHistory, commandSatisfiesVerification, acceptanceContract, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("../cli/workflowRouter") as {
-    classifyWorkflow: (message: string) => { kind: string };
-    classifyWorkflowWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { kind: string };
+const { forbidsWorkspaceWrite, requiresWorkspaceWrite, requiresWorkspaceWriteWithHistory, verificationRequirement, verificationRequirementWithHistory, commandSatisfiesVerification, acceptanceContract, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("../cli/workflowRouter") as {
     forbidsWorkspaceWrite: (message: string) => boolean;
     requiresWorkspaceWrite: (message: string) => boolean;
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
@@ -20,6 +18,9 @@ const { classifyWorkflow, classifyWorkflowWithHistory, forbidsWorkspaceWrite, re
 const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext") as {
     isContinuationRequest: (message: string) => boolean;
     selectTaskContext: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, workflow: string, max?: number) => Array<{ content: string }>;
+};
+const { searchReturnedNoResults } = require("../cli/webResearch") as {
+    searchReturnedNoResults: (output: string) => boolean;
 };
 const { WriteValidator } = require("../cli/writeValidator") as { WriteValidator: new (workspace: string) => {
     validate: (file: string) => { ok: boolean; validator: string; output: string };
@@ -246,25 +247,10 @@ async function main(): Promise<void> {
     assert.match(deviceScript, /--spec-type", "draft-mtp"/);
     assert.match(startScript, /Get-LlamaSpeculativeProfile/);
     assert.match(standaloneStartScript, /Get-LlamaSpeculativeProfile/);
-    assert.equal(classifyWorkflow("นกฮูกคืออะไร").kind, "general");
-    assert.equal(classifyWorkflow("เช็คข่าวล่าสุดของ llama.cpp ให้หน่อย").kind, "web_research");
-    assert.equal(classifyWorkflow("ช่วยแก้ cli/terminal.ts และรันเทส").kind, "coding");
-    assert.equal(classifyWorkflow("สร้างหน้า login พร้อม privacy policy modal").kind, "coding");
-    assert.equal(classifyWorkflow("ยังไม่มี ตัว register นะ").kind, "coding");
-    assert.equal(classifyWorkflow("ทำเลยเพิ่มปุ่มตัว register ได้เลย").kind, "coding");
-    assert.equal(classifyWorkflow("ทำงานเดิมต่อจากสถานะไฟล์ปัจจุบันให้เสร็จ").kind, "coding");
+    assert.equal(searchReturnedNoResults('{"attempts":[{"resultCount":5}],"resultCount":0,"evidenceQuality":"insufficient","results":[]}'), true);
+    assert.equal(searchReturnedNoResults('{"resultCount":2,"evidenceQuality":"sufficient","results":[{"url":"https://example.com"}]}'), false);
     const swaggerUntilWorking = "ใช้วิธีแก้อื่นจนกว่ามันจะสามารถเปิด swagger ได้";
-    assert.equal(classifyWorkflow(swaggerUntilWorking).kind, "coding");
-    assert.equal(classifyWorkflow("เช็ค version ล่าสุดของ llama.cpp").kind, "web_research");
     const uiSpacingRequest = "จัดระเบียบ ui ให้มันสวยกว่านี้หน่อยซิ ตัว ยกเลิก กับลงทะเบียนมันติดกันจัดๆเลย";
-    assert.equal(classifyWorkflow(uiSpacingRequest).kind, "coding");
-    assert.equal(classifyWorkflowWithHistory("ทำงานต่อจากเดิมหน่อย", [
-        { role: "user", content: "แก้ไฟล์ login.html ให้มี register" },
-        { role: "assistant", content: "ยังแก้ไม่เสร็จ" }
-    ], true).kind, "coding");
-    assert.equal(classifyWorkflow("สร้าง MCP server เพิ่มให้หน่อย").kind, "mcp_creation");
-    assert.equal(classifyWorkflow("install package ของ react ให้หน่อย").kind, "coding");
-    assert.equal(classifyWorkflow("install zod ให้หน่อย").kind, "coding");
     assert.equal(requiresWorkspaceWrite("install package ของ react ให้หน่อย"), true);
     assert.equal(requiresWorkspaceWrite("install zod ให้หน่อย"), true);
     assert.equal(requiresWorkspaceWrite("ติดตั้งแพ็กเกจของ react ให้หน่อย"), true);
@@ -283,12 +269,10 @@ async function main(): Promise<void> {
     assert.equal(requiresWorkspaceWrite("file ถูกสร้างไว้ที่ไหน"), false);
     assert.equal(verificationRequirement(swaggerUntilWorking), "runtime");
     const fullStackPrompt = "create a golang restfull api with react website show dashboard about employee";
-    assert.equal(classifyWorkflow(fullStackPrompt).kind, "coding");
     assert.equal(requiresWorkspaceWrite(fullStackPrompt), true);
     assert.equal(verificationRequirement(fullStackPrompt), "command");
     assert.equal(verificationRequirement("create a Go API with Swagger UI"), "runtime");
     const angularSwitchPrompt = "เปลี่ยนเป็นไปใช้ angular แทนได้ไหมถ้างั้น ลบ react ทิ้งไปก่อนแล้วสร้าง dashboard โดยใช้ angular แทน";
-    assert.equal(classifyWorkflow(angularSwitchPrompt).kind, "coding");
     assert.equal(requiresWorkspaceWrite(angularSwitchPrompt), true);
     assert.equal(verificationRequirement(angularSwitchPrompt), "command");
     assert.equal(verificationRequirement("แก้ TypeScript จนกว่า npm test จะผ่าน"), "command");
@@ -522,7 +506,9 @@ async function main(): Promise<void> {
     assert.ok(!localWebActions.includes("mcp_call_tool"));
     assert.ok(!localWebActions.includes("mcp_list_tools"));
     const generalActions = getAgentResponseFormat("general").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "ask_user", "final"]);
+    assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
+    const codingActions = getAgentResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.deepEqual(codingActions, generalActions);
     const readOnlyActions = getAgentReadOnlyResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(readOnlyActions.includes("read_file"));
     assert.ok(!readOnlyActions.includes("run_command"));
@@ -997,9 +983,20 @@ async function main(): Promise<void> {
     }
 
     const pipeline = await import("../mcp/servers/web-search/searchPipeline.mjs") as {
+        tokenize: (value: string) => string[];
         rewriteQueries: (query: string) => string[];
         runSearchPipeline: (query: string, max: number, search: (query: string) => Promise<{ provider: string; results: unknown[] }>) => Promise<{ attempts: unknown[]; resultCount: number; evidenceQuality: string; results: Array<{ url: string }> }>;
     };
+    const htmlSearch = await import("../mcp/servers/web-search/htmlSearch.mjs") as {
+        extractBingSearchResults: (html: string, maxResults: number) => Array<{ title: string; snippet: string; url: string; source: string }>;
+    };
+    const scrapedResults = htmlSearch.extractBingSearchResults(`
+        <li class="b_algo"><h2><a href="https://example.com/qwen2.5-coder">Qwen2.5-Coder</a></h2><div class="b_caption"><p>Model &amp; tooling overview.</p></div></li>
+        <li class="b_algo"><h2><a href="https://docs.example.com/guide">Documentation</a></h2><div class="b_caption"><p>Usage guide.</p></div></li>
+    `, 5);
+    assert.deepEqual(scrapedResults.map((result) => result.url), ["https://example.com/qwen2.5-coder", "https://docs.example.com/guide"]);
+    assert.equal(scrapedResults[0]?.snippet, "Model & tooling overview.");
+    assert.ok(pipeline.tokenize("Qwen2.5-Coder").includes("qwen2.5-coder"));
     assert.ok(pipeline.rewriteQueries("Meme 67 คืออะไร").length >= 2);
     let attempts = 0;
     const searchResult = await pipeline.runSearchPipeline("Meme 67", 5, async () => {
@@ -1015,6 +1012,14 @@ async function main(): Promise<void> {
     assert.equal(searchResult.resultCount, 2);
     assert.equal(searchResult.attempts.length, 2);
     assert.ok(searchResult.results.every((result) => !result.url.includes("weather")));
+    const technicalSearchResult = await pipeline.runSearchPipeline("qwen2.5-coder", 2, async () => ({
+        provider: "test",
+        results: [
+            { title: "Qwen2.5-Coder model", snippet: "Technical model overview", url: "https://example.com/qwen2.5-coder" },
+            { title: "Qwen2.5-Coder documentation", snippet: "Model documentation", url: "https://docs.example.com/qwen2.5-coder" }
+        ]
+    }));
+    assert.equal(technicalSearchResult.resultCount, 2);
 
     console.log("Workflow routing, context isolation, validators, and web relevance regression tests passed.");
 }

@@ -1,7 +1,7 @@
 const stopWords = new Set(["the", "and", "for", "what", "with", "from", "คือ", "อะไร", "ของ", "ที่", "ใน", "ไหม", "หน่อย"]);
 
 export function tokenize(value) {
-    return (String(value || "").toLowerCase().match(/[a-z0-9]{2,}|[\u0E00-\u0E7F]{2,}/g) || [])
+    return (String(value || "").toLowerCase().match(/[a-z0-9]+(?:[._-][a-z0-9]+)+|[a-z0-9]{2,}|[\u0E00-\u0E7F]{2,}/g) || [])
         .filter((token) => !stopWords.has(token));
 }
 

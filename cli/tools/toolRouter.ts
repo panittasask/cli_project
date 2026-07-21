@@ -1,4 +1,5 @@
 type RouterTool = "readfile" | "editfile" | "none";
+type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 
 type RouterDecision = {
     needsTool: boolean;
@@ -10,6 +11,32 @@ type RouterDecision = {
 };
 
 class ToolRouter {
+    buildWorkflowMessages(message: string, recentContext: Array<{ role: "user" | "assistant"; content: string }> = []): Array<{ role: "system" | "user"; content: string }> {
+        const context = recentContext.slice(-6).map((entry) => `${entry.role}: ${entry.content}`).join("\n");
+        return [
+            { role: "system", content: `Classify the user's task from its intended outcome and relevant conversation context. Do not infer intent from isolated keywords, spelling, or product names.
+Choose one workflow: general (conversation or freely chosen tools), web_research (needs external/current evidence), coding (primary outcome is local workspace work), mcp_creation (primary outcome is an MCP server or registration change).
+This classification must not remove otherwise safe tools. Return only JSON: {"workflow":"general|web_research|coding|mcp_creation","reason":"short semantic rationale"}` },
+            { role: "user", content: `${context ? `Recent context:\n${context}\n\n` : ""}Current request:\n${message}` }
+        ];
+    }
+
+    parseWorkflowDecision(content: string | undefined | null): { kind: WorkflowKind; reason: string } | undefined {
+        if (!content) return undefined;
+        const raw = content.trim();
+        const start = raw.indexOf("{");
+        const end = raw.lastIndexOf("}");
+        if (start === -1 || end <= start) return undefined;
+        try {
+            const data = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
+            const workflow = typeof data.workflow === "string" ? data.workflow : "";
+            if (!["general", "web_research", "coding", "mcp_creation"].includes(workflow)) return undefined;
+            return { kind: workflow as WorkflowKind, reason: typeof data.reason === "string" ? data.reason.trim() : "LLM workflow decision." };
+        } catch {
+            return undefined;
+        }
+    }
+
     buildRouterMessages(message: string): Array<{ role: "system" | "user"; content: string }> {
         return [
             {
