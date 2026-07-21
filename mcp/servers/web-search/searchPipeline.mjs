@@ -16,11 +16,6 @@ export function rewriteQueries(query) {
     if (/\bmeme\s*67\b|\b67\s*meme\b/i.test(clean)) {
         variants.push('"6-7" meme origin TikTok');
     }
-    if (/[\u0E00-\u0E7F]/.test(clean)) {
-        variants.push(`${clean} meaning origin context`);
-    } else {
-        variants.push(`${clean} meaning origin context`);
-    }
     const withoutQuestionWords = clean.replace(/\b(what is|who is|how does)\b|(?:คืออะไร|หมายถึงอะไร|ช่วยหา|ค้นหา)/gi, " ").replace(/\s+/g, " ").trim();
     if (withoutQuestionWords && withoutQuestionWords !== clean) variants.push(withoutQuestionWords);
     return [...new Set(variants)].slice(0, 4);
@@ -31,7 +26,10 @@ export function scoreResult(query, result) {
     const resultTokens = new Set(tokenize(`${result.title || ""} ${result.snippet || ""} ${result.url || ""}`));
     let overlap = 0;
     for (const token of queryTokens) if (resultTokens.has(token)) overlap += 1;
-    const minimumOverlap = queryTokens.size >= 3 ? 2 : 1;
+    // Require a meaningful share of the request's terms. This prevents a
+    // generic page that happens to define one word in a long technical query
+    // from becoming evidence for the whole request.
+    const minimumOverlap = Math.max(1, Math.ceil(queryTokens.size / 2));
     return overlap >= minimumOverlap ? overlap : 0;
 }
 

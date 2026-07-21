@@ -985,6 +985,7 @@ async function main(): Promise<void> {
     const pipeline = await import("../mcp/servers/web-search/searchPipeline.mjs") as {
         tokenize: (value: string) => string[];
         rewriteQueries: (query: string) => string[];
+        scoreResult: (query: string, result: { title?: string; snippet?: string; url?: string }) => number;
         runSearchPipeline: (query: string, max: number, search: (query: string) => Promise<{ provider: string; results: unknown[] }>) => Promise<{ attempts: unknown[]; resultCount: number; evidenceQuality: string; results: Array<{ url: string }> }>;
     };
     const htmlSearch = await import("../mcp/servers/web-search/htmlSearch.mjs") as {
@@ -998,6 +999,7 @@ async function main(): Promise<void> {
     assert.equal(scrapedResults[0]?.snippet, "Model & tooling overview.");
     assert.ok(pipeline.tokenize("Qwen2.5-Coder").includes("qwen2.5-coder"));
     assert.ok(pipeline.rewriteQueries("Meme 67 คืออะไร").length >= 2);
+    assert.ok(!pipeline.rewriteQueries("best local AI models for GGUF").some((query) => /meaning origin context/i.test(query)));
     let attempts = 0;
     const searchResult = await pipeline.runSearchPipeline("Meme 67", 5, async () => {
         attempts += 1;
@@ -1020,6 +1022,11 @@ async function main(): Promise<void> {
         ]
     }));
     assert.equal(technicalSearchResult.resultCount, 2);
+    assert.equal(pipeline.scoreResult("best local AI models for GGUF meaning origin context", {
+        title: "BEST Definition & Meaning",
+        snippet: "The meaning of best.",
+        url: "https://dictionary.example.com/best"
+    }), 0);
 
     console.log("Workflow routing, context isolation, validators, and web relevance regression tests passed.");
 }
