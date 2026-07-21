@@ -21,9 +21,15 @@ $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($se
 $requestedLlamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "auto" }
 $requestedHardwareProfile = if ($env:LLAMA_HARDWARE_PROFILE) { $env:LLAMA_HARDWARE_PROFILE } elseif ($settings.hardwareProfile) { $settings.hardwareProfile } else { "auto" }
 $contextLength = if ($env:LLAMA_CONTEXT_LENGTH) { $env:LLAMA_CONTEXT_LENGTH } elseif ($settings.contextLength) { $settings.contextLength } else { 16384 }
+$serverHost = if ($env:LLAMA_ARG_HOST) { $env:LLAMA_ARG_HOST } elseif ($settings.serverHost) { $settings.serverHost } else { "127.0.0.1" }
+$serverPort = if ($env:LLAMA_ARG_PORT) { $env:LLAMA_ARG_PORT } elseif ($settings.serverPort) { $settings.serverPort } else { 8080 }
 $parsedContextLength = 0
 if (-not [int]::TryParse($contextLength.ToString(), [ref]$parsedContextLength) -or $parsedContextLength -lt 512) {
     throw "Invalid context length: $contextLength"
+}
+$parsedServerPort = 0
+if (-not [int]::TryParse($serverPort.ToString(), [ref]$parsedServerPort) -or $parsedServerPort -lt 1 -or $parsedServerPort -gt 65535) {
+    throw "Invalid llama.cpp server port: $serverPort"
 }
 
 $launcher = Join-Path $llamaDirectory "llama-server.exe"
@@ -73,7 +79,7 @@ if (-not [int]::TryParse($choice, [ref]$selectedNumber) -or $selectedNumber -lt 
 
 $selectedModel = $models[$selectedNumber - 1]
 $speculativeProfile = Get-LlamaSpeculativeProfile -ServerExecutable $launcher -ModelPath $selectedModel.FullName
-$serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", "127.0.0.1", "--port", "8080")
+$serverArguments = @("-m", $selectedModel.FullName, "-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString())
 $serverArguments += @($memoryProfile.Arguments)
 $serverArguments += @($speculativeProfile.Arguments)
 
@@ -84,7 +90,8 @@ Write-Host "Runtime profile: $($runtimeProfile.Name) / $($runtimeProfile.Backend
 Write-Host "Memory profile: $($memoryProfile.Description)"
 Write-Host "Speculative decoding: $($speculativeProfile.Description)"
 Write-Host ("Configured context: {0:N0} tokens" -f $parsedContextLength)
-Write-Host "The CLI will connect to: http://127.0.0.1:8080"
+Write-Host "Listening on: http://${serverHost}:$parsedServerPort"
+Write-Host "Local health check: http://127.0.0.1:$parsedServerPort/health"
 Write-Host ""
 
 & $launcher @serverArguments

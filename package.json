@@ -8,6 +8,7 @@
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1",
     "dev:cli": "tsx cli/terminal.ts",
     "llama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-llama.ps1",
+    "serve:tailscale": "tailscale serve --bg 8080",
     "baseline:model": "tsx scripts/baseline-model.ts",
     "baseline:agent": "tsx scripts/baseline-agent.ts",
     "eval:local": "tsx scripts/evaluate-local-model.ts",

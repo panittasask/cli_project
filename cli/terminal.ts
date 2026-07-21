@@ -326,6 +326,7 @@ type SessionUsage = ApiUsage & {
 type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
+    apiUrl?: string;
     defaultModel?: string;
     contextLength?: number;
     device?: string;
@@ -444,6 +445,7 @@ rl.on("SIGINT", () => {
 });
 
 const apiUrl = process.env.LLAMA_API_URL?.trim()
+    || cliSettings.apiUrl?.trim()
     || "http://127.0.0.1:8080/v1/chat/completions";
 const agentGuardSettings = getAgentGuardSettings(cliSettings);
 const clarificationSettings = getClarificationSettings(cliSettings);

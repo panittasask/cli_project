@@ -1,6 +1,9 @@
 {
   "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
+  "serverHost": "127.0.0.1",
+  "serverPort": 8080,
+  "apiUrl": "http://127.0.0.1:8080/v1/chat/completions",
   "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
   "contextLength": 16384,
   "device": "auto",

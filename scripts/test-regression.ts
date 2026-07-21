@@ -197,14 +197,20 @@ const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspac
 };
 
 async function main(): Promise<void> {
+    const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
     const startScript = fs.readFileSync(path.resolve(__dirname, "start.ps1"), "utf8");
     const standaloneStartScript = fs.readFileSync(path.resolve(__dirname, "start-llama.ps1"), "utf8");
     const deviceScript = fs.readFileSync(path.resolve(__dirname, "llama-device.ps1"), "utf8");
     assert.match(startScript, /Set-Location -LiteralPath \$appRoot/);
     assert.ok(startScript.indexOf("if ($portInUse)") < startScript.indexOf("Resolve-LlamaDevice"));
-    assert.match(startScript, /Reusing llama-server already listening on port 8080/);
+    assert.match(startScript, /Reusing llama-server already listening on port \$parsedServerPort/);
     assert.match(startScript, /Stopping reused llama\.cpp/);
     assert.match(startScript, /ProcessName -ne "llama-server"/);
+    assert.match(startScript, /elseif \(\$settings\.serverHost\)/);
+    assert.match(startScript, /elseif \(\$settings\.serverPort\)/);
+    assert.match(startScript, /"--host", \$serverHost, "--port", \$parsedServerPort\.ToString\(\)/);
+    assert.match(standaloneStartScript, /"--host", \$serverHost, "--port", \$parsedServerPort\.ToString\(\)/);
+    assert.equal(packageJson.scripts["serve:tailscale"], "tailscale serve --bg 8080");
     assert.match(deviceScript, /function Get-LlamaSpeculativeProfile/);
     assert.match(deviceScript, /function Get-LlamaMemoryProfile/);
     assert.match(deviceScript, /function Resolve-LlamaHardwareProfile/);

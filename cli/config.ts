@@ -14,6 +14,7 @@ type SamplingProfile = Partial<SamplingSettings>;
 type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
+    apiUrl?: string;
     defaultModel?: string;
     contextLength?: number;
     device?: string;
