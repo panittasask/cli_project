@@ -91,7 +91,9 @@ const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, 
 // overrides are allowed to request a larger budget within these global safety
 // ceilings; a profile must not silently rewrite a saved user preference.
 const agentBudgetLimits = {
-    maxTurns: 100,
+    // maxTurns is the context-compaction cadence when maxSegments is 0, so it
+    // must not silently truncate a deliberately longer user setting.
+    maxTurns: 1_000,
     maxSegments: 20,
     maxDurationMinutes: 720,
     maxCompletionTokens: 128_000,
@@ -209,9 +211,9 @@ function validateCliSettings(input: unknown): string[] {
         }
         const budget = agentBudgetProfiles[profile];
         numberField(agent, "maxTurns", "agent.maxTurns", 1, agentBudgetLimits.maxTurns);
-        numberField(agent, "maxSegments", "agent.maxSegments", 1, agentBudgetLimits.maxSegments);
+        numberField(agent, "maxSegments", "agent.maxSegments", 0, agentBudgetLimits.maxSegments);
         numberField(agent, "maxDurationMinutes", "agent.maxDurationMinutes", 1, agentBudgetLimits.maxDurationMinutes);
-        numberField(agent, "maxCompletionTokens", "agent.maxCompletionTokens", 256, agentBudgetLimits.maxCompletionTokens);
+        numberField(agent, "maxCompletionTokens", "agent.maxCompletionTokens", 0, agentBudgetLimits.maxCompletionTokens);
         numberField(agent, "repeatLimit", "agent.repeatLimit", 2, agentBudgetLimits.repeatLimit);
         numberField(agent, "maxClarifications", "agent.maxClarifications", 0);
         booleanField(agent, "requireInspectionBeforeClarification", "agent.requireInspectionBeforeClarification");
@@ -311,7 +313,7 @@ function getAgentGuardSettings(settings: CliSettings): AgentBudgetSettings {
     return {
         profile,
         maxTurns: boundedInteger("CLI_AGENT_MAX_TURNS", configured.maxTurns, budget.maxTurns, agentBudgetLimits.maxTurns),
-        maxSegments: boundedInteger("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments, budget.maxSegments, agentBudgetLimits.maxSegments),
+        maxSegments: boundedInteger("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments, budget.maxSegments, agentBudgetLimits.maxSegments, 0),
         maxDurationMs: boundedInteger(
             "CLI_AGENT_MAX_MINUTES",
             configured.maxDurationMinutes,
@@ -323,7 +325,7 @@ function getAgentGuardSettings(settings: CliSettings): AgentBudgetSettings {
             configured.maxCompletionTokens,
             budget.maxCompletionTokens,
             agentBudgetLimits.maxCompletionTokens,
-            256
+            0
         ),
         repeatLimit: boundedInteger("CLI_AGENT_REPEAT_LIMIT", configured.repeatLimit, budget.repeatLimit, agentBudgetLimits.repeatLimit, 2)
     };

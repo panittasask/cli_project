@@ -298,7 +298,7 @@ async function main(): Promise<void> {
         const repeated = initializeCliSettings(settingsInitRoot);
         assert.equal(repeated.created, false);
         assert.deepEqual(loadCliSettings(settingsInitRoot), { preserved: true });
-        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, hardwareProfile: "unknown", agent: { maxSegments: 0 }, sampling: { action: { top_p: 3 } } }), "utf8");
+        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, hardwareProfile: "unknown", agent: { maxSegments: -1 }, sampling: { action: { top_p: 3 } } }), "utf8");
         const invalidSettings = validateCliSettingsFile(settingsInitRoot);
         assert.equal(invalidSettings.ok, false);
         assert.match(invalidSettings.errors.join("\n"), /contextLength/);
@@ -353,6 +353,19 @@ async function main(): Promise<void> {
         maxSegments: 3,
         maxDurationMs: 7_200_000,
         maxCompletionTokens: 8000,
+        repeatLimit: 2
+    });
+    assert.deepEqual(getAgentGuardSettings({ agent: {
+        maxTurns: 120,
+        maxSegments: 0,
+        maxDurationMinutes: 120,
+        maxCompletionTokens: 0
+    } }), {
+        profile: "standard",
+        maxTurns: 120,
+        maxSegments: 0,
+        maxDurationMs: 7_200_000,
+        maxCompletionTokens: 0,
         repeatLimit: 2
     });
     assert.deepEqual(getAgentGuardSettings({ agent: { profile: "deep" } }), {

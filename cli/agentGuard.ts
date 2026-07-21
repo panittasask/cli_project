@@ -22,9 +22,9 @@ class AgentGuard {
     }
 
     checkBudget(turn: number, now = Date.now()): string | undefined {
-        if (turn > this.settings.maxTurns) return `turn budget reached (${this.settings.maxTurns})`;
+        if (this.settings.maxTurns > 0 && turn > this.settings.maxTurns) return `turn budget reached (${this.settings.maxTurns})`;
         if (this.elapsedMs(now) >= this.settings.maxDurationMs) return `wall-clock budget reached (${this.formatRemaining(now)})`;
-        if (this.completionTokens >= this.settings.maxCompletionTokens) return `completion-token budget reached (${this.completionTokens}/${this.settings.maxCompletionTokens})`;
+        if (this.settings.maxCompletionTokens > 0 && this.completionTokens >= this.settings.maxCompletionTokens) return `completion-token budget reached (${this.completionTokens}/${this.settings.maxCompletionTokens})`;
         return undefined;
     }
 
