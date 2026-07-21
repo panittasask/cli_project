@@ -140,11 +140,10 @@ tailnet, and keep the server's `serverHost` set to `127.0.0.1`. After starting
 npm run serve:tailscale
 ```
 
-Tailscale prints a private HTTPS URL such as
-`https://server-name.tailnet-name.ts.net`. Set the client machine's `apiUrl` to
-`https://server-name.tailnet-name.ts.net/v1/chat/completions`, then run
-`npm run dev:cli`. Only devices authorized by that tailnet can reach the
-Tailscale Serve URL.
+Tailscale prints a tailnet-only IP and DNS name. Set the client machine's
+`apiUrl` to `http://<tailscale-ip>:8080/v1/chat/completions` (or use its
+MagicDNS name with port `8080`), then run `npm run dev:cli`. Only devices
+authorized by that tailnet can reach the Tailscale Serve endpoint.
 
 With `device` set to `auto`, the launcher asks the configured `llama-server.exe`
 which accelerator devices it provides and selects the first one. This lets the
