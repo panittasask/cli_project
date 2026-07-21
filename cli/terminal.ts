@@ -1972,6 +1972,16 @@ async function runAgentLoop(
         }
 
         if (["write_file", "edit_file", "delete_file"].includes(action.action ?? "") && action.path) {
+            const normalizedMutationPath = action.path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+            if (normalizedMutationPath === ".cli/mcp.json" && workflow.kind !== "mcp_creation") {
+                const output = "Blocked MCP config mutation: .cli/mcp.json is only changed for an explicit MCP-server creation task. Keep the existing configuration while working on this project.";
+                recoveryResponseFormat = recoveryFormat(["read_file", "final"]);
+                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                trace.add({ turn, status: "error", action: "mcp_config_mutation_blocked", reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
             projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
             const scopeFailure = unownedProjectMutationReason(action.path, projectChecks);
             if (scopeFailure) {
