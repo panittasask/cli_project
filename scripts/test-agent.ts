@@ -336,10 +336,23 @@ async function main(): Promise<void> {
         repeatLimit: 5
     } }), {
         profile: "quick",
-        maxTurns: 4,
-        maxSegments: 1,
-        maxDurationMs: 180_000,
-        maxCompletionTokens: 3000,
+        maxTurns: 50,
+        maxSegments: 3,
+        maxDurationMs: 3_600_000,
+        maxCompletionTokens: 16000,
+        repeatLimit: 5
+    });
+    assert.deepEqual(getAgentGuardSettings({ agent: {
+        profile: "standard",
+        maxTurns: 25,
+        maxSegments: 3,
+        maxDurationMinutes: 120
+    } }), {
+        profile: "standard",
+        maxTurns: 25,
+        maxSegments: 3,
+        maxDurationMs: 7_200_000,
+        maxCompletionTokens: 8000,
         repeatLimit: 2
     });
     assert.deepEqual(getAgentGuardSettings({ agent: { profile: "deep" } }), {
