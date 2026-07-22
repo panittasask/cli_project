@@ -1013,6 +1013,10 @@ async function promptForClarification(request: ClarificationRequest, signal: Abo
 type RequestBudgetControl = { pause: () => void; resume: () => void; clear: () => void };
 
 function createRequestBudget(controller: AbortController, durationMs: number): RequestBudgetControl {
+    // Zero is explicitly unbounded. Do not arm a zero-delay timer.
+    if (durationMs <= 0) {
+        return { pause: () => undefined, resume: () => undefined, clear: () => undefined };
+    }
     let remainingMs = durationMs;
     let armedAt = 0;
     let timer: NodeJS.Timeout | undefined;
@@ -1390,11 +1394,12 @@ async function runAgentLoop(
 ): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace>; clarifications: string[] }> {
     const guard = new AgentGuard(agentGuardSettings);
     const maxTurnsPerSegment = guard.settings.maxTurns;
+    const hasStepCadence = maxTurnsPerSegment > 0;
     const maxSegments = agentGuardSettings.maxSegments;
     const unboundedSegments = maxSegments === 0;
     const maxSegmentsLabel = unboundedSegments ? "unbounded" : String(maxSegments);
-    const maxTurns = unboundedSegments ? Number.POSITIVE_INFINITY : maxTurnsPerSegment * maxSegments;
-    const maxTurnsForLog = unboundedSegments ? 0 : maxTurns;
+    const maxTurns = unboundedSegments || !hasStepCadence ? Number.POSITIVE_INFINITY : maxTurnsPerSegment * maxSegments;
+    const maxTurnsForLog = unboundedSegments || !hasStepCadence ? 0 : maxTurns;
     let effectiveUserMessage = userMessage;
     let workflow = await decideWorkflowWithLlm(effectiveUserMessage, historyForTask, sessionId, signal);
     const continuation = isContinuationRequest(userMessage);
@@ -1454,7 +1459,7 @@ async function runAgentLoop(
             model,
             contextLength: activeContextLength,
             agentProfile: agentGuardSettings.profile,
-            maxTurns: unboundedSegments ? "unbounded" : maxTurns,
+            maxSteps: unboundedSegments || !hasStepCadence ? "unbounded" : maxTurns,
             maxDurationMs: agentGuardSettings.maxDurationMs
         })
     });
@@ -1484,17 +1489,20 @@ async function runAgentLoop(
     );
     let segmentEvents: string[] = [];
     let contextCompactionCount = 0;
+    const stepStatus = (step: number): string => hasStepCadence
+        ? `step ${step}/${maxTurns}`
+        : `step ${step}`;
 
     if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
-        const segmentTurn = (turn - 1) % maxTurnsPerSegment + 1;
-        const segment = Math.floor((turn - 1) / maxTurnsPerSegment) + 1;
+        const segmentTurn = hasStepCadence ? (turn - 1) % maxTurnsPerSegment + 1 : turn;
+        const segment = hasStepCadence ? Math.floor((turn - 1) / maxTurnsPerSegment) + 1 : 1;
         const contextTokenThreshold = Math.floor(activeContextLength * 0.7);
         const compactForTokens = turn > 1
             && contextTokenThreshold > 0
             && sessionTool.getUsage(sessionId).activeContextTokens >= contextTokenThreshold;
-        if ((segmentTurn === 1 && segment > 1) || compactForTokens) {
+        if ((hasStepCadence && segmentTurn === 1 && segment > 1) || compactForTokens) {
             contextCompactionCount += 1;
             const compactedSegment = Math.max(segment, contextCompactionCount + 1);
             messages = buildCompactedAgentMessages(systemPrompt, userMessage, {
@@ -1533,8 +1541,8 @@ async function runAgentLoop(
                 : (turn === 1 ? initialAgentResponseFormat : agentResponseFormat));
         recoveryResponseFormat = undefined;
         spinner.update(turn === 1
-            ? `Planning next action (segment ${segment}/${maxSegmentsLabel}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`
-            : `Reviewing results (segment ${segment}/${maxSegmentsLabel}, ${segmentTurn}/${maxTurnsPerSegment}, ${guard.formatRemaining()})...`);
+            ? `Planning next step (step ${turn}, ${guard.formatRemaining()})...`
+            : `Reviewing results (step ${turn}, ${guard.formatRemaining()})...`);
 
         const modelStartedAt = Date.now();
         debugLog("LLM request", { turn, model, messages, responseFormat: requestFormat, sampling: actionSampling });
@@ -1603,8 +1611,8 @@ async function runAgentLoop(
         });
 
         if (!action) {
-            segmentEvents.push(`Turn ${segmentTurn}: invalid model action (${parseError ?? "unknown parse error"})`);
-            spinner.log(`[${turn}/${maxTurns}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
+            segmentEvents.push(`Step ${segmentTurn}: invalid model action (${parseError ?? "unknown parse error"})`);
+            spinner.log(`[${stepStatus(turn)}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
             trace.add({
                 turn,
                 status: "parse_error",
@@ -1695,7 +1703,7 @@ async function runAgentLoop(
             });
             if (clarificationBlocked) {
                 recoveryResponseFormat = recoveryFormat("ask_user");
-                spinner.log(`[${turn}/${maxTurns}] Clarification blocked: ${clarificationBlocked}`);
+                spinner.log(`[${stepStatus(turn)}] Clarification blocked: ${clarificationBlocked}`);
                 trace.add({
                     turn,
                     status: "error",
@@ -1760,7 +1768,7 @@ async function runAgentLoop(
             const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
             if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
             guard.resetActionHistory();
-            segmentEvents.push(`Turn ${segmentTurn}: user clarification answered`);
+            segmentEvents.push(`Step ${segmentTurn}: user clarification answered`);
             if (workflow.kind !== previousWorkflowKind) {
                 segmentEvents.push(`Workflow reclassified: ${previousWorkflowKind} -> ${workflow.kind}`);
                 spinner.log(`Workflow reclassified after clarification: ${previousWorkflowKind} -> ${workflow.kind}`);
@@ -1775,7 +1783,7 @@ async function runAgentLoop(
         if (action.action === "final") {
             const rejectFinal = (summary: string, feedback: string): void => {
                 recoveryResponseFormat = recoveryFormat("final");
-                spinner.log(`[${turn}/${maxTurns}] Final blocked: ${summary}`);
+                spinner.log(`[${stepStatus(turn)}] Final blocked: ${summary}`);
                 trace.add({
                     turn,
                     status: "error",
@@ -1922,7 +1930,7 @@ async function runAgentLoop(
                 ? ` Review the previous failure before choosing another action:\n${unresolvedVerificationFailure}`
                 : "";
             const repeatObservation = `${guardDecision.message}${failureReview}`;
-            spinner.log(`[${turn}/${maxTurns}] ${guardDecision.message}`);
+            spinner.log(`[${stepStatus(turn)}] ${guardDecision.message}`);
             trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: repeatObservation });
             trace.save();
             const repeatedMutation = ["edit_file", "write_file", "delete_file"].includes(action.action ?? "");
@@ -1964,7 +1972,7 @@ async function runAgentLoop(
             && commandAddsTooling(action.command)
             && !/(?:\blint(?:er|ing)?\b|\btooling\b|\bplugin\b|ติดตั้ง|เพิ่ม.*(?:เครื่องมือ|ปลั๊กอิน))/i.test(userMessage)) {
             const output = "Blocked scope expansion: a missing optional command target does not authorize installing new tooling. Use a finite verification command already declared by the project, or inspect the manifest to find one.";
-            spinner.log(`[${turn}/${maxTurns}] ${output}`);
+            spinner.log(`[${stepStatus(turn)}] ${output}`);
             trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
             trace.save();
             messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1977,7 +1985,7 @@ async function runAgentLoop(
         if (attemptsReadOnlyMutation) {
             const output = "Blocked by read-only contract: the user explicitly prohibited workspace changes. Inspect with read/list/search or return a factual final answer without mutating files.";
             recoveryResponseFormat = getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands);
-            spinner.log(`[${turn}/${maxTurns}] ${output}`);
+            spinner.log(`[${stepStatus(turn)}] ${output}`);
             trace.add({ turn, status: "error", action: "read_only_mutation_blocked", reason: action.reason, arguments: action, observation: output });
             trace.save();
             messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1989,7 +1997,7 @@ async function runAgentLoop(
             if (noOpMutationPaths.has(mutationPathKey)) {
                 const output = `Blocked mutation: ${action.path} already has the requested state. Read its current contents before any further mutation, or verify/finalize the task. Deletion is not a recovery for a no-op change.`;
                 recoveryResponseFormat = recoveryFormat(["write_file", "edit_file", "delete_file"]);
-                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "no_op_mutation_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1999,7 +2007,7 @@ async function runAgentLoop(
             if (normalizedMutationPath === ".cli/mcp.json" && workflow.kind !== "mcp_creation") {
                 const output = "Blocked MCP config mutation: .cli/mcp.json is only changed for an explicit MCP-server creation task. Keep the existing configuration while working on this project.";
                 recoveryResponseFormat = recoveryFormat(["read_file", "final"]);
-                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "mcp_config_mutation_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -2010,7 +2018,7 @@ async function runAgentLoop(
             if (scopeFailure) {
                 const output = `Blocked unscoped project mutation: ${scopeFailure}`;
                 recoveryResponseFormat = recoveryFormat([action.action ?? "write_file", "final"]);
-                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "project_scope_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -2025,7 +2033,7 @@ async function runAgentLoop(
             if (missingCompanions.length > 0) {
                 const output = `Blocked behavior mutation: inspect the target's owning implementation companion before editing: ${missingCompanions.join(", ")}. Trace bindings, imports/providers, handlers, and state changes from source evidence instead of changing presentation markup speculatively.`;
                 recoveryResponseFormat = recoveryFormat([action.action ?? "edit_file", "final"]);
-                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "behavior_inspection_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -2038,7 +2046,7 @@ async function runAgentLoop(
             if (packageRisk) {
                 const output = `Blocked package mutation: ${packageRisk}. Inspect the selected manifest and lockfile, then use an exact user-authorized package and compatible package manager.`;
                 recoveryResponseFormat = recoveryFormat("final");
-                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "package_preflight_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -2051,7 +2059,7 @@ async function runAgentLoop(
             if (protectedDeletion) {
                 const output = `Blocked deletion: ${protectedDeletion}. Inspect the co-located project files and make a different correction.`;
                 recoveryResponseFormat = recoveryFormat(["delete_file", "final"]);
-                spinner.log(`[${turn}/${maxTurns}] ${output}`);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -2063,7 +2071,7 @@ async function runAgentLoop(
             && writeValidator.exists(action.path) && !readPaths.has(path.resolve(activeWorkspace, action.path).toLowerCase())) {
             writeRetriesAwaitingRead.add(path.resolve(activeWorkspace, action.path).toLowerCase());
             const output = `Blocked write: read the existing file first (${action.path}).`;
-            spinner.log(`[${turn}/${maxTurns}] ${output}`);
+            spinner.log(`[${stepStatus(turn)}] ${output}`);
             trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
             trace.save();
             messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });

@@ -22,8 +22,8 @@ class AgentGuard {
     }
 
     checkBudget(turn: number, now = Date.now()): string | undefined {
-        if (this.settings.maxTurns > 0 && turn > this.settings.maxTurns) return `turn budget reached (${this.settings.maxTurns})`;
-        if (this.elapsedMs(now) >= this.settings.maxDurationMs) return `wall-clock budget reached (${this.formatRemaining(now)})`;
+        if (this.settings.maxTurns > 0 && turn > this.settings.maxTurns) return `step budget reached (${this.settings.maxTurns})`;
+        if (this.settings.maxDurationMs > 0 && this.elapsedMs(now) >= this.settings.maxDurationMs) return `wall-clock budget reached (${this.formatRemaining(now)})`;
         if (this.settings.maxCompletionTokens > 0 && this.completionTokens >= this.settings.maxCompletionTokens) return `completion-token budget reached (${this.completionTokens}/${this.settings.maxCompletionTokens})`;
         return undefined;
     }
@@ -64,6 +64,7 @@ class AgentGuard {
     }
 
     formatRemaining(now = Date.now()): string {
+        if (this.settings.maxDurationMs <= 0) return "no time limit";
         const remainingMs = Math.max(0, this.settings.maxDurationMs - this.elapsedMs(now));
         const totalSeconds = Math.ceil(remainingMs / 1000);
         const minutes = Math.floor(totalSeconds / 60);

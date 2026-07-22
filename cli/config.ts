@@ -65,24 +65,24 @@ type AgentBudgetSettings = {
 
 const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, "profile">> = {
     quick: {
-        maxTurns: 4,
-        maxSegments: 1,
-        maxDurationMs: 3 * 60_000,
-        maxCompletionTokens: 3000,
+        maxTurns: 0,
+        maxSegments: 0,
+        maxDurationMs: 0,
+        maxCompletionTokens: 0,
         repeatLimit: 2
     },
     standard: {
-        maxTurns: 12,
-        maxSegments: 1,
-        maxDurationMs: 8 * 60_000,
-        maxCompletionTokens: 8000,
+        maxTurns: 0,
+        maxSegments: 0,
+        maxDurationMs: 0,
+        maxCompletionTokens: 0,
         repeatLimit: 2
     },
     deep: {
-        maxTurns: 12,
-        maxSegments: 2,
-        maxDurationMs: 20 * 60_000,
-        maxCompletionTokens: 16000,
+        maxTurns: 0,
+        maxSegments: 0,
+        maxDurationMs: 0,
+        maxCompletionTokens: 0,
         repeatLimit: 2
     }
 };
@@ -91,8 +91,8 @@ const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, 
 // overrides are allowed to request a larger budget within these global safety
 // ceilings; a profile must not silently rewrite a saved user preference.
 const agentBudgetLimits = {
-    // maxTurns is the context-compaction cadence when maxSegments is 0, so it
-    // must not silently truncate a deliberately longer user setting.
+    // maxTurns and maxDurationMinutes accept 0 for an unbounded agent run.
+    // Positive values remain optional step/time limits for callers that need them.
     maxTurns: 1_000,
     maxSegments: 20,
     maxDurationMinutes: 720,
@@ -210,9 +210,9 @@ function validateCliSettings(input: unknown): string[] {
             errors.push("agent.profile must be quick, standard, or deep");
         }
         const budget = agentBudgetProfiles[profile];
-        numberField(agent, "maxTurns", "agent.maxTurns", 1, agentBudgetLimits.maxTurns);
+        numberField(agent, "maxTurns", "agent.maxTurns", 0, agentBudgetLimits.maxTurns);
         numberField(agent, "maxSegments", "agent.maxSegments", 0, agentBudgetLimits.maxSegments);
-        numberField(agent, "maxDurationMinutes", "agent.maxDurationMinutes", 1, agentBudgetLimits.maxDurationMinutes);
+        numberField(agent, "maxDurationMinutes", "agent.maxDurationMinutes", 0, agentBudgetLimits.maxDurationMinutes);
         numberField(agent, "maxCompletionTokens", "agent.maxCompletionTokens", 0, agentBudgetLimits.maxCompletionTokens);
         numberField(agent, "repeatLimit", "agent.repeatLimit", 2, agentBudgetLimits.repeatLimit);
         numberField(agent, "maxClarifications", "agent.maxClarifications", 0);
@@ -312,13 +312,14 @@ function getAgentGuardSettings(settings: CliSettings): AgentBudgetSettings {
     );
     return {
         profile,
-        maxTurns: boundedInteger("CLI_AGENT_MAX_TURNS", configured.maxTurns, budget.maxTurns, agentBudgetLimits.maxTurns),
+        maxTurns: boundedInteger("CLI_AGENT_MAX_TURNS", configured.maxTurns, budget.maxTurns, agentBudgetLimits.maxTurns, 0),
         maxSegments: boundedInteger("CLI_AGENT_MAX_SEGMENTS", configured.maxSegments, budget.maxSegments, agentBudgetLimits.maxSegments, 0),
         maxDurationMs: boundedInteger(
             "CLI_AGENT_MAX_MINUTES",
             configured.maxDurationMinutes,
             budget.maxDurationMs / 60_000,
-            agentBudgetLimits.maxDurationMinutes
+            agentBudgetLimits.maxDurationMinutes,
+            0
         ) * 60_000,
         maxCompletionTokens: boundedInteger(
             "CLI_AGENT_MAX_COMPLETION_TOKENS",

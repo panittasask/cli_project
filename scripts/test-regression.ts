@@ -683,7 +683,7 @@ async function main(): Promise<void> {
     assert.match(guard.formatRemaining(), /left$/);
     guard.pause();
     guard.resume();
-    assert.match(guard.checkBudget(4) ?? "", /turn budget/);
+    assert.match(guard.checkBudget(4) ?? "", /step budget/);
     guard.recordCompletionTokens(100);
     assert.match(guard.checkBudget(2) ?? "", /completion-token budget/);
 
