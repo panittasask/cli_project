@@ -29,6 +29,10 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (con
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     close: () => Promise<void>;
 } };
+const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settings: { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number }) => {
+    checkBudget: (step: number) => string | undefined;
+    formatRemaining: () => string;
+} };
 const { AgentResponseLog } = require("../cli/agentResponseLog") as { AgentResponseLog: new (logTarget?: string | { directory: string; basename: string }) => {
     append: (entry: Record<string, unknown>) => void;
 } };
@@ -277,10 +281,10 @@ async function main(): Promise<void> {
         const prototypeSettings = loadCliSettings(settingsInitRoot);
         assert.deepEqual(getAgentGuardSettings(prototypeSettings), {
             profile: "standard",
-            maxTurns: 12,
-            maxSegments: 1,
-            maxDurationMs: 480_000,
-            maxCompletionTokens: 8000,
+            maxTurns: 0,
+            maxSegments: 0,
+            maxDurationMs: 0,
+            maxCompletionTokens: 0,
             repeatLimit: 2
         });
         assert.deepEqual(getClarificationSettings(prototypeSettings), {
@@ -293,7 +297,7 @@ async function main(): Promise<void> {
         assert.equal(validateCliSettingsFile(settingsInitRoot).source, "settings.example.json");
         const initialized = initializeCliSettings(settingsInitRoot);
         assert.equal(initialized.created, true);
-        assert.equal((loadCliSettings(settingsInitRoot).agent as Record<string, unknown>).maxSegments, 1);
+        assert.equal((loadCliSettings(settingsInitRoot).agent as Record<string, unknown>).maxSegments, 0);
         fs.writeFileSync(initialized.path, "{\"preserved\":true}\n", "utf8");
         const repeated = initializeCliSettings(settingsInitRoot);
         assert.equal(repeated.created, false);
@@ -352,9 +356,12 @@ async function main(): Promise<void> {
         maxTurns: 25,
         maxSegments: 3,
         maxDurationMs: 7_200_000,
-        maxCompletionTokens: 8000,
+        maxCompletionTokens: 0,
         repeatLimit: 2
     });
+    const unboundedGuard = new AgentGuard({ maxTurns: 0, maxDurationMs: 0, maxCompletionTokens: 0, repeatLimit: 2 });
+    assert.equal(unboundedGuard.checkBudget(10_000), undefined);
+    assert.equal(unboundedGuard.formatRemaining(), "no time limit");
     assert.deepEqual(getAgentGuardSettings({ agent: {
         maxTurns: 120,
         maxSegments: 0,
@@ -370,10 +377,10 @@ async function main(): Promise<void> {
     });
     assert.deepEqual(getAgentGuardSettings({ agent: { profile: "deep" } }), {
         profile: "deep",
-        maxTurns: 12,
-        maxSegments: 2,
-        maxDurationMs: 1_200_000,
-        maxCompletionTokens: 16000,
+        maxTurns: 0,
+        maxSegments: 0,
+        maxDurationMs: 0,
+        maxCompletionTokens: 0,
         repeatLimit: 2
     });
     assert.deepEqual(getClarificationSettings({ agent: {
@@ -492,7 +499,11 @@ async function main(): Promise<void> {
             path: "README.md",
             reason: "Inspect the project documentation."
         }, 1, 12),
-        "[1/12] Reading file: README.md - Inspect the project documentation."
+        "[step 1/12] Reading file: README.md - Inspect the project documentation."
+    );
+    assert.equal(
+        agent.formatActionStatus({ action: "read_file", path: "README.md", reason: "Inspect the project documentation." }, 9, 0),
+        "[step 9] Reading file: README.md - Inspect the project documentation."
     );
     assert.ok(!agent.formatActionStatus({
         action: "run_command",

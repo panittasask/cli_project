@@ -588,7 +588,8 @@ ${mcpSection}`;
         })();
         const reason = clean(action.reason, 120);
 
-        return `[${turn}/${maxTurns}] ${target}${reason ? ` - ${reason}` : ""}`;
+        const progress = maxTurns > 0 ? `step ${turn}/${maxTurns}` : `step ${turn}`;
+        return `[${progress}] ${target}${reason ? ` - ${reason}` : ""}`;
     }
 
     formatObservation(action: AgentAction, result: AgentToolResult): string {
