@@ -1483,15 +1483,22 @@ async function runAgentLoop(
         Array.from(new Set(Array.isArray(extra) ? extra : [extra])).filter(Boolean)
     );
     let segmentEvents: string[] = [];
+    let contextCompactionCount = 0;
 
     if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
         const segmentTurn = (turn - 1) % maxTurnsPerSegment + 1;
         const segment = Math.floor((turn - 1) / maxTurnsPerSegment) + 1;
-        if (segmentTurn === 1 && segment > 1) {
+        const contextTokenThreshold = Math.floor(activeContextLength * 0.7);
+        const compactForTokens = turn > 1
+            && contextTokenThreshold > 0
+            && sessionTool.getUsage(sessionId).activeContextTokens >= contextTokenThreshold;
+        if ((segmentTurn === 1 && segment > 1) || compactForTokens) {
+            contextCompactionCount += 1;
+            const compactedSegment = Math.max(segment, contextCompactionCount + 1);
             messages = buildCompactedAgentMessages(systemPrompt, userMessage, {
-                segment,
+                segment: compactedSegment,
                 maxSegments,
                 writtenPaths: Array.from(writtenPaths),
                 satisfiedPaths: Array.from(satisfiedPaths),
@@ -1506,9 +1513,11 @@ async function runAgentLoop(
             segmentEvents = [];
             readPaths.clear();
             writeRetriesAwaitingRead.clear();
+            sessionTool.resetActiveContextUsage(sessionId);
             recoveryResponseFormat = undefined;
-            spinner.log(`Compacted agent context; continuing segment ${segment}/${maxSegmentsLabel}.`);
-            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${segment}/${maxSegmentsLabel}` });
+            const trigger = compactForTokens ? `at 70% context usage (${contextTokenThreshold.toLocaleString()} tokens)` : "at the turn boundary";
+            spinner.log(`Compacted agent context ${trigger}; continuing segment ${compactedSegment}/${maxSegmentsLabel}.`);
+            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${compactedSegment}/${maxSegmentsLabel} ${trigger}` });
             trace.save();
         }
         const budgetError = guard.checkBudget(segmentTurn);
