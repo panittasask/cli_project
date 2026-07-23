@@ -93,6 +93,14 @@ const { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionB
         hasUnresolvedFailures: boolean;
     }) => string | undefined;
 };
+const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } = require("./verificationRecovery") as {
+    shouldActivateVerificationRecovery: (input: {
+        boundedRun: boolean;
+        baseLimitReached: boolean;
+        unresolvedVerificationFailure?: string;
+    }) => boolean;
+    verificationRecoveryTurnAllowance: (maxTurnsPerSegment: number) => number;
+};
 const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, commandInvokesAgentTool, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk } = require("./commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
@@ -1415,6 +1423,11 @@ async function runAgentLoop(
     const maxSegmentsLabel = unboundedSegments ? "unbounded" : String(maxSegments);
     const maxTurns = unboundedSegments || !hasStepCadence ? Number.POSITIVE_INFINITY : maxTurnsPerSegment * maxSegments;
     const maxTurnsForLog = unboundedSegments || !hasStepCadence ? 0 : maxTurns;
+    const recoveryTurnAllowance = Number.isFinite(maxTurns)
+        ? verificationRecoveryTurnAllowance(maxTurnsPerSegment)
+        : 0;
+    const recoveryMaxTurns = Number.isFinite(maxTurns) ? maxTurns + recoveryTurnAllowance : maxTurns;
+    let verificationRecoveryActive = false;
     let effectiveUserMessage = userMessage;
     let workflow: { kind: WorkflowKind; reason: string } = {
         kind: "general",
@@ -1495,6 +1508,7 @@ async function runAgentLoop(
             contextLength: activeContextLength,
             agentProfile: agentGuardSettings.profile,
             maxSteps: unboundedSegments || !hasStepCadence ? "unbounded" : maxTurns,
+            verificationRecoverySteps: recoveryTurnAllowance,
             maxDurationMs: agentGuardSettings.maxDurationMs
         })
     });
@@ -1529,12 +1543,28 @@ async function runAgentLoop(
     const finalBlockers = new CompletionBlockerTracker(finalBlockerLimit);
     let repeatedFinalBlocker: string | undefined;
     const stepStatus = (step: number): string => hasStepCadence
-        ? `step ${step}/${maxTurns}`
+        ? `step ${step}/${verificationRecoveryActive ? recoveryMaxTurns : maxTurns}`
         : `step ${step}`;
 
     if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
 
-    for (let turn = 1; turn <= maxTurns; turn += 1) {
+    let lastExecutedTurn = 0;
+    for (let turn = 1; ; turn += 1) {
+        if (turn > maxTurns && !verificationRecoveryActive) {
+            verificationRecoveryActive = shouldActivateVerificationRecovery({
+                boundedRun: Number.isFinite(maxTurns),
+                baseLimitReached: true,
+                unresolvedVerificationFailure
+            });
+            if (verificationRecoveryActive) {
+                const observation = `Verification failed at the normal step limit. Continuing for up to ${recoveryTurnAllowance} recovery steps so the agent can inspect the error, correct the project, and rerun verification.`;
+                spinner.log(`[recovery] ${observation}`);
+                trace.add({ turn, status: "action", action: "verification_recovery_started", observation });
+                trace.save();
+            }
+        }
+        if (turn > maxTurns && (!verificationRecoveryActive || turn > recoveryMaxTurns)) break;
+        lastExecutedTurn = turn;
         if (repeatedFinalBlocker) {
             const answer = `Agent stopped after the same completion blocker recurred ${finalBlockerLimit} times: ${repeatedFinalBlocker} Successful workspace changes remain in place and can be continued from the session journal.`;
             trace.add({ turn, status: "error", action: "final_loop_stop", observation: answer });
@@ -1552,7 +1582,9 @@ async function runAgentLoop(
             const compactedSegment = Math.max(segment, contextCompactionCount + 1);
             messages = buildCompactedAgentMessages(systemPrompt, userMessage, {
                 segment: compactedSegment,
-                maxSegments,
+                maxSegments: verificationRecoveryActive && maxSegments > 0
+                    ? maxSegments + 1
+                    : maxSegments,
                 writtenPaths: Array.from(writtenPaths),
                 satisfiedPaths: Array.from(satisfiedPaths),
                 validationFailures: Array.from(validationFailures),
@@ -1570,8 +1602,11 @@ async function runAgentLoop(
             sessionTool.resetActiveContextUsage(sessionId);
             recoveryResponseFormat = undefined;
             const trigger = compactForTokens ? `at 70% context usage (${contextTokenThreshold.toLocaleString()} tokens)` : "at the turn boundary";
-            spinner.log(`Compacted agent context ${trigger}; continuing segment ${compactedSegment}/${maxSegmentsLabel}.`);
-            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${compactedSegment}/${maxSegmentsLabel} ${trigger}` });
+            const segmentLabel = verificationRecoveryActive && compactedSegment > maxSegments
+                ? `${maxSegmentsLabel} + recovery`
+                : maxSegmentsLabel;
+            spinner.log(`Compacted agent context ${trigger}; continuing segment ${compactedSegment}/${segmentLabel}.`);
+            trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${compactedSegment}/${segmentLabel} ${trigger}` });
             trace.save();
         }
         const budgetError = guard.checkBudget(segmentTurn);
@@ -2508,9 +2543,10 @@ async function runAgentLoop(
     }
     if (toolLimitBlockers.length > 0) {
         const answer = formatIncompleteTaskAnswer(toolLimitBlockers, Array.from(writtenPaths));
-        spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached; task remains incomplete`);
+        const executedTurnLimit = verificationRecoveryActive ? recoveryMaxTurns : maxTurns;
+        spinner.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached; task remains incomplete`);
         trace.add({
-            turn: maxTurns + 1,
+            turn: lastExecutedTurn + 1,
             status: "error",
             action: "incomplete_after_tool_limit",
             observation: toolLimitBlockers.join("; ")
@@ -2519,7 +2555,8 @@ async function runAgentLoop(
         return { answer, trace, clarifications: clarificationTranscript };
     }
 
-    spinner.log(`[${maxTurns}/${maxTurns}] Tool limit reached after all completion gates passed; preparing a final summary`);
+    const executedTurnLimit = verificationRecoveryActive ? recoveryMaxTurns : maxTurns;
+    spinner.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached after all completion gates passed; preparing a final summary`);
     spinner.update("Summarizing completed work...");
     messages.push({
         role: "user",
@@ -2558,7 +2595,7 @@ Do not call another tool. Do not claim unverified success.`
             timings: response.data.timings
         });
         responseLog.append({
-            turn: maxTurns + 1,
+            turn: lastExecutedTurn + 1,
             maxTurns: maxTurnsForLog,
             requestFormat: agentResponseFormat,
             rawContent: rawAssistantContent,
@@ -2578,7 +2615,7 @@ Do not call another tool. Do not claim unverified success.`
                 ? answer
                 : `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
             trace.add({
-                turn: maxTurns + 1,
+                turn: lastExecutedTurn + 1,
                 status: "final",
                 action: "final_after_tool_limit",
                 reason: finalAction.reason
@@ -2589,7 +2626,7 @@ Do not call another tool. Do not claim unverified success.`
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         trace.add({
-            turn: maxTurns + 1,
+            turn: lastExecutedTurn + 1,
             status: "error",
             action: "final_after_tool_limit",
             observation: message
@@ -2597,7 +2634,7 @@ Do not call another tool. Do not claim unverified success.`
     }
 
     const answer = "Agent completed the maximum number of tool actions but could not produce a final summary. Review the trace and ask it to inspect the existing files before continuing.";
-    trace.add({ turn: maxTurns + 1, status: "error", action: "final_summary_failed", observation: answer });
+    trace.add({ turn: lastExecutedTurn + 1, status: "error", action: "final_summary_failed", observation: answer });
     trace.save();
     return { answer, trace, clarifications: clarificationTranscript };
 }
@@ -3177,7 +3214,10 @@ Do not mention hidden context, internal tools, or system prompts.`;
                     : "Request cancelled.";
                 console.log(`${reason} The CLI is ready for the next prompt; use /undo if a completed write should be reverted.`);
             }
-            else console.error(`API Error: ${llamaClient.formatError(error)}`);
+            else {
+                console.error(`Model request failed: ${llamaClient.formatError(error)}`);
+                console.log("The task was saved as interrupted and the CLI is ready for the next prompt. Retry to continue from the session journal; use /model to confirm the loaded model.");
+            }
             console.log(formatCompletionLine(elapsedMs, false));
         } finally {
             requestBudget.clear();

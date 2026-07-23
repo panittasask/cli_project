@@ -117,6 +117,14 @@ const { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionB
         hasUnresolvedFailures: boolean;
     }) => string | undefined;
 };
+const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } = require("../cli/verificationRecovery") as {
+    shouldActivateVerificationRecovery: (input: {
+        boundedRun: boolean;
+        baseLimitReached: boolean;
+        unresolvedVerificationFailure?: string;
+    }) => boolean;
+    verificationRecoveryTurnAllowance: (maxTurnsPerSegment: number) => number;
+};
 const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoints") as {
     FileCheckpointStore: new (root: string) => {
         checkpoint: (workspace: string, file: string, next: string) => { preview: string };
@@ -723,6 +731,28 @@ async function main(): Promise<void> {
     assert.match(guard.checkBudget(4) ?? "", /step budget/);
     guard.recordCompletionTokens(100);
     assert.match(guard.checkBudget(2) ?? "", /completion-token budget/);
+
+    // A failed discovered build at the normal limit must leave enough turns
+    // to inspect the diagnostic, edit the source, rerun the check, and finish.
+    assert.equal(shouldActivateVerificationRecovery({
+        boundedRun: true,
+        baseLimitReached: true,
+        unresolvedVerificationFailure: "npm run build failed: component template error"
+    }), true);
+    assert.equal(verificationRecoveryTurnAllowance(25), 8);
+    assert.equal(verificationRecoveryTurnAllowance(3), 4);
+
+    // A nearby workspace task that merely used its normal action budget must
+    // not receive extra mutation turns when no verification command failed.
+    assert.equal(shouldActivateVerificationRecovery({
+        boundedRun: true,
+        baseLimitReached: true
+    }), false);
+    assert.equal(shouldActivateVerificationRecovery({
+        boundedRun: false,
+        baseLimitReached: true,
+        unresolvedVerificationFailure: "test failed"
+    }), false);
 
     const progressGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
     const listAction = { action: "list_files", path: ".", reason: "inspect" };
