@@ -412,6 +412,10 @@ function packageLifecycleRoleChanges(beforeContent: string, afterContent: string
     }
 }
 
+function commandInvokesAgentTool(command: string): boolean {
+    return /^\s*mcp_(?:call_tool|list_tools)\b/i.test(command);
+}
+
 type PackageMutation = {
     manager: "npm" | "pnpm" | "yarn" | "bun";
     operation: "add" | "remove" | "install_declared";
@@ -519,6 +523,7 @@ module.exports = {
     commandInvocationError,
     diagnosticRecoveryGuidance,
     commandInteractiveRisk,
+    commandInvokesAgentTool,
     commandAddsTooling,
     commandCreatesWorkspaceFiles,
     commandMutatesWorkspaceFiles,

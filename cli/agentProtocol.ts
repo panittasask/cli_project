@@ -145,6 +145,23 @@ function getAgentFinalResponseFormat(): Record<string, unknown> {
     return formatForActions(["final"]);
 }
 
+function withoutMcpActions(responseFormat: Record<string, unknown>): Record<string, unknown> {
+    const schema = responseFormat.schema as { oneOf?: Array<Record<string, unknown>> } | undefined;
+    const oneOf = schema?.oneOf;
+    if (!Array.isArray(oneOf)) return responseFormat;
+    const filtered = oneOf.filter((variant) => {
+        const properties = variant.properties as { action?: { const?: unknown } } | undefined;
+        return !String(properties?.action?.const ?? "").startsWith("mcp_");
+    });
+    return {
+        ...responseFormat,
+        schema: {
+            ...schema,
+            oneOf: filtered.length > 0 ? filtered : [variants.final]
+        }
+    };
+}
+
 function getInitialAgentResponseFormat(): Record<string, unknown> {
     return {
         type: "json_object",
@@ -180,4 +197,4 @@ function formatForActions(actions: string[]): Record<string, unknown> {
     };
 }
 
-module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat };
+module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat, withoutMcpActions };
