@@ -257,7 +257,9 @@ class SessionTool {
         }
 
         if (entry.status === "final" || action === "final") task.status = "completed";
-        if (["budget_stop", "repeat_stop", "incomplete_after_tool_limit"].includes(action)) task.status = "stopped";
+        if (["budget_stop", "repeat_stop", "final_loop_stop", "incomplete_after_tool_limit"].includes(action)) {
+            task.status = "stopped";
+        }
         task.updatedAt = now;
         session.updatedAt = now;
         this.enforceLimits(store);

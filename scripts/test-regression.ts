@@ -61,7 +61,7 @@ const {
     relevantClarificationInspections: (input: { decision: string; question: string; inspections: Array<Record<string, unknown>> }) => Array<Record<string, unknown>>;
     resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat, withoutMcpActions } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentResponseFormat: (workflow: string) => {
         schema: {
@@ -83,6 +83,9 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
     getInitialAgentResponseFormat: () => {
         schema: { oneOf: Array<{ properties: { action: { const: string }; task: Record<string, any> }; required: string[] }> };
     };
+    withoutMcpActions: (format: Record<string, unknown>) => {
+        schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
+    };
 };
 const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settings: { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number }) => {
     recordCompletionTokens: (tokens: number) => void;
@@ -95,7 +98,14 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
+const { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
+    CompletionBlockerTracker: new (limit: number) => {
+        record: (summary: string) => { count: number; shouldStop: boolean };
+    };
+    effectiveCompletionStatus: (
+        status: "completed" | "already_satisfied" | "no_change_needed",
+        successfulWorkspaceChanges: number
+    ) => "completed" | "already_satisfied" | "no_change_needed";
     noChangeCompletionBlockReason: (input: {
         status: "completed" | "already_satisfied" | "no_change_needed";
         evidence: string[];
@@ -189,13 +199,14 @@ const {
     requiredProjectChecks: (requirement: Record<string, unknown>, checks: Array<Record<string, unknown>>) => Array<{ id: string }>;
     protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
-const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandInteractiveRisk, commandInvocationError, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, packageMutationRisk, parsePackageMutation, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandInteractiveRisk, commandInvocationError, commandInvokesAgentTool, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, packageMutationRisk, parsePackageMutation, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
     commandMutatesWorkspaceFiles: (command: string) => boolean;
     commandFailureGuidance: (workspace: string, command: string, errorOutput: string) => string;
     commandInteractiveRisk: (command: string, workspace: string, workdir?: string) => string | undefined;
     commandInvocationError: (errorOutput: string) => boolean;
+    commandInvokesAgentTool: (command: string) => boolean;
     commandTimeoutMs: (command: string) => number;
     diagnosticRecoveryGuidance: (errorOutput: string) => string | undefined;
     missingCommandTargetError: (errorOutput: string) => boolean;
@@ -553,6 +564,11 @@ async function main(): Promise<void> {
     assert.ok(repeatedReadRecoveryActions.includes("edit_file"));
     assert.ok(repeatedReadRecoveryActions.includes("final"));
     assert.ok(!repeatedReadRecoveryActions.includes("ask_user"));
+    const localRecoveryActions = withoutMcpActions(getAgentRecoveryResponseFormat("coding", "final"))
+        .schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.ok(localRecoveryActions.includes("read_file"));
+    assert.ok(!localRecoveryActions.includes("mcp_call_tool"));
+    assert.ok(!localRecoveryActions.includes("mcp_list_tools"));
     const forcedDiagnosticActions = getAgentRecoveryResponseFormat("coding", ["run_command", "final"]).schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(!forcedDiagnosticActions.includes("run_command"));
     assert.ok(!forcedDiagnosticActions.includes("final"));
@@ -734,6 +750,14 @@ async function main(): Promise<void> {
 
     const successfulRefs = new Set(["evidence_2_read_file", "evidence_3_run_command"]);
     const workspaceRefs = new Set(["evidence_2_read_file"]);
+    assert.equal(effectiveCompletionStatus("already_satisfied", 2), "completed");
+    assert.equal(effectiveCompletionStatus("no_change_needed", 1), "completed");
+    assert.equal(effectiveCompletionStatus("already_satisfied", 0), "already_satisfied");
+    const blockerTracker = new CompletionBlockerTracker(3);
+    assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, false);
+    assert.equal(blockerTracker.record("latest command failed").shouldStop, false);
+    assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, false);
+    assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, true);
     assert.equal(noChangeCompletionBlockReason({
         status: "already_satisfied",
         evidence: ["evidence_2_read_file"],
@@ -774,6 +798,9 @@ async function main(): Promise<void> {
         verificationSatisfied: true,
         hasUnresolvedFailures: false
     }) ?? "", /workspace inspection or no-op evidence/);
+    assert.equal(commandInvokesAgentTool('mcp_call_tool server=angular-cli tool=serve arguments:{}'), true);
+    assert.equal(commandInvokesAgentTool("  MCP_LIST_TOOLS server=web"), true);
+    assert.equal(commandInvokesAgentTool("npm run build"), false);
     const finalParser = new AgentTool();
     assert.deepEqual(finalParser.parseAction('{"action":"final","answer":"hello"}'), {
         action: "final",

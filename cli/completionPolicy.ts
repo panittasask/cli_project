@@ -11,6 +11,25 @@ type NoChangeCompletionInput = {
     hasUnresolvedFailures: boolean;
 };
 
+class CompletionBlockerTracker {
+    private readonly counts = new Map<string, number>();
+
+    constructor(readonly limit: number) {}
+
+    record(summary: string): { count: number; shouldStop: boolean } {
+        const count = (this.counts.get(summary) ?? 0) + 1;
+        this.counts.set(summary, count);
+        return { count, shouldStop: count >= this.limit };
+    }
+}
+
+function effectiveCompletionStatus(status: CompletionStatus, successfulWorkspaceChanges: number): CompletionStatus {
+    // Once this task has actually changed workspace state, a local model using
+    // "already_satisfied" is a labeling mistake rather than a no-change claim.
+    // The host still applies every validation and verification gate.
+    return successfulWorkspaceChanges > 0 ? "completed" : status;
+}
+
 function noChangeCompletionBlockReason(input: NoChangeCompletionInput): string | undefined {
     if (input.status === "completed") return undefined;
     if (input.hasUnresolvedFailures) {
@@ -30,4 +49,4 @@ function noChangeCompletionBlockReason(input: NoChangeCompletionInput): string |
     return undefined;
 }
 
-module.exports = { noChangeCompletionBlockReason };
+module.exports = { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionBlockReason };

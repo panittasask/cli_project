@@ -74,7 +74,14 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { noChangeCompletionBlockReason } = require("./completionPolicy") as {
+const { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("./completionPolicy") as {
+    CompletionBlockerTracker: new (limit: number) => {
+        record: (summary: string) => { count: number; shouldStop: boolean };
+    };
+    effectiveCompletionStatus: (
+        status: "completed" | "already_satisfied" | "no_change_needed",
+        successfulWorkspaceChanges: number
+    ) => "completed" | "already_satisfied" | "no_change_needed";
     noChangeCompletionBlockReason: (input: {
         status: "completed" | "already_satisfied" | "no_change_needed";
         evidence: string[];
@@ -86,11 +93,12 @@ const { noChangeCompletionBlockReason } = require("./completionPolicy") as {
         hasUnresolvedFailures: boolean;
     }) => string | undefined;
 };
-const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk } = require("./commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, commandInvokesAgentTool, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk } = require("./commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
     commandMutatesWorkspaceFiles: (command: string) => boolean;
     commandInvocationError: (errorOutput: string) => boolean;
+    commandInvokesAgentTool: (command: string) => boolean;
     diagnosticRecoveryGuidance: (errorOutput: string) => string | undefined;
     missingCommandTargetError: (errorOutput: string) => boolean;
     normalizeCommandSignature: (command: string) => string;
@@ -157,15 +165,15 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
         }
     ) => Array<{ role: "system" | "user"; content: string }>;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat, withoutMcpActions } = require("./agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string | string[]) => Record<string, unknown>;
     getAgentMutationResponseFormat: (blockedAction?: string) => Record<string, unknown>;
-    getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentReadOnlyResponseFormat: (workflow: WorkflowKind, allowCommands?: boolean) => Record<string, unknown>;
     getAgentFinalResponseFormat: () => Record<string, unknown>;
     getInitialAgentResponseFormat: () => Record<string, unknown>;
+    withoutMcpActions: (responseFormat: Record<string, unknown>) => Record<string, unknown>;
 };
 const { StatusBar } = require("./statusBar") as { StatusBar: new (getState: () => {
     model: string;
@@ -1517,6 +1525,9 @@ async function runAgentLoop(
     );
     let segmentEvents: string[] = [];
     let contextCompactionCount = 0;
+    const finalBlockerLimit = Math.max(3, guard.settings.repeatLimit + 1);
+    const finalBlockers = new CompletionBlockerTracker(finalBlockerLimit);
+    let repeatedFinalBlocker: string | undefined;
     const stepStatus = (step: number): string => hasStepCadence
         ? `step ${step}/${maxTurns}`
         : `step ${step}`;
@@ -1524,6 +1535,12 @@ async function runAgentLoop(
     if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill) => skill.name).join(", ")}`);
 
     for (let turn = 1; turn <= maxTurns; turn += 1) {
+        if (repeatedFinalBlocker) {
+            const answer = `Agent stopped after the same completion blocker recurred ${finalBlockerLimit} times: ${repeatedFinalBlocker} Successful workspace changes remain in place and can be continued from the session journal.`;
+            trace.add({ turn, status: "error", action: "final_loop_stop", observation: answer });
+            trace.save();
+            return { answer, trace, clarifications: clarificationTranscript };
+        }
         const segmentTurn = hasStepCadence ? (turn - 1) % maxTurnsPerSegment + 1 : turn;
         const segment = hasStepCadence ? Math.floor((turn - 1) / maxTurnsPerSegment) + 1 : 1;
         const contextTokenThreshold = Math.floor(activeContextLength * 0.7);
@@ -1564,10 +1581,11 @@ async function runAgentLoop(
             trace.save();
             return { answer, trace, clarifications: clarificationTranscript };
         }
-        const requestFormat = recoveryResponseFormat
-            ?? (mcpCallsDisabled
-                ? getAgentLocalResponseFormat(workflow.kind)
-                : (turn === 1 ? initialAgentResponseFormat : agentResponseFormat));
+        const selectedResponseFormat = recoveryResponseFormat
+            ?? (turn === 1 ? initialAgentResponseFormat : agentResponseFormat);
+        const requestFormat = mcpCallsDisabled
+            ? withoutMcpActions(selectedResponseFormat)
+            : selectedResponseFormat;
         recoveryResponseFormat = undefined;
         spinner.update(turn === 1
             ? `Planning next step (step ${turn}, ${guard.formatRemaining()})...`
@@ -1857,6 +1875,8 @@ async function runAgentLoop(
 
         if (action.action === "final") {
             const rejectFinal = (summary: string, feedback: string): void => {
+                const blocker = finalBlockers.record(summary);
+                if (blocker.shouldStop) repeatedFinalBlocker = summary;
                 recoveryResponseFormat = recoveryFormat("final");
                 spinner.log(`[${stepStatus(turn)}] Final blocked: ${summary}`);
                 trace.add({
@@ -1871,10 +1891,14 @@ async function runAgentLoop(
                 messages.push({ role: "user", content: feedback });
             };
             const proposedAnswer = action.answer?.trim() || "Done.";
-            const noChangeOutcome = action.completion_status === "already_satisfied"
-                || action.completion_status === "no_change_needed";
+            const completionStatus = effectiveCompletionStatus(
+                action.completion_status ?? "completed",
+                writtenPaths.size
+            );
+            const noChangeOutcome = completionStatus === "already_satisfied"
+                || completionStatus === "no_change_needed";
             const noChangeBlocker = noChangeCompletionBlockReason({
-                status: action.completion_status ?? "completed",
+                status: completionStatus,
                 evidence: action.evidence ?? [],
                 successfulEvidenceRefs,
                 successfulWorkspaceEvidenceRefs,
@@ -2044,6 +2068,18 @@ async function runAgentLoop(
                 trace,
                 clarifications: clarificationTranscript
             };
+        }
+
+        if (action.action === "run_command" && commandInvokesAgentTool(action.command ?? "")) {
+            const output = mcpCallsDisabled
+                ? "Blocked protocol misuse: MCP is disabled for this task because no configured server is available. Do not invoke agent action names through the shell."
+                : "Blocked protocol misuse: mcp_call_tool and mcp_list_tools are agent actions, not shell commands. Return the corresponding MCP action JSON instead.";
+            recoveryResponseFormat = recoveryFormat(["run_command", "final"]);
+            spinner.log(`[${stepStatus(turn)}] ${output}`);
+            trace.add({ turn, status: "error", action: "shell_tool_call_blocked", reason: action.reason, arguments: action, observation: output });
+            trace.save();
+            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+            continue;
         }
 
         if (action.action === "run_command" && action.command
