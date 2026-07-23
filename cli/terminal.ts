@@ -2359,14 +2359,18 @@ async function runAgentLoop(
         if (action.action === "run_command" && !result.ok) {
             lastFailedCommand = action.command;
             unresolvedMissingCommandTarget = missingCommandTargetError(result.output);
+            const invocationFailure = commandInvocationError(result.output);
             const effectiveWorkdir = action.workdir
                 ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
             const failedKnownCheck = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir).length > 0;
             const failedRequiredVerification = commandSatisfiesAcceptance(action.command ?? "", acceptance);
-            if (failedKnownCheck || failedRequiredVerification) {
+            // A rejected command line never exercised the project. Preserve it
+            // as diagnostic feedback, but do not mistake it for failed product
+            // verification that permanently blocks completion.
+            if (!invocationFailure && (failedKnownCheck || failedRequiredVerification)) {
                 unresolvedVerificationFailure = result.output.slice(0, 2000);
             }
-            if (commandInvocationError(result.output)) {
+            if (invocationFailure) {
                 recoveryResponseFormat = recoveryFormat(["edit_file", "write_file", "delete_file", "final"]);
             }
             if (verificationRequirement !== "none") verificationSatisfied = false;
@@ -2391,7 +2395,10 @@ async function runAgentLoop(
                 unresolvedMissingCommandTarget = false;
             }
         }
-        if (!result.ok) {
+        const nonBlockingInvocationFailure = action.action === "run_command"
+            && !result.ok
+            && commandInvocationError(result.output);
+        if (!result.ok && !nonBlockingInvocationFailure) {
             unresolvedToolFailure = {
                 action: action.action ?? "unknown_action",
                 output: result.output
