@@ -47,9 +47,9 @@ class AgentGuard {
     }
 
     recordFileProgress(): void {
-        // A verification command is expected to run again after source changes.
-        // Keep mutation signatures intact so delete/write/edit cycles still
-        // accumulate, but give commands a new evidence epoch.
+        // A successful file change is real progress. Actions chosen against the
+        // previous workspace state are no longer equivalent repetitions.
+        this.actionCounts.clear();
         this.verificationEpoch += 1;
     }
 

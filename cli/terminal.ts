@@ -142,11 +142,10 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
         }
     ) => Array<{ role: "system" | "user"; content: string }>;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentRequiredActionResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string | string[]) => Record<string, unknown>;
-    getAgentRequiredActionResponseFormat: (action: string) => Record<string, unknown>;
     getAgentMutationResponseFormat: (blockedAction?: string) => Record<string, unknown>;
     getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentReadOnlyResponseFormat: (workflow: WorkflowKind, allowCommands?: boolean) => Record<string, unknown>;
@@ -222,9 +221,6 @@ const { isContinuationRequest, selectTaskContext, summarizeTaskContext } = requi
     isContinuationRequest: (message: string) => boolean;
     selectTaskContext: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, workflow: WorkflowKind, maxMessages?: number) => Array<{ role: "user" | "assistant"; content: string }>;
     summarizeTaskContext: (messages: Array<{ role: "user" | "assistant"; content: string }>) => string;
-};
-const { missingBehaviorCompanionInspections } = require("./behaviorEvidence") as {
-    missingBehaviorCompanionInspections: (workspace: string, inputPath: string, readPaths: Set<string>) => string[];
 };
 const { WriteValidator } = require("./writeValidator") as { WriteValidator: new (workspace?: string) => {
     exists: (inputPath: string) => boolean;
@@ -1425,8 +1421,6 @@ async function runAgentLoop(
     const readPaths = new Set<string>();
     const explicitlyRequestedFiles = Array.from(effectiveUserMessage.matchAll(/(?:^|[\s"'`])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go))(?=$|[\s"'`,)])/gi))
         .map((match) => path.resolve(activeWorkspace, match[1] ?? "").toLowerCase());
-    const writeRetriesAwaitingRead = new Set<string>();
-    const noOpMutationPaths = new Set<string>();
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
     let unresolvedToolFailure: { action: string; output: string } | undefined;
@@ -1524,7 +1518,6 @@ async function runAgentLoop(
             });
             segmentEvents = [];
             readPaths.clear();
-            writeRetriesAwaitingRead.clear();
             sessionTool.resetActiveContextUsage(sessionId);
             recoveryResponseFormat = undefined;
             const trigger = compactForTokens ? `at 70% context usage (${contextTokenThreshold.toLocaleString()} tokens)` : "at the turn boundary";
@@ -1997,16 +1990,6 @@ async function runAgentLoop(
         }
 
         if (["write_file", "edit_file", "delete_file"].includes(action.action ?? "") && action.path) {
-            const mutationPathKey = path.resolve(activeWorkspace, action.path).toLowerCase();
-            if (noOpMutationPaths.has(mutationPathKey)) {
-                const output = `Blocked mutation: ${action.path} already has the requested state. Read its current contents before any further mutation, or verify/finalize the task. Deletion is not a recovery for a no-op change.`;
-                recoveryResponseFormat = recoveryFormat(["write_file", "edit_file", "delete_file"]);
-                spinner.log(`[${stepStatus(turn)}] ${output}`);
-                trace.add({ turn, status: "error", action: "no_op_mutation_blocked", reason: action.reason, arguments: action, observation: output });
-                trace.save();
-                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
-                continue;
-            }
             const normalizedMutationPath = action.path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
             if (normalizedMutationPath === ".cli/mcp.json" && workflow.kind !== "mcp_creation") {
                 const output = "Blocked MCP config mutation: .cli/mcp.json is only changed for an explicit MCP-server creation task. Keep the existing configuration while working on this project.";
@@ -2024,25 +2007,6 @@ async function runAgentLoop(
                 recoveryResponseFormat = recoveryFormat([action.action ?? "write_file", "final"]);
                 spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "project_scope_blocked", reason: action.reason, arguments: action, observation: output });
-                trace.save();
-                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
-                continue;
-            }
-        }
-
-        if (acceptance.evidence === "interaction"
-            && ["write_file", "edit_file", "delete_file"].includes(action.action ?? "")
-            && action.path) {
-            const missingCompanions = missingBehaviorCompanionInspections(activeWorkspace, action.path, readPaths);
-            if (missingCompanions.length > 0) {
-                const output = `Blocked behavior mutation: inspect the target's owning implementation companion before editing: ${missingCompanions.join(", ")}. Trace bindings, imports/providers, handlers, and state changes from source evidence instead of changing presentation markup speculatively.`;
-                // This is an expected evidence-gathering transition, not a failed
-                // mutation retry. Force the exact recovery class so the model cannot
-                // substitute a broad directory listing and exhaust the repeat guard.
-                guard.resetActionHistory();
-                recoveryResponseFormat = getAgentRequiredActionResponseFormat("read_file");
-                spinner.log(`[${stepStatus(turn)}] ${output}`);
-                trace.add({ turn, status: "error", action: "behavior_inspection_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
                 continue;
@@ -2073,17 +2037,6 @@ async function runAgentLoop(
                 messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
                 continue;
             }
-        }
-
-        if ((action.action === "write_file" || action.action === "edit_file" || action.action === "delete_file") && action.path
-            && writeValidator.exists(action.path) && !readPaths.has(path.resolve(activeWorkspace, action.path).toLowerCase())) {
-            writeRetriesAwaitingRead.add(path.resolve(activeWorkspace, action.path).toLowerCase());
-            const output = `Blocked write: read the existing file first (${action.path}).`;
-            spinner.log(`[${stepStatus(turn)}] ${output}`);
-            trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
-            trace.save();
-            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
-            continue;
         }
 
         const validationBeforeMutation = (action.action === "write_file" || action.action === "edit_file") && action.path
@@ -2154,13 +2107,9 @@ async function runAgentLoop(
         if (action.action === "read_file" && result.ok && action.path) {
             const resolvedReadPath = path.resolve(activeWorkspace, action.path).toLowerCase();
             readPaths.add(resolvedReadPath);
-            noOpMutationPaths.delete(resolvedReadPath);
             if (readOnlyRequest && verificationRequirement === "none" && explicitlyRequestedFiles.length > 0
                 && explicitlyRequestedFiles.every((requestedPath) => readPaths.has(requestedPath))) {
                 recoveryResponseFormat = getAgentFinalResponseFormat();
-            }
-            if (writeRetriesAwaitingRead.delete(resolvedReadPath)) {
-                guard.resetActionHistory();
             }
         }
         if (action.action === "run_command" && result.ok && commandMutatesWorkspaceFiles(action.command ?? "")) {
@@ -2234,7 +2183,6 @@ async function runAgentLoop(
                     successfulMcpCall = false;
                 }
             } else if (validation.ok && result.changed === false) {
-                noOpMutationPaths.add(path.resolve(activeWorkspace, action.path).toLowerCase());
                 satisfiedPaths.add(action.path);
                 if (verificationRequirement === "none" && !projectRequirement) {
                     recoveryResponseFormat = getAgentFinalResponseFormat();
