@@ -469,9 +469,12 @@ const agentGuardSettings = getAgentGuardSettings(cliSettings);
 const clarificationSettings = getClarificationSettings(cliSettings);
 const projectCheckProviders = getProjectCheckProviders(cliSettings);
 // The request-level Axios timeout must not fire before the user-visible Agent
-// wall-clock guard. The guard's AbortController remains the single source of
-// truth and produces the actionable timeout message.
-const llamaClient = new LlamaClient(apiUrl, agentGuardSettings.maxDurationMs + 5000);
+// wall-clock guard. A zero guard is deliberately unbounded, so Axios must also
+// receive zero (its no-timeout value) rather than a five-second fallback.
+const llamaClient = new LlamaClient(
+    apiUrl,
+    agentGuardSettings.maxDurationMs > 0 ? agentGuardSettings.maxDurationMs + 5000 : 0
+);
 const modelRouterClient = new ModelRouterClient(apiUrl);
 const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
