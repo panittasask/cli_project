@@ -142,10 +142,11 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
         }
     ) => Array<{ role: "system" | "user"; content: string }>;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentRequiredActionResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat } = require("./agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: "system" | "user"; content: string }>;
     getAgentResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentRecoveryResponseFormat: (workflow: WorkflowKind, blockedAction: string | string[]) => Record<string, unknown>;
+    getAgentRequiredActionResponseFormat: (action: string) => Record<string, unknown>;
     getAgentMutationResponseFormat: (blockedAction?: string) => Record<string, unknown>;
     getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentReadOnlyResponseFormat: (workflow: WorkflowKind, allowCommands?: boolean) => Record<string, unknown>;
@@ -2035,7 +2036,11 @@ async function runAgentLoop(
             const missingCompanions = missingBehaviorCompanionInspections(activeWorkspace, action.path, readPaths);
             if (missingCompanions.length > 0) {
                 const output = `Blocked behavior mutation: inspect the target's owning implementation companion before editing: ${missingCompanions.join(", ")}. Trace bindings, imports/providers, handlers, and state changes from source evidence instead of changing presentation markup speculatively.`;
-                recoveryResponseFormat = recoveryFormat([action.action ?? "edit_file", "final"]);
+                // This is an expected evidence-gathering transition, not a failed
+                // mutation retry. Force the exact recovery class so the model cannot
+                // substitute a broad directory listing and exhaust the repeat guard.
+                guard.resetActionHistory();
+                recoveryResponseFormat = getAgentRequiredActionResponseFormat("read_file");
                 spinner.log(`[${stepStatus(turn)}] ${output}`);
                 trace.add({ turn, status: "error", action: "behavior_inspection_blocked", reason: action.reason, arguments: action, observation: output });
                 trace.save();

@@ -61,7 +61,7 @@ const {
     relevantClarificationInspections: (input: { decision: string; question: string; inspections: Array<Record<string, unknown>> }) => Array<Record<string, unknown>>;
     resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentRequiredActionResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentResponseFormat: (workflow: string) => {
         schema: {
@@ -69,6 +69,9 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
         };
     };
     getAgentRecoveryResponseFormat: (workflow: string, blockedAction: string | string[]) => {
+        schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
+    };
+    getAgentRequiredActionResponseFormat: (action: string) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
     getAgentMutationResponseFormat: (blockedAction?: string) => {
@@ -550,6 +553,8 @@ async function main(): Promise<void> {
     assert.ok(forcedDiagnosticActions.includes("read_file"));
     assert.ok(forcedDiagnosticActions.includes("delete_file"));
     assert.ok(!forcedDiagnosticActions.includes("ask_user"));
+    const requiredInspectionActions = getAgentRequiredActionResponseFormat("read_file").schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.deepEqual(requiredInspectionActions, ["read_file"]);
     const forcedMutationActions = getAgentMutationResponseFormat("edit_file").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(forcedMutationActions, ["write_file", "delete_file"]);
     const askUserSchema = getAgentResponseFormat("coding").schema.oneOf.find((variant) => variant.properties.action.const === "ask_user");
