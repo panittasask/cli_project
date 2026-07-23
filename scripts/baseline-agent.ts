@@ -90,7 +90,7 @@ async function main(): Promise<void> {
             results
         };
 
-        const outputDirectory = path.resolve(appRoot, ".cli", "logs");
+        const outputDirectory = path.resolve(appRoot, ".cli", "logs", "baseline");
         fs.mkdirSync(outputDirectory, { recursive: true });
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const outputPath = path.join(outputDirectory, `baseline-agent-${stamp}.json`);

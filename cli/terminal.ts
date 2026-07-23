@@ -1442,7 +1442,7 @@ async function runAgentLoop(
     const sourceUrls = new Set<string>();
     let consecutiveEmptyWebSearches = 0;
     let webResearchExhausted = false;
-    const logDirectory = path.resolve(appRoot, ".cli", "logs");
+    const logDirectory = path.resolve(appRoot, ".cli", "logs", "agent");
     const traceTarget = { directory: logDirectory, basename: "agent-trace" };
     const responseTarget = { directory: logDirectory, basename: "agent-model-responses" };
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;

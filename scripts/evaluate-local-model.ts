@@ -20,7 +20,7 @@ type ProbeResult = {
 };
 
 const appRoot = path.resolve(__dirname, "..");
-const logDirectory = path.join(appRoot, ".cli", "logs");
+const logDirectory = path.join(appRoot, ".cli", "logs", "evaluation");
 const settings = loadCliSettings(appRoot);
 
 function readPositiveInteger(name: string, fallback: number, minimum: number, maximum: number): number {

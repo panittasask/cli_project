@@ -55,11 +55,11 @@ while ((Get-Date) -lt $deadline) {
 
 if (-not $ready) {
     $task = Get-ScheduledTaskInfo -TaskName $TaskName
-    throw "Scheduled task was installed but llama.cpp did not become ready. LastTaskResult=$($task.LastTaskResult). Check .cli\logs\llama-autostart.log."
+    throw "Scheduled task was installed but llama.cpp did not become ready. LastTaskResult=$($task.LastTaskResult). Check .cli\logs\server\llama-autostart.log."
 }
 
 Write-Host "Installed and started scheduled task: $TaskName"
 Write-Host "Startup account: SYSTEM"
 Write-Host "Health: ok"
 Write-Host "Loaded model: $(if ($loaded.Count -gt 0) { $loaded[0].id } else { 'none' })"
-Write-Host "Logs: $(Join-Path $appRoot '.cli\logs\llama-autostart.log')"
+Write-Host "Logs: $(Join-Path $appRoot '.cli\logs\server\llama-autostart.log')"

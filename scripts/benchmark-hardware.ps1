@@ -22,7 +22,7 @@ $device = Resolve-LlamaDevice -ServerExecutable $server -RequestedDevice $reques
 $deviceDescription = Get-LlamaDeviceDescription -ServerExecutable $server -Device $device
 $profile = Get-LlamaRuntimeProfile -Device $device -HardwareProfile $requestedProfile -DeviceDescription $deviceDescription
 $memory = Get-LlamaMemoryProfile -Device $device -HardwareProfile $profile.Name -DeviceDescription $deviceDescription
-$logDirectory = Join-Path $root ".cli\logs"
+$logDirectory = Join-Path $root ".cli\logs\benchmark"
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $logPath = Join-Path $logDirectory "hardware-benchmark-$stamp.txt"

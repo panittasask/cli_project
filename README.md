@@ -17,7 +17,7 @@ This reads paths from `.cli/settings.json`, lists the GGUF files in the configur
 model path, asks which model to use, starts `llama-server` in the background,
 waits until it is ready, and opens the CLI in the same terminal at the normal
 session-selection screen. Exiting the CLI also stops that background server.
-Logs are written to `.cli/logs/`.
+Logs are written beneath `.cli/logs/`, grouped by purpose: `agent/`, `server/`, `evaluation/`, `baseline/`, and `benchmark/`.
 
 At session selection, use `D` to delete one saved session or `C` to clear all
 saved sessions. Both paths require confirmation. `/clear` inside a session only
@@ -227,13 +227,13 @@ value when automatic VRAM fitting requires it.
 
 Inside the CLI, `/debug on` displays each agent action, its short decision
 summary, and whether the tool succeeded. The full redacted trace is rotated
-daily as `.cli/logs/agent-trace-YYYY-MM-DD.jsonl`; model-generated file content and
+daily as `.cli/logs/agent/agent-trace-YYYY-MM-DD.jsonl`; model-generated file content and
 common secret fields are omitted. This trace is an operational summary, not
 the model's private chain-of-thought. `/clear` starts a clean task context while
 keeping the saved session history on disk.
 
 Agent mode also writes every raw model message to daily files named
-`.cli/logs/agent-model-responses-YYYY-MM-DD.jsonl`, including the requested response
+`.cli/logs/agent/agent-model-responses-YYYY-MM-DD.jsonl`, including the requested response
 format, finish reason, parsed action, and parse failure reason. This local file
 is ignored by Git and can contain model-generated content from the active task.
 In an interactive terminal, a fixed status banner stays on the bottom row and
@@ -342,9 +342,9 @@ npm run baseline:agent
 
 The first command tests the baseline questions and stores model, server
 properties, chat template information exposed by llama.cpp, sampling, and
-answers under `.cli/logs/baseline-model-*.json`. The second repeats the same
+answers under `.cli/logs/baseline/baseline-model-*.json`. The second repeats the same
 agent action request five times by default and records JSON validity, tool selection
-stability, and concise-reason coverage under `.cli/logs/baseline-agent-*.json`.
+stability, and concise-reason coverage under `.cli/logs/baseline/baseline-agent-*.json`.
 
 Run the bounded local evaluation suite with an isolated llama.cpp server:
 
@@ -363,7 +363,7 @@ default and uses the normal wall-clock budgets.
 The runner selects a free localhost port, waits for both `/health` and
 `/v1/models`, runs the agent-protocol, read-only E2E, and focused coding E2E
 probes, then terminates the server process tree. It writes one comparison report
-plus server logs under `.cli/logs/`; startup failures and probe timeouts are
+plus server logs under `.cli/logs/server/`; startup failures and probe timeouts are
 reported separately from model failures.
 
 Summarize all dated agent traces into task-level success, duration, model-call,
