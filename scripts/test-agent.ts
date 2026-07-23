@@ -75,6 +75,12 @@ const { SessionTool } = require("../cli/session") as { SessionTool: new (storage
         activeContextTokens: number;
     };
     resetActiveContextUsage: (sessionId: string) => void;
+    beginTask: (sessionId: string, request: string) => string | undefined;
+    recordTaskEvent: (sessionId: string, taskId: string, entry: Record<string, unknown>) => void;
+    finishTask: (sessionId: string, taskId: string, answer: string) => void;
+    interruptTask: (sessionId: string, taskId: string, reason: string) => void;
+    recoverInterruptedTask: (sessionId: string) => boolean;
+    getUnfinishedTaskContext: (sessionId: string) => string;
 } };
 const { LlamaClient } = require("../cli/llamaClient") as { LlamaClient: new (apiUrl: string, timeoutMs?: number) => {
     post: (
@@ -738,6 +744,46 @@ async function main(): Promise<void> {
         session.resetActiveContextUsage("test");
         assert.equal(session.getUsage("test").activeContextTokens, 0);
         assert.equal(session.getUsage("test").totalTokens, 290);
+        const durableTaskId = session.beginTask("test", "แก้ modal ไม่ให้เปิดทันที token=private-value");
+        assert.ok(durableTaskId);
+        assert.match(session.getUnfinishedTaskContext("test"), /แก้ modal ไม่ให้เปิดทันที/);
+        assert.doesNotMatch(fs.readFileSync(sessionPath, "utf8"), /private-value/);
+        session.recordTaskEvent("test", durableTaskId as string, {
+            turn: 1,
+            status: "action",
+            action: "task_contract",
+            observation: JSON.stringify({
+                intent: "แก้พฤติกรรม modal",
+                task_type: "coding",
+                requires_workspace_changes: true,
+                verification: "interaction",
+                success_criteria: ["modal เปิดเมื่อ double click เท่านั้น"]
+            })
+        });
+        session.recordTaskEvent("test", durableTaskId as string, {
+            turn: 2,
+            status: "ok",
+            action: "read_file",
+            reason: "ตรวจ modal template",
+            arguments: { path: "src/app/modal.html" },
+            observation: "Read 120 lines"
+        });
+        const restartedSession = new SessionTool(sessionPath);
+        assert.equal(restartedSession.recoverInterruptedTask("test"), true);
+        const recoveredContext = restartedSession.getUnfinishedTaskContext("test");
+        assert.match(recoveredContext, /Status: interrupted/);
+        assert.match(recoveredContext, /แก้พฤติกรรม modal/);
+        assert.match(recoveredContext, /read_file src\/app\/modal\.html \[ok]/);
+        assert.equal(restartedSession.recoverInterruptedTask("test"), false);
+        const completedTaskId = restartedSession.beginTask("test", "สรุปงานเดิม");
+        assert.ok(completedTaskId);
+        restartedSession.recordTaskEvent("test", completedTaskId as string, {
+            turn: 1,
+            status: "final",
+            action: "final"
+        });
+        restartedSession.finishTask("test", completedTaskId as string, "สรุปเรียบร้อย");
+        assert.equal(restartedSession.getUnfinishedTaskContext("test"), "");
         assert.equal(session.deleteSession("test"), true);
         assert.equal(session.deleteSession("missing"), false);
         assert.deepEqual(session.getContextMessages("keep").map((item) => item.content), ["keep me"]);

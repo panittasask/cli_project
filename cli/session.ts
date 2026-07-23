@@ -18,6 +18,34 @@ interface SessionUsage {
     activeContextTokens: number;
 }
 
+type SessionTaskStatus = "in_progress" | "completed" | "interrupted" | "stopped";
+
+interface SessionTaskStep {
+    turn: number;
+    status: "action" | "ok" | "error" | "parse_error" | "final";
+    action: string;
+    reason?: string;
+    target?: string;
+    summary?: string;
+    timestamp: number;
+}
+
+interface SessionTaskJournal {
+    id: string;
+    userRequest: string;
+    status: SessionTaskStatus;
+    startedAt: number;
+    updatedAt: number;
+    intent?: string;
+    taskType?: string;
+    requiresWorkspaceChanges?: boolean;
+    verification?: string;
+    successCriteria?: string[];
+    steps: SessionTaskStep[];
+    finalAnswer?: string;
+    interruptionReason?: string;
+}
+
 interface ChatSession {
     id: string;
     title: string;
@@ -26,6 +54,7 @@ interface ChatSession {
     updatedAt: number;
     messages: SessionMessage[];
     usage?: SessionUsage;
+    activeTask?: SessionTaskJournal;
 }
 
 interface SessionStore {
@@ -145,6 +174,164 @@ class SessionTool {
         return session.messages
             .filter((message) => message.timestamp > afterTimestamp)
             .slice(-maxMessages);
+    }
+
+    beginTask(sessionId: string, userRequest: string): string | undefined {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        if (!session) return undefined;
+        const now = Date.now();
+        const taskId = `task_${now.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+        session.activeTask = {
+            id: taskId,
+            userRequest: this.trimTaskText(userRequest, 2400),
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+            steps: []
+        };
+        session.updatedAt = now;
+        this.enforceLimits(store);
+        this.saveStore(store);
+        return taskId;
+    }
+
+    recordTaskEvent(sessionId: string, taskId: string, entry: {
+        turn: number;
+        status: SessionTaskStep["status"];
+        action?: string;
+        reason?: string;
+        arguments?: unknown;
+        observation?: string;
+    }): void {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        const task = session?.activeTask;
+        if (!session || !task || task.id !== taskId) return;
+
+        const now = Date.now();
+        const action = entry.action ?? entry.status;
+        if (action === "task_contract" && entry.observation) {
+            try {
+                const contract = JSON.parse(entry.observation) as Record<string, unknown>;
+                if (typeof contract.intent === "string") task.intent = this.trimTaskText(contract.intent, 600);
+                if (typeof contract.task_type === "string") task.taskType = contract.task_type;
+                if (typeof contract.requires_workspace_changes === "boolean") {
+                    task.requiresWorkspaceChanges = contract.requires_workspace_changes;
+                }
+                if (typeof contract.verification === "string") task.verification = contract.verification;
+                if (Array.isArray(contract.success_criteria)) {
+                    task.successCriteria = contract.success_criteria
+                        .filter((item): item is string => typeof item === "string")
+                        .map((item) => this.trimTaskText(item, 300))
+                        .filter(Boolean)
+                        .slice(0, 8);
+                }
+            } catch {
+                // The normal event is structured JSON; retain the task even if
+                // a malformed model contract cannot be decoded.
+            }
+        }
+
+        if (action !== "task_start" && action !== "task_contract") {
+            const args = entry.arguments && typeof entry.arguments === "object"
+                ? entry.arguments as Record<string, unknown>
+                : {};
+            const target = typeof args.path === "string"
+                ? args.path
+                : typeof args.tool === "string"
+                    ? args.tool
+                    : undefined;
+            task.steps.push({
+                turn: entry.turn,
+                status: entry.status,
+                action,
+                ...(entry.reason ? { reason: this.trimTaskText(entry.reason, 360) } : {}),
+                ...(target ? { target: this.trimTaskText(target, 360) } : {}),
+                ...(entry.observation && (entry.status === "error" || entry.status === "parse_error")
+                    ? { summary: this.trimTaskText(entry.observation, 500) }
+                    : {}),
+                timestamp: now
+            });
+            if (task.steps.length > 30) task.steps = task.steps.slice(-30);
+        }
+
+        if (entry.status === "final" || action === "final") task.status = "completed";
+        if (["budget_stop", "repeat_stop", "incomplete_after_tool_limit"].includes(action)) task.status = "stopped";
+        task.updatedAt = now;
+        session.updatedAt = now;
+        this.enforceLimits(store);
+        this.saveStore(store);
+    }
+
+    finishTask(sessionId: string, taskId: string, answer: string): void {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        const task = session?.activeTask;
+        if (!session || !task || task.id !== taskId) return;
+        const now = Date.now();
+        if (task.status === "in_progress") task.status = "completed";
+        task.finalAnswer = this.trimTaskText(answer, 1600);
+        task.updatedAt = now;
+        session.updatedAt = now;
+        this.enforceLimits(store);
+        this.saveStore(store);
+    }
+
+    interruptTask(sessionId: string, taskId: string, reason: string): void {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        const task = session?.activeTask;
+        if (!session || !task || task.id !== taskId || task.status === "completed") return;
+        const now = Date.now();
+        task.status = "interrupted";
+        task.interruptionReason = this.trimTaskText(reason, 600);
+        task.updatedAt = now;
+        session.updatedAt = now;
+        this.enforceLimits(store);
+        this.saveStore(store);
+    }
+
+    recoverInterruptedTask(sessionId: string): boolean {
+        const store = this.loadStore();
+        const session = store.sessions.find((item) => item.id === sessionId);
+        const task = session?.activeTask;
+        if (!session || !task || task.status !== "in_progress") return false;
+        const now = Date.now();
+        task.status = "interrupted";
+        task.interruptionReason = "The previous CLI process ended before the task returned a final result.";
+        task.updatedAt = now;
+        session.updatedAt = now;
+        this.enforceLimits(store);
+        this.saveStore(store);
+        return true;
+    }
+
+    getUnfinishedTaskContext(sessionId: string): string {
+        const task = this.getSession(sessionId)?.activeTask;
+        if (!task || task.status === "completed") return "";
+        const criteria = task.successCriteria?.map((item) => `- ${item}`).join("\n") || "- not recorded before interruption";
+        const steps = task.steps.slice(-12).map((step) => {
+            const target = step.target ? ` ${step.target}` : "";
+            const reason = step.reason ? ` — ${step.reason}` : "";
+            return `- turn ${step.turn}: ${step.action}${target} [${step.status}]${reason}`;
+        }).join("\n") || "- no tool action was recorded";
+        return [
+            "Durable unfinished-task journal from this same session:",
+            `Task ID: ${task.id}`,
+            `Status: ${task.status}`,
+            `Original user request: ${task.userRequest}`,
+            `Interpreted intent: ${task.intent || "not recorded before interruption"}`,
+            `Task type: ${task.taskType || "unknown"}`,
+            `Workspace changes expected: ${task.requiresWorkspaceChanges === undefined ? "unknown" : task.requiresWorkspaceChanges ? "yes" : "no"}`,
+            `Required verification: ${task.verification || "unknown"}`,
+            "Success criteria:",
+            criteria,
+            "Recent persisted steps:",
+            steps,
+            `Interruption reason: ${task.interruptionReason || "the task has not returned final yet"}`,
+            "Use this journal when the current request refers to previous, unfinished, or continuing work. The current user request still has priority."
+        ].join("\n");
     }
 
     resumeSession(sessionId: string): ChatSession | undefined {
@@ -332,6 +519,15 @@ class SessionTool {
         return `${clean.slice(0, this.maxMessageChars)}...`;
     }
 
+    private trimTaskText(value: string, maxChars: number): string {
+        const clean = value
+            .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
+            .replace(/\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
+            .replace(/\s+/g, " ")
+            .trim();
+        return clean.length <= maxChars ? clean : `${clean.slice(0, maxChars)}...`;
+    }
+
     private newSessionId(now: number): string {
         return `s_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     }
@@ -387,7 +583,7 @@ class SessionTool {
     private loadStore(): SessionStore {
         if (!fs.existsSync(this.storagePath)) {
             return {
-                version: 2,
+                version: 3,
                 sessions: []
             };
         }
@@ -401,12 +597,12 @@ class SessionTool {
             }
 
             return {
-                version: 2,
+                version: 3,
                 sessions: parsed.sessions
             };
         } catch {
             return {
-                version: 2,
+                version: 3,
                 sessions: []
             };
         }

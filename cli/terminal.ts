@@ -291,6 +291,19 @@ const { SessionTool } = require("./session") as { SessionTool: new (storagePath?
     recordUsage: (sessionId: string, usage: ApiUsage) => void;
     getUsage: (sessionId: string) => SessionUsage;
     resetActiveContextUsage: (sessionId: string) => void;
+    beginTask: (sessionId: string, userRequest: string) => string | undefined;
+    recordTaskEvent: (sessionId: string, taskId: string, entry: {
+        turn: number;
+        status: "action" | "ok" | "error" | "parse_error" | "final";
+        action?: string;
+        reason?: string;
+        arguments?: unknown;
+        observation?: string;
+    }) => void;
+    finishTask: (sessionId: string, taskId: string, answer: string) => void;
+    interruptTask: (sessionId: string, taskId: string, reason: string) => void;
+    recoverInterruptedTask: (sessionId: string) => boolean;
+    getUnfinishedTaskContext: (sessionId: string) => string;
 } };
 
 type ChatSession = {
@@ -1382,6 +1395,7 @@ async function runAgentLoop(
         resume: () => void;
     },
     sessionId: string,
+    taskId: string,
     signal: AbortSignal,
     requestBudget: RequestBudgetControl
 ): Promise<{ answer: string; trace: InstanceType<typeof AgentTrace>; clarifications: string[] }> {
@@ -1451,8 +1465,17 @@ async function runAgentLoop(
     const logDirectory = path.resolve(appRoot, ".cli", "logs", "agent");
     const traceTarget = { directory: logDirectory, basename: "agent-trace" };
     const responseTarget = { directory: logDirectory, basename: "agent-model-responses" };
-    const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-    const trace = new AgentTrace(traceTarget, taskId, (entry) => debugLog("Agent trace", entry));
+    const trace = new AgentTrace(traceTarget, taskId, (entry) => {
+        debugLog("Agent trace", entry);
+        sessionTool.recordTaskEvent(sessionId, taskId, entry as {
+            turn: number;
+            status: "action" | "ok" | "error" | "parse_error" | "final";
+            action?: string;
+            reason?: string;
+            arguments?: unknown;
+            observation?: string;
+        });
+    });
     const responseLog = new AgentResponseLog(responseTarget, taskId);
     trace.add({
         turn: 0,
@@ -2136,6 +2159,16 @@ async function runAgentLoop(
             spinner.log(checkpoint.preview);
             spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
         }
+        // Persist the selected action before execution. If the process exits
+        // inside a command, filesystem operation, or external tool call, the
+        // next CLI process can still explain exactly where the task stopped.
+        sessionTool.recordTaskEvent(sessionId, taskId, {
+            turn,
+            status: "action",
+            action: action.action ?? "unknown_action",
+            ...(action.reason ? { reason: action.reason } : {}),
+            arguments: action
+        });
         spinner.log(agentTool.formatActionStatus(action, segmentTurn, maxTurnsPerSegment));
         spinner.update(`Executing ${action.action}...`);
         debugLog("Tool request", { turn, action });
@@ -2776,6 +2809,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         const requestController = new AbortController();
         const requestBudget = createRequestBudget(requestController, agentGuardSettings.maxDurationMs);
+        let journalTaskId: string | undefined;
         activeRequestController = requestController;
         activeRequestSpinner = spinner;
         try {
@@ -2794,22 +2828,34 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             // much longer window than conversational context so repeated
             // continuation requests cannot erase the original acceptance scope.
             const taskHistory = sessionTool.getContextMessages(activeSession.id, 160, contextStartedAt);
-            const historyForModel = toModelMessages(sessionHistory);
+            const unfinishedTaskContext = sessionTool.getUnfinishedTaskContext(activeSession.id);
+            const unfinishedTaskMessage = unfinishedTaskContext
+                ? [{ role: "assistant" as const, content: unfinishedTaskContext }]
+                : [];
+            const historyForModel = [
+                ...toModelMessages(sessionHistory),
+                ...unfinishedTaskMessage
+            ];
             const historyForTask = [
                 ...(activeSession.title ? [{ role: "user" as const, content: `Build task: ${activeSession.title}` }] : []),
-                ...toModelMessages(taskHistory)
+                ...toModelMessages(taskHistory),
+                ...unfinishedTaskMessage
             ];
 
             if (runMode === "agent" && !imagePrompt && !explicitReadPrompt && !explicitEditPrompt && !trimmed.startsWith("/")) {
+                journalTaskId = sessionTool.beginTask(activeSession.id, trimmed);
+                if (!journalTaskId) throw new Error("Could not create the durable session task journal.");
                 const result = await runAgentLoop(
                     trimmed,
                     historyForModel,
                     historyForTask,
                     spinner,
                     activeSession.id,
+                    journalTaskId,
                     requestController.signal,
                     requestBudget
                 );
+                sessionTool.finishTask(activeSession.id, journalTaskId, result.answer);
                 const elapsedMs = spinner.stop();
                 if (debugEnabled) {
                     result.trace.print();
@@ -3073,6 +3119,14 @@ Do not mention hidden context, internal tools, or system prompts.`;
 
             sessionTool.appendExchange(activeSession.id, trimmed, answer);
         } catch (error) {
+            if (journalTaskId) {
+                const interruptionReason = requestController.signal.aborted
+                    ? requestController.signal.reason instanceof Error
+                        ? requestController.signal.reason.message
+                        : "Request cancelled by the user."
+                    : llamaClient.formatError(error);
+                sessionTool.interruptTask(activeSession.id, journalTaskId, interruptionReason);
+            }
             const elapsedMs = spinner.stop();
             if (requestController.signal.aborted) {
                 const reason = requestController.signal.reason instanceof Error && requestController.signal.reason.message.includes("budget")
@@ -3128,8 +3182,12 @@ async function start(): Promise<void> {
     if (!activeSession) {
         throw new Error(`Session not found: ${requestedSessionId}`);
     }
+    const recoveredInterruptedTask = sessionTool.recoverInterruptedTask(activeSession.id);
     await restoreSessionWorkspace(activeSession);
     console.log(`Session: ${activeSession.title}`);
+    if (recoveredInterruptedTask) {
+        console.log("Recovered an unfinished task journal from the previous CLI process.");
+    }
     console.log(formatSessionHistory(
         sessionTool.getContextMessages(activeSession.id, historyMessageLimit),
         historyMessageLimit
