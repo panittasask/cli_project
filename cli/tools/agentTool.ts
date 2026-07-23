@@ -34,6 +34,7 @@ type AgentTaskContract = {
     task_type: "general" | "web_research" | "coding" | "mcp_creation";
     requires_workspace_changes: boolean;
     verification: "none" | "command" | "runtime" | "interaction";
+    evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
     success_criteria: string[];
 };
 
@@ -137,7 +138,7 @@ Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. D
 Set run_command.workdir to a relative workspace directory instead of using Set-Location or cd.
 If workdir is omitted and exactly one nested package manifest matches the requested executable or package script, the runner selects that directory automatically.
 Dependency installation and project scaffolding may run for up to three minutes. After a real timeout, inspect files before retrying because the command may have created partial output.
-Never add automatic browser-opening flags such as --open to package scripts. Do not run dev servers, watch commands, or browser-based interactive tests; use finite build and non-watch test commands.
+Never add automatic browser-opening flags such as --open to package scripts. Do not run dev servers, watch commands, or headed/manual browser sessions. Finite headless automated interaction tests are allowed.
 Do not wrap commands in another powershell.exe invocation. Do not use Bash separators such as && or a bare & to background a process.`
             : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
         // The model is controlled through a small JSON protocol so the CLI can
@@ -153,8 +154,9 @@ ${workflowInstructions}
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
 For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. Use the user's language when practical. This is a decision summary, not private chain-of-thought.
 On the first response for a task, include "task" in the same JSON object as the first action:
-{"intent":"what the user wants","task_type":"general|web_research|coding|mcp_creation","requires_workspace_changes":true,"verification":"none|command|runtime|interaction","success_criteria":["observable result"]}
+{"intent":"what the user wants","task_type":"general|web_research|coding|mcp_creation","requires_workspace_changes":true,"verification":"interaction","evidence_requirements":["interaction","visual"],"success_criteria":["observable result"]}
 Classify the task semantically from the complete request and context. Choose the first evidence-producing action in that same response; there is no separate routing phase. For repository work, inspect the workspace map and request only relevant file contents rather than asking for every file.
+Choose every applicable evidence requirement from the requested outcome, not merely the cheapest check. Use interaction whenever success depends on a user action and its observable result. Use visual whenever success depends on rendered appearance, layout, or styling; visual work also requires interaction evidence. A build proves compilation only and must not be used as evidence that navigation, clicks, state transitions, or appearance work.
 
 Available actions:
 {"action":"list_files","path":"optional relative path","reason":"brief rationale"}
@@ -815,24 +817,31 @@ ${mcpSection}`;
         const task = value as Record<string, unknown>;
         const taskTypes = new Set(["general", "web_research", "coding", "mcp_creation"]);
         const verificationTypes = new Set(["none", "command", "runtime", "interaction"]);
+        const evidenceTypes = new Set(["source", "command", "runtime", "interaction", "visual"]);
         if (typeof task.intent !== "string"
             || !taskTypes.has(String(task.task_type))
             || typeof task.requires_workspace_changes !== "boolean"
             || !verificationTypes.has(String(task.verification))
+            || !Array.isArray(task.evidence_requirements)
             || !Array.isArray(task.success_criteria)) {
             return undefined;
         }
+        const evidenceRequirements = Array.from(new Set(task.evidence_requirements
+            .filter((item): item is AgentTaskContract["evidence_requirements"][number] => (
+                typeof item === "string" && evidenceTypes.has(item)
+            )))).slice(0, 5);
         const successCriteria = task.success_criteria
             .filter((item): item is string => typeof item === "string")
             .map((item) => item.trim())
             .filter(Boolean)
             .slice(0, 6);
-        if (successCriteria.length === 0) return undefined;
+        if (successCriteria.length === 0 || evidenceRequirements.length === 0) return undefined;
         return {
             intent: task.intent.trim().slice(0, 500),
             task_type: task.task_type as AgentTaskContract["task_type"],
             requires_workspace_changes: task.requires_workspace_changes,
             verification: task.verification as AgentTaskContract["verification"],
+            evidence_requirements: evidenceRequirements,
             success_criteria: successCriteria
         };
     }

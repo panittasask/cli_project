@@ -8,6 +8,13 @@ const taskContractProperty = {
         task_type: { enum: ["general", "web_research", "coding", "mcp_creation"] },
         requires_workspace_changes: { type: "boolean" },
         verification: { enum: ["none", "command", "runtime", "interaction"] },
+        evidence_requirements: {
+            type: "array",
+            minItems: 1,
+            maxItems: 5,
+            uniqueItems: true,
+            items: { enum: ["source", "command", "runtime", "interaction", "visual"] }
+        },
         success_criteria: {
             type: "array",
             minItems: 1,
@@ -15,7 +22,7 @@ const taskContractProperty = {
             items: stringProperty
         }
     },
-    required: ["intent", "task_type", "requires_workspace_changes", "verification", "success_criteria"],
+    required: ["intent", "task_type", "requires_workspace_changes", "verification", "evidence_requirements", "success_criteria"],
     additionalProperties: false
 };
 const variants: Record<string, Record<string, unknown>> = {

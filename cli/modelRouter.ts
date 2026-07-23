@@ -41,6 +41,23 @@ function resolveRouterModel(models: RouterModel[], selection: string): RouterMod
         || models.find((entry) => path.basename(entry.path || "").toLowerCase() === normalized);
 }
 
+function selectActiveModelId(entries: unknown[]): string | undefined {
+    const records = entries.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object");
+    const loaded = records.find((entry) => {
+        const status = entry.status && typeof entry.status === "object"
+            ? entry.status as Record<string, unknown>
+            : undefined;
+        return status?.value === "loaded" && typeof entry.id === "string" && entry.id.length > 0;
+    });
+    if (typeof loaded?.id === "string") return loaded.id;
+
+    // A standalone llama-server exposes one status-less model entry. Do not
+    // fall back to an explicitly unloaded router entry.
+    const standalone = records.find((entry) => entry.status === undefined
+        && typeof entry.id === "string" && entry.id.length > 0);
+    return typeof standalone?.id === "string" ? standalone.id : undefined;
+}
+
 function routerErrorMessage(error: unknown): string {
     if (!axios.isAxiosError(error)) return error instanceof Error ? error.message : String(error);
     const responseMessage = typeof error.response?.data === "string"
@@ -74,25 +91,17 @@ class ModelRouterClient {
         const loaded = models.filter((entry) => entry.status === "loaded" && entry.id !== target.id);
         for (const entry of loaded) {
             await this.assertModelIdle(entry.id);
-            await axios.post(endpoint(this.apiUrl, "/models/unload"), { model: entry.id }, { timeout: 30_000 });
+            await this.transitionModel(entry.id, "/models/unload", "unloaded", 30_000);
         }
 
         if (target.status !== "loaded") {
-            await axios.post(endpoint(this.apiUrl, "/models/load"), { model: target.id }, { timeout: this.loadTimeoutMs });
+            await this.transitionModel(target.id, "/models/load", "loaded", this.loadTimeoutMs);
         }
 
-        const deadline = Date.now() + this.loadTimeoutMs;
-        while (Date.now() < deadline) {
-            const refreshed = await this.list();
-            const current = refreshed.find((entry) => entry.id === target.id);
-            if (current?.status === "loaded") {
-                return { model: current, unloaded: loaded.map((entry) => entry.id) };
-            }
-            if (current?.failed) throw new Error(`llama.cpp failed to load model: ${target.id}`);
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-
-        throw new Error(`Timed out while loading model: ${target.id}`);
+        const refreshed = await this.list();
+        const current = refreshed.find((entry) => entry.id === target.id);
+        if (current?.status !== "loaded") throw new Error(`llama.cpp did not report the selected model as loaded: ${target.id}`);
+        return { model: current, unloaded: loaded.map((entry) => entry.id) };
     }
 
     formatError(error: unknown): string {
@@ -108,11 +117,64 @@ class ModelRouterClient {
             throw new Error(`Cannot switch models while '${modelId}' is processing an active request. Wait for the current response to finish, then retry the model switch.`);
         }
     }
+
+    private async transitionModel(
+        modelId: string,
+        route: "/models/load" | "/models/unload",
+        desiredStatus: "loaded" | "unloaded",
+        timeoutMs: number
+    ): Promise<void> {
+        const deadline = Date.now() + timeoutMs;
+        let lastError: unknown;
+
+        for (let attempt = 0; attempt < 2 && Date.now() < deadline; attempt += 1) {
+            let transientMutationFailure = false;
+            try {
+                await axios.post(endpoint(this.apiUrl, route), { model: modelId }, {
+                    timeout: Math.max(1, Math.min(timeoutMs, deadline - Date.now()))
+                });
+            } catch (error) {
+                lastError = error;
+                if (!this.isTransientConnectionError(error)) throw error;
+                transientMutationFailure = true;
+            }
+
+            let unchangedPolls = 0;
+            while (Date.now() < deadline) {
+                try {
+                    const current = (await this.list()).find((entry) => entry.id === modelId);
+                    if (current?.status === desiredStatus) return;
+                    if (current?.failed) throw new Error(`llama.cpp failed to ${desiredStatus === "loaded" ? "load" : "unload"} model: ${modelId}`);
+                    const oppositeStatus = desiredStatus === "loaded" ? "unloaded" : "loaded";
+                    unchangedPolls = current?.status === oppositeStatus ? unchangedPolls + 1 : 0;
+                } catch (error) {
+                    lastError = error;
+                    if (!this.isTransientConnectionError(error)) throw error;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 500));
+                // Retry the mutation if the router accepted no state change
+                // for several polls after resetting the HTTP connection.
+                if (attempt === 0 && transientMutationFailure && unchangedPolls >= 6) break;
+            }
+        }
+
+        if (lastError) throw new Error(
+            `Model ${desiredStatus === "loaded" ? "load" : "unload"} did not complete after a transient router disconnect: ${routerErrorMessage(lastError)}`
+        );
+        throw new Error(`Timed out while waiting for model '${modelId}' to become ${desiredStatus}.`);
+    }
+
+    private isTransientConnectionError(error: unknown): boolean {
+        if (!axios.isAxiosError(error)) return false;
+        return ["ECONNRESET", "EPIPE", "ECONNREFUSED", "ETIMEDOUT", "ERR_NETWORK"].includes(error.code || "")
+            || /socket hang up|connection reset/i.test(error.message);
+    }
 }
 
 module.exports = {
     ModelRouterClient,
     normalizeRouterModel,
     resolveRouterModel,
+    selectActiveModelId,
     routerErrorMessage
 };
