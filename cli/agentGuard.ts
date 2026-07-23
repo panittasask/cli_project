@@ -5,13 +5,15 @@ const { normalizeCommandSignature } = require("./commandNormalizer") as {
 
 type GuardSettings = { maxTurns: number; maxSegments?: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
 type GuardDecision = { status: "allow" | "replan" | "stop"; message?: string };
+type ToolObservation = { ok: boolean; output: string; changed?: boolean };
 
 class AgentGuard {
     private readonly startedAt = Date.now();
     private completionTokens = 0;
-    private readonly actionCounts = new Map<string, number>();
-    private inspectionEpoch = 0;
-    private verificationEpoch = 0;
+    private readonly seenEvidencePairs = new Set<string>();
+    private readonly repeatedEvidenceCounts = new Map<string, number>();
+    private readonly quarantinedActions = new Set<string>();
+    private readonly quarantineViolationCounts = new Map<string, number>();
     private pausedAt: number | undefined;
     private pausedDurationMs = 0;
 
@@ -30,27 +32,65 @@ class AgentGuard {
 
     registerAction(action: Record<string, unknown>): GuardDecision {
         const signature = this.signature(action);
-        const count = (this.actionCounts.get(signature) ?? 0) + 1;
-        this.actionCounts.set(signature, count);
-        if (!this.isInspectionAction(action.action)) this.inspectionEpoch += 1;
-        if (count === this.settings.repeatLimit) {
-            return { status: "replan", message: `Repeated equivalent action ${count} times without file progress; choose a different action or return final.` };
+        if (this.quarantinedActions.has(signature)) {
+            const violations = (this.quarantineViolationCounts.get(signature) ?? 0) + 1;
+            this.quarantineViolationCounts.set(signature, violations);
+            if (violations >= this.settings.repeatLimit) {
+                return {
+                    status: "stop",
+                    message: `Stopped after the model ignored the quarantine for this exact action ${violations} times.`
+                };
+            }
+            return {
+                status: "replan",
+                message: "This exact action is quarantined because it returned an identical observation repeatedly. Choose different arguments, another evidence-producing action, or return final."
+            };
         }
-        if (count > this.settings.repeatLimit) {
-            return { status: "stop", message: `Stopped equivalent action after ${count} attempts without file progress.` };
+        return { status: "allow" };
+    }
+
+    recordObservation(action: Record<string, unknown>, observation: ToolObservation): GuardDecision {
+        const signature = this.signature(action);
+        const fingerprint = this.observationFingerprint(observation);
+        const evidencePair = `${signature}:${fingerprint}`;
+
+        if (!this.seenEvidencePairs.has(evidencePair)) {
+            // Any genuinely new observation, including a new failure, gives the
+            // model new evidence to reason from and releases current
+            // quarantines. Keep the global seen set so alternating old A/B
+            // observations cannot masquerade as perpetual progress.
+            this.seenEvidencePairs.add(evidencePair);
+            this.repeatedEvidenceCounts.clear();
+            this.quarantinedActions.clear();
+            this.quarantineViolationCounts.clear();
+            this.repeatedEvidenceCounts.set(evidencePair, 1);
+            return { status: "allow" };
+        }
+
+        const count = (this.repeatedEvidenceCounts.get(evidencePair) ?? 0) + 1;
+        this.repeatedEvidenceCounts.set(evidencePair, count);
+        if (count >= this.settings.repeatLimit) {
+            this.quarantinedActions.add(signature);
+            return {
+                status: "replan",
+                message: `The exact action returned an identical observation ${count} times and is now quarantined. Choose different arguments, another evidence-producing action, or return final.`
+            };
         }
         return { status: "allow" };
     }
 
     resetActionHistory(): void {
-        this.actionCounts.clear();
+        this.seenEvidencePairs.clear();
+        this.repeatedEvidenceCounts.clear();
+        this.quarantinedActions.clear();
+        this.quarantineViolationCounts.clear();
     }
 
     recordFileProgress(): void {
-        // A successful file change is real progress. Actions chosen against the
-        // previous workspace state are no longer equivalent repetitions.
-        this.actionCounts.clear();
-        this.verificationEpoch += 1;
+        // Kept as a compatibility alias for callers that already record
+        // mutations. File changes are one kind of evidence progress, not the
+        // only kind.
+        this.resetActionHistory();
     }
 
     pause(now = Date.now()): void {
@@ -79,21 +119,15 @@ class AgentGuard {
 
     private signature(action: Record<string, unknown>): string {
         const canonicalAction = { ...action };
-        if (this.isInspectionAction(action.action)) {
-            canonicalAction.inspection_epoch = this.inspectionEpoch;
-        }
         if (action.action === "run_command" && typeof action.workdir !== "string") {
             canonicalAction.workdir = ".";
-        }
-        if (action.action === "run_command") {
-            canonicalAction.verification_epoch = this.verificationEpoch;
         }
         if ((action.action === "list_files" || action.action === "search_files")
             && typeof action.path !== "string") {
             canonicalAction.path = ".";
         }
         const normalized = Object.fromEntries(Object.entries(canonicalAction)
-            .filter(([key]) => key !== "reason")
+            .filter(([key]) => key !== "reason" && key !== "task")
             .sort(([left], [right]) => left.localeCompare(right))
             .map(([key, value]) => {
                 if (key === "content" && typeof value === "string") {
@@ -110,8 +144,12 @@ class AgentGuard {
         return JSON.stringify(normalized);
     }
 
-    private isInspectionAction(action: unknown): boolean {
-        return action === "read_file" || action === "list_files" || action === "search_files";
+    private observationFingerprint(observation: ToolObservation): string {
+        return crypto.createHash("sha256").update(JSON.stringify({
+            ok: observation.ok,
+            changed: observation.changed,
+            output: observation.output
+        })).digest("hex");
     }
 }
 

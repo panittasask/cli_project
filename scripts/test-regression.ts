@@ -88,12 +88,25 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     recordCompletionTokens: (tokens: number) => void;
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: string };
+    recordObservation: (action: Record<string, unknown>, observation: { ok: boolean; output: string; changed?: boolean }) => { status: string };
     resetActionHistory: () => void;
     recordFileProgress: () => void;
     pause: () => void;
     resume: () => void;
     formatRemaining: () => string;
 } };
+const { noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
+    noChangeCompletionBlockReason: (input: {
+        status: "completed" | "already_satisfied" | "no_change_needed";
+        evidence: string[];
+        successfulEvidenceRefs: Set<string>;
+        successfulWorkspaceEvidenceRefs: Set<string>;
+        workspaceChangeRequired: boolean;
+        verificationRequired: boolean;
+        verificationSatisfied: boolean;
+        hasUnresolvedFailures: boolean;
+    }) => string | undefined;
+};
 const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoints") as {
     FileCheckpointStore: new (root: string) => {
         checkpoint: (workspace: string, file: string, next: string) => { preview: string };
@@ -673,9 +686,16 @@ async function main(): Promise<void> {
     assert.match(continuedMessages[0]?.content ?? "", /Recent session context \(use only when relevant/);
 
     const guard = new AgentGuard({ maxTurns: 3, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
-    assert.equal(guard.registerAction({ action: "read_file", path: "README.md", reason: "one" }).status, "allow");
-    assert.equal(guard.registerAction({ action: "read_file", path: "README.md", reason: "two" }).status, "replan");
-    assert.equal(guard.registerAction({ action: "read_file", path: "README.md", reason: "three" }).status, "stop");
+    const repeatedRead = { action: "read_file", path: "README.md", reason: "inspect" };
+    assert.equal(guard.registerAction(repeatedRead).status, "allow");
+    assert.equal(guard.recordObservation(repeatedRead, { ok: true, output: "same content" }).status, "allow");
+    assert.equal(guard.registerAction({ ...repeatedRead, reason: "inspect again" }).status, "allow");
+    assert.equal(guard.recordObservation(repeatedRead, { ok: true, output: "same content" }).status, "replan");
+    assert.equal(guard.registerAction(repeatedRead).status, "replan");
+    assert.equal(guard.registerAction(repeatedRead).status, "stop");
+    guard.recordFileProgress();
+    assert.equal(guard.registerAction(repeatedRead).status, "allow");
+    assert.equal(guard.recordObservation(repeatedRead, { ok: true, output: "same content" }).status, "allow");
     assert.match(guard.formatRemaining(), /left$/);
     guard.pause();
     guard.resume();
@@ -684,45 +704,85 @@ async function main(): Promise<void> {
     assert.match(guard.checkBudget(2) ?? "", /completion-token budget/);
 
     const progressGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
-    assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "inspect" }).status, "allow");
-    assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "inspect again" }).status, "replan");
-    assert.equal(progressGuard.registerAction({ action: "write_file", path: "index.html", content: "done", reason: "make progress" }).status, "allow");
-    progressGuard.resetActionHistory();
-    assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "verify" }).status, "allow");
-    assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "verify again" }).status, "replan");
-    progressGuard.resetActionHistory();
-    assert.equal(progressGuard.registerAction({ action: "list_files", path: ".", reason: "new segment" }).status, "allow");
-    const semanticGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
-    assert.equal(semanticGuard.registerAction({
+    const listAction = { action: "list_files", path: ".", reason: "inspect" };
+    assert.equal(progressGuard.recordObservation(listAction, { ok: true, output: "first state" }).status, "allow");
+    assert.equal(progressGuard.recordObservation(listAction, { ok: true, output: "changed state" }).status, "allow");
+    assert.equal(progressGuard.registerAction(listAction).status, "allow");
+    const alternatingGuard = new AgentGuard({ maxTurns: 8, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
+    const actionA = { action: "read_file", path: "a.ts" };
+    const actionB = { action: "read_file", path: "b.ts" };
+    assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A" }).status, "allow");
+    assert.equal(alternatingGuard.recordObservation(actionB, { ok: false, output: "B missing" }).status, "allow");
+    assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A" }).status, "allow");
+    assert.equal(alternatingGuard.recordObservation(actionB, { ok: false, output: "B missing" }).status, "replan");
+    assert.equal(alternatingGuard.registerAction(actionB).status, "replan");
+    assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A changed" }).status, "allow");
+    assert.equal(alternatingGuard.registerAction(actionB).status, "allow");
+    const normalizedCommandGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
+    const wrappedCommand = {
         action: "run_command",
         command: "powershell.exe -NoLogo -NoProfile -Command \"go test ./...\"",
         workdir: "go"
-    }).status, "allow");
-    assert.equal(semanticGuard.registerAction({ action: "read_file", path: "go/go.mod" }).status, "allow");
-    assert.equal(semanticGuard.registerAction({
+    };
+    const normalizedCommand = {
         action: "run_command",
         command: "go   test   ./...",
         workdir: ".\\go"
-    }).status, "replan");
-    const recoveryReadGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
-    assert.equal(recoveryReadGuard.registerAction({ action: "read_file", path: "src/app.ts" }).status, "allow");
-    assert.equal(recoveryReadGuard.registerAction({ action: "edit_file", path: "src/app.ts", old_text: "x", new_text: "y" }).status, "allow");
-    assert.equal(recoveryReadGuard.registerAction({ action: "read_file", path: "src/app.ts" }).status, "allow");
-    assert.equal(recoveryReadGuard.registerAction({ action: "read_file", path: "src/app.ts" }).status, "replan");
-    const repeatedWriteGuard = new AgentGuard({ maxTurns: 6, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
-    const repeatedWrite = { action: "write_file", path: "same.txt", content: "same" };
-    assert.equal(repeatedWriteGuard.registerAction(repeatedWrite).status, "allow");
-    assert.equal(repeatedWriteGuard.registerAction(repeatedWrite).status, "replan");
-    const verificationEpochGuard = new AgentGuard({ maxTurns: 8, maxDurationMs: 60_000, maxCompletionTokens: 100, repeatLimit: 2 });
-    const buildAction = { action: "run_command", command: "npm run build", workdir: "web" };
-    assert.equal(verificationEpochGuard.registerAction(buildAction).status, "allow");
-    assert.equal(verificationEpochGuard.registerAction(buildAction).status, "replan");
-    verificationEpochGuard.recordFileProgress();
-    assert.equal(verificationEpochGuard.registerAction(buildAction).status, "allow");
-    assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "allow");
-    verificationEpochGuard.recordFileProgress();
-    assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "allow");
-    assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "replan");
+    };
+    assert.equal(normalizedCommandGuard.recordObservation(wrappedCommand, { ok: true, output: "tests pass" }).status, "allow");
+    assert.equal(normalizedCommandGuard.recordObservation(normalizedCommand, { ok: true, output: "tests pass" }).status, "replan");
+
+    const successfulRefs = new Set(["evidence_2_read_file", "evidence_3_run_command"]);
+    const workspaceRefs = new Set(["evidence_2_read_file"]);
+    assert.equal(noChangeCompletionBlockReason({
+        status: "already_satisfied",
+        evidence: ["evidence_2_read_file"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        workspaceChangeRequired: true,
+        verificationRequired: false,
+        verificationSatisfied: true,
+        hasUnresolvedFailures: false
+    }), undefined);
+    assert.match(noChangeCompletionBlockReason({
+        status: "no_change_needed",
+        evidence: ["invented"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        workspaceChangeRequired: true,
+        verificationRequired: false,
+        verificationSatisfied: true,
+        hasUnresolvedFailures: false
+    }) ?? "", /host-issued evidence ID/);
+    assert.match(noChangeCompletionBlockReason({
+        status: "already_satisfied",
+        evidence: ["evidence_2_read_file"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        workspaceChangeRequired: true,
+        verificationRequired: true,
+        verificationSatisfied: false,
+        hasUnresolvedFailures: false
+    }) ?? "", /required verification/);
+    assert.match(noChangeCompletionBlockReason({
+        status: "already_satisfied",
+        evidence: ["evidence_3_run_command"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        workspaceChangeRequired: true,
+        verificationRequired: false,
+        verificationSatisfied: true,
+        hasUnresolvedFailures: false
+    }) ?? "", /workspace inspection or no-op evidence/);
+    const finalParser = new AgentTool();
+    assert.deepEqual(finalParser.parseAction('{"action":"final","answer":"hello"}'), {
+        action: "final",
+        answer: "hello",
+        completion_status: "completed",
+        evidence: [],
+        reason: undefined
+    });
+    await finalParser.close();
     const compacted = buildCompactedAgentMessages("system", "แก้ login.html", {
         segment: 2,
         maxSegments: 3,
@@ -730,6 +790,8 @@ async function main(): Promise<void> {
         validationFailures: [],
         verificationRequirement: "runtime",
         verificationSatisfied: false,
+        successfulEvidenceRefs: ["evidence_3_read_file", "evidence_4_run_command"],
+        successfulWorkspaceEvidenceRefs: ["evidence_3_read_file"],
         sourceUrls: [],
         recentEvents: ["edit_file [ok] login.html", "read_file [ok] login.html"],
         mcpCallsDisabled: true
@@ -740,6 +802,8 @@ async function main(): Promise<void> {
     assert.match(compacted[1]?.content ?? "", /MCP calls available: no/);
     assert.match(compacted[1]?.content ?? "", /Required verification: runtime/);
     assert.match(compacted[1]?.content ?? "", /Required verification satisfied after the latest write: no/);
+    assert.match(compacted[1]?.content ?? "", /Successful host evidence IDs: evidence_3_read_file, evidence_4_run_command/);
+    assert.match(compacted[1]?.content ?? "", /Workspace inspection\/no-op evidence IDs: evidence_3_read_file/);
 
     const sharedLogDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cli-shared-task-id-"));
     try {

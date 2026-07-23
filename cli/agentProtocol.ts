@@ -21,7 +21,13 @@ const taskContractProperty = {
 const variants: Record<string, Record<string, unknown>> = {
     final: {
         type: "object",
-        properties: { action: { const: "final" }, answer: stringProperty, reason: stringProperty },
+        properties: {
+            action: { const: "final" },
+            answer: stringProperty,
+            completion_status: { enum: ["completed", "already_satisfied", "no_change_needed"] },
+            evidence: { type: "array", maxItems: 8, items: stringProperty },
+            reason: stringProperty
+        },
         required: ["action", "answer"], additionalProperties: false
     },
     list_files: {

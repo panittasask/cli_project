@@ -7,6 +7,8 @@ type CompactState = {
     unresolvedVerificationFailure?: string;
     verificationRequirement?: "none" | "command" | "runtime";
     verificationSatisfied?: boolean;
+    successfulEvidenceRefs?: string[];
+    successfulWorkspaceEvidenceRefs?: string[];
     sourceUrls: string[];
     recentEvents: string[];
     mcpCallsDisabled?: boolean;
@@ -26,6 +28,8 @@ function buildCompactedAgentMessages(
         `Unresolved verification failure: ${state.unresolvedVerificationFailure || "none"}`,
         `Required verification: ${state.verificationRequirement || "none"}`,
         `Required verification satisfied after the latest write: ${state.verificationSatisfied === true ? "yes" : "no"}`,
+        `Successful host evidence IDs: ${state.successfulEvidenceRefs?.join(", ") || "none"}`,
+        `Workspace inspection/no-op evidence IDs: ${state.successfulWorkspaceEvidenceRefs?.join(", ") || "none"}`,
         `Collected source URLs: ${state.sourceUrls.join(", ") || "none"}`,
         `MCP calls available: ${state.mcpCallsDisabled ? "no - use local file tools and do not invent server names" : "yes"}`,
         "Recent agent events:",
