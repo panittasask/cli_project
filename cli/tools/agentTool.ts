@@ -29,6 +29,14 @@ const { McpTool } = require("./mcpTool") as { McpTool: new (configRoot?: string)
     close: () => Promise<void>;
 } };
 
+type AgentTaskContract = {
+    intent: string;
+    task_type: "general" | "web_research" | "coding" | "mcp_creation";
+    requires_workspace_changes: boolean;
+    verification: "none" | "command" | "runtime" | "interaction";
+    success_criteria: string[];
+};
+
 type AgentAction = (
     | {
         action: "final";
@@ -79,6 +87,7 @@ type AgentAction = (
         arguments: Record<string, unknown>;
     }) & {
         reason?: string | undefined;
+        task?: AgentTaskContract | undefined;
     };
 
 type AgentToolResult = {
@@ -119,6 +128,7 @@ class AgentTool {
 
     async buildSystemPrompt(workflowInstructions = ""): Promise<string> {
         const mcpSection = await this.mcpTool.buildPromptSection();
+        const workspaceMap = this.listFiles();
         const runtimeSection = process.platform === "win32"
             ? `Runtime platform: Windows. run_command executes Windows PowerShell.
 Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.
@@ -140,6 +150,9 @@ ${workflowInstructions}
 
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
 For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. Use the user's language when practical. This is a decision summary, not private chain-of-thought.
+On the first response for a task, include "task" in the same JSON object as the first action:
+{"intent":"what the user wants","task_type":"general|web_research|coding|mcp_creation","requires_workspace_changes":true,"verification":"none|command|runtime|interaction","success_criteria":["observable result"]}
+Classify the task semantically from the complete request and context. Choose the first evidence-producing action in that same response; there is no separate routing phase. For repository work, inspect the workspace map and request only relevant file contents rather than asking for every file.
 
 Available actions:
 {"action":"list_files","path":"optional relative path","reason":"brief rationale"}
@@ -186,6 +199,9 @@ Rules:
 - Do not run destructive commands.
 - Answer the final user in Thai unless the user asks for another language.
 
+Workspace map (paths only; request relevant contents with read_file):
+${workspaceMap}
+
 ${mcpSection}`;
     }
 
@@ -210,36 +226,38 @@ ${mcpSection}`;
         const data = parsed;
         const action = typeof data.action === "string" ? data.action : "";
         const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
+        const task = this.normalizeTaskContract(data.task);
+        const common = { reason, ...(task ? { task } : {}) };
 
         if (action === "final") {
             return {
                 action,
                 answer: typeof data.answer === "string" ? data.answer : "",
-                reason
+                ...common
             };
         }
 
         if (action === "ask_user") {
             const request = normalizeClarificationRequest(data.question, data.options, data.decision, reason);
-            return request ? { action, ...request } : undefined;
+            return request ? { action, ...request, ...(task ? { task } : {}) } : undefined;
         }
 
         if (action === "list_files") {
             const pathValue = typeof data.path === "string" ? data.path : undefined;
-            return pathValue ? { action, path: pathValue, reason } : { action, reason };
+            return pathValue ? { action, path: pathValue, ...common } : { action, ...common };
         }
 
         if (action === "search_files") {
             const query = typeof data.query === "string" ? data.query : "";
             const pathValue = typeof data.path === "string" ? data.path : undefined;
-            return pathValue ? { action, query, path: pathValue, reason } : { action, query, reason };
+            return pathValue ? { action, query, path: pathValue, ...common } : { action, query, ...common };
         }
 
         if (action === "read_file") {
             return {
                 action,
                 path: typeof data.path === "string" ? data.path : "",
-                reason
+                ...common
             };
         }
 
@@ -248,7 +266,7 @@ ${mcpSection}`;
                 action,
                 path: typeof data.path === "string" ? data.path : "",
                 content: typeof data.content === "string" ? data.content : "",
-                reason
+                ...common
             };
         }
 
@@ -258,7 +276,7 @@ ${mcpSection}`;
                 path: typeof data.path === "string" ? data.path : "",
                 old_text: typeof data.old_text === "string" ? data.old_text : "",
                 new_text: typeof data.new_text === "string" ? data.new_text : "",
-                reason
+                ...common
             };
         }
 
@@ -266,7 +284,7 @@ ${mcpSection}`;
             return {
                 action,
                 path: typeof data.path === "string" ? data.path : "",
-                reason
+                ...common
             };
         }
 
@@ -276,13 +294,13 @@ ${mcpSection}`;
                 action,
                 command: typeof data.command === "string" ? data.command : "",
                 ...(workdir ? { workdir } : {}),
-                reason
+                ...common
             };
         }
 
         if (action === "mcp_list_tools") {
             const server = typeof data.server === "string" ? data.server : undefined;
-            return server ? { action, server, reason } : { action, reason };
+            return server ? { action, server, ...common } : { action, ...common };
         }
 
         if (action === "mcp_call_tool") {
@@ -293,7 +311,7 @@ ${mcpSection}`;
                 arguments: data.arguments && typeof data.arguments === "object" && !Array.isArray(data.arguments)
                     ? data.arguments as Record<string, unknown>
                     : {},
-                reason
+                ...common
             };
         }
 
@@ -304,7 +322,7 @@ ${mcpSection}`;
                 server: directMcpCall.server,
                 tool: directMcpCall.tool,
                 arguments: directMcpCall.arguments,
-                reason
+                ...common
             };
         }
 
@@ -779,6 +797,33 @@ ${mcpSection}`;
             return "Invalid .cli/mcp.json: content must be valid JSON with an object-valued mcpServers field.";
         }
         return undefined;
+    }
+
+    private normalizeTaskContract(value: unknown): AgentTaskContract | undefined {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+        const task = value as Record<string, unknown>;
+        const taskTypes = new Set(["general", "web_research", "coding", "mcp_creation"]);
+        const verificationTypes = new Set(["none", "command", "runtime", "interaction"]);
+        if (typeof task.intent !== "string"
+            || !taskTypes.has(String(task.task_type))
+            || typeof task.requires_workspace_changes !== "boolean"
+            || !verificationTypes.has(String(task.verification))
+            || !Array.isArray(task.success_criteria)) {
+            return undefined;
+        }
+        const successCriteria = task.success_criteria
+            .filter((item): item is string => typeof item === "string")
+            .map((item) => item.trim())
+            .filter(Boolean)
+            .slice(0, 6);
+        if (successCriteria.length === 0) return undefined;
+        return {
+            intent: task.intent.trim().slice(0, 500),
+            task_type: task.task_type as AgentTaskContract["task_type"],
+            requires_workspace_changes: task.requires_workspace_changes,
+            verification: task.verification as AgentTaskContract["verification"],
+            success_criteria: successCriteria
+        };
     }
 
     private async runCommand(command: string, workdir?: string): Promise<string> {

@@ -30,7 +30,7 @@ const { WriteValidator } = require("../cli/writeValidator") as { WriteValidator:
 const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () => {
     buildSystemPrompt: (instructions?: string) => Promise<string>;
     diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
-    parseAction: (content: string) => Record<string, unknown> | undefined;
+    parseAction: (content: string) => any;
     close: () => Promise<void>;
 } };
 const {
@@ -80,8 +80,8 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
     getAgentReadOnlyResponseFormat: (workflow: string, allowCommands?: boolean) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
-    getInitialAgentResponseFormat: (workflow: string, message: string, requiresWrite?: boolean) => {
-        schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
+    getInitialAgentResponseFormat: () => {
+        schema: { oneOf: Array<{ properties: { action: { const: string }; task: Record<string, any> }; required: string[] }> };
     };
 };
 const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settings: { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number }) => {
@@ -517,23 +517,23 @@ async function main(): Promise<void> {
     assert.ok(!readOnlyActions.includes("write_file"));
     assert.ok(!readOnlyActions.includes("delete_file"));
     assert.ok(getAgentReadOnlyResponseFormat("coding", true).schema.oneOf.some((variant) => variant.properties.action.const === "run_command"));
-    const ambiguousWorkspaceActions = getInitialAgentResponseFormat("general", "ช่วยเอาสองอันนี้แยกออกจากกัน").schema.oneOf.map((variant) => variant.properties.action.const);
+    const initialVariants = getInitialAgentResponseFormat().schema.oneOf;
+    const ambiguousWorkspaceActions = initialVariants.map((variant) => variant.properties.action.const);
     assert.ok(ambiguousWorkspaceActions.includes("read_file"));
     assert.ok(ambiguousWorkspaceActions.includes("edit_file"));
     assert.ok(ambiguousWorkspaceActions.includes("write_file"));
     assert.ok(ambiguousWorkspaceActions.includes("ask_user"));
     assert.ok(ambiguousWorkspaceActions.includes("final"));
-    const firstCodingActions = getInitialAgentResponseFormat("coding", "Read README.md first").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(firstCodingActions, ["read_file"]);
-    const firstCreateActions = getInitialAgentResponseFormat("coding", "สร้างหน้า login พร้อม privacy policy modal", true).schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.ok(firstCreateActions.includes("write_file"));
-    assert.ok(firstCreateActions.includes("delete_file"));
-    assert.ok(!firstCreateActions.includes("ask_user"));
-    assert.ok(!firstCreateActions.includes("final"));
-    const swaggerRepairActions = getInitialAgentResponseFormat("coding", swaggerUntilWorking, true).schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.ok(swaggerRepairActions.includes("edit_file"));
-    assert.ok(!swaggerRepairActions.includes("ask_user"));
-    assert.ok(!swaggerRepairActions.includes("final"));
+    for (const variant of initialVariants) {
+        assert.ok(variant.required.includes("task"));
+        assert.deepEqual(variant.properties.task.required, [
+            "intent",
+            "task_type",
+            "requires_workspace_changes",
+            "verification",
+            "success_criteria"
+        ]);
+    }
     const repeatedReadRecoveryActions = getAgentRecoveryResponseFormat("coding", "read_file").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(!repeatedReadRecoveryActions.includes("read_file"));
     assert.ok(repeatedReadRecoveryActions.includes("write_file"));
@@ -766,6 +766,22 @@ async function main(): Promise<void> {
         assert.match(generalPrompt, /Use ask_user only when required information/);
         assert.match(generalPrompt, /Uncertainty by itself is not a blocker/);
         assert.match(generalPrompt, /Never ask whether to create a new project/);
+        assert.match(generalPrompt, /Workspace map \(paths only/);
+        const parsedFirstAction = agent.parseAction(JSON.stringify({
+            action: "read_file",
+            path: "package.json",
+            reason: "Inspect the project manifest",
+            task: {
+                intent: "Understand the project",
+                task_type: "coding",
+                requires_workspace_changes: false,
+                verification: "none",
+                success_criteria: ["Explain the project from repository evidence"]
+            }
+        }));
+        assert.equal(parsedFirstAction?.action, "read_file");
+        assert.equal(parsedFirstAction?.task?.task_type, "coding");
+        assert.deepEqual(parsedFirstAction?.task?.success_criteria, ["Explain the project from repository evidence"]);
         const parsedClarification = agent.parseAction(JSON.stringify({
             action: "ask_user",
             decision: "target",

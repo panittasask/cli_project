@@ -150,7 +150,7 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
     getAgentLocalResponseFormat: (workflow: WorkflowKind) => Record<string, unknown>;
     getAgentReadOnlyResponseFormat: (workflow: WorkflowKind, allowCommands?: boolean) => Record<string, unknown>;
     getAgentFinalResponseFormat: () => Record<string, unknown>;
-    getInitialAgentResponseFormat: (workflow: WorkflowKind, message: string, requiresWrite?: boolean) => Record<string, unknown>;
+    getInitialAgentResponseFormat: () => Record<string, unknown>;
 };
 const { StatusBar } = require("./statusBar") as { StatusBar: new (getState: () => {
     model: string;
@@ -172,12 +172,8 @@ type VerificationRequirement = "none" | "command" | "runtime";
 type AcceptanceContract = { evidence: "source" | "command" | "runtime" | "interaction"; verification: VerificationRequirement; reason: string };
 type ProjectCheck = import("./projectTypes").ProjectCheck;
 type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
-const { forbidsWorkspaceWriteWithHistory, requiresWorkspaceWriteWithHistory, acceptanceContractWithHistory, commandSatisfiesAcceptance, workflowInstructions } = require("./workflowRouter") as {
-    forbidsWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
-    requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
-    acceptanceContractWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => AcceptanceContract;
+const { commandSatisfiesAcceptance } = require("./workflowRouter") as {
     commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract) => boolean;
-    workflowInstructions: (kind: WorkflowKind) => string;
 };
 const { searchReturnedNoResults } = require("./webResearch") as {
     searchReturnedNoResults: (output: string) => boolean;
@@ -249,8 +245,6 @@ const { EditFileTool } = require("./tools/editFileTool") as { EditFileTool: new 
     writeEditedFile: (inputPath: string, content: string) => void;
 } };
 const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => {
-    buildWorkflowMessages: (message: string, recentContext?: Array<{ role: "user" | "assistant"; content: string }>) => Array<{ role: "system" | "user"; content: string }>;
-    parseWorkflowDecision: (content: string | undefined | null) => { kind: WorkflowKind; reason: string } | undefined;
     buildRouterMessages: (message: string) => Array<{ role: "system" | "user"; content: string }>;
     parseDecision: (content: string | undefined | null) => {
         needsTool: boolean;
@@ -1362,22 +1356,6 @@ async function routeTool(message: string, sessionId: string, signal?: AbortSigna
     return keywordFallbackDecision(message);
 }
 
-async function decideWorkflowWithLlm(message: string, history: Array<{ role: "user" | "assistant"; content: string }>, sessionId: string, signal?: AbortSignal): Promise<{ kind: WorkflowKind; reason: string }> {
-    try {
-        const messages = toolRouter.buildWorkflowMessages(message, history);
-        debugLog("Workflow-router LLM request", { model, messages, sampling: actionSampling });
-        const response = await llamaClient.post({ model, messages, ...actionSampling }, undefined, signal);
-        recordResponseUsage(sessionId, response.data);
-        const rawContent = response.data.choices[0].message.content;
-        const decision = toolRouter.parseWorkflowDecision(rawContent);
-        debugLog("Workflow-router LLM response", { rawContent, decision, usage: response.data.usage, timings: response.data.timings });
-        if (decision) return decision;
-    } catch (error) {
-        debugLog("Workflow-router fallback", { error: llamaClient.formatError(error) });
-    }
-    return { kind: "general", reason: "Workflow router unavailable; retain all safe capabilities and let the agent select its tools." };
-}
-
 async function runAgentLoop(
     userMessage: string,
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>,
@@ -1401,17 +1379,30 @@ async function runAgentLoop(
     const maxTurns = unboundedSegments || !hasStepCadence ? Number.POSITIVE_INFINITY : maxTurnsPerSegment * maxSegments;
     const maxTurnsForLog = unboundedSegments || !hasStepCadence ? 0 : maxTurns;
     let effectiveUserMessage = userMessage;
-    let workflow = await decideWorkflowWithLlm(effectiveUserMessage, historyForTask, sessionId, signal);
-    const continuation = isContinuationRequest(userMessage);
-    const readOnlyRequest = forbidsWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
-    let mustWrite = !readOnlyRequest && requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
-    let acceptance = acceptanceContractWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let workflow: { kind: WorkflowKind; reason: string } = {
+        kind: "general",
+        reason: "Pending semantic classification in the agent's first tool action."
+    };
+    let readOnlyRequest = false;
+    let mustWrite = false;
+    let acceptance: AcceptanceContract = {
+        evidence: "source",
+        verification: "none",
+        reason: "Pending the model-owned task contract."
+    };
     let verificationRequirement = acceptance.verification;
-    let readOnlyAllowsCommands = verificationRequirement !== "none";
-    let projectRequirement = inferProjectCompletionRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
+    let readOnlyAllowsCommands = false;
+    let projectRequirement: ProjectCompletionRequirement | undefined;
+    let taskContract: {
+        intent: string;
+        task_type: WorkflowKind;
+        requires_workspace_changes: boolean;
+        verification: "none" | "command" | "runtime" | "interaction";
+        success_criteria: string[];
+    } | undefined;
     let projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
     let agentResponseFormat = readOnlyRequest ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands) : getAgentResponseFormat(workflow.kind);
-    let initialAgentResponseFormat = readOnlyRequest ? agentResponseFormat : getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
+    const initialAgentResponseFormat = getInitialAgentResponseFormat();
     const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
     const contextSummary = summarizeTaskContext(relevantHistory);
     const writeValidator = new WriteValidator(activeWorkspace);
@@ -1451,9 +1442,7 @@ async function runAgentLoop(
         status: "action",
         action: "task_start",
         observation: JSON.stringify({
-            workflow: workflow.kind,
-            verificationRequirement,
-            evidence: acceptance.evidence,
+            workflow: "pending_model_classification",
             model,
             contextLength: activeContextLength,
             agentProfile: agentGuardSettings.profile,
@@ -1464,16 +1453,17 @@ async function runAgentLoop(
     trace.save();
     const responseLogDisplayPath = path.relative(appRoot, resolveJsonlLogPath(responseTarget));
     const buildCurrentSystemPrompt = (): Promise<string> => agentTool.buildSystemPrompt([
-        workflowInstructions(workflow.kind),
-        `Router decision: ${workflow.reason}`,
-        verificationRequirement === "none"
-            ? "No explicit command-level acceptance check was inferred."
-            : `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`,
-        `Acceptance evidence contract: ${acceptance.evidence}. ${acceptance.reason} Final claims must not exceed successful tool evidence.`,
+        taskContract
+            ? `Model-owned task contract: ${JSON.stringify(taskContract)}`
+            : "First-response requirement: infer the user's intent and observable success criteria, include the task contract, and choose the first useful action in the same JSON response.",
+        taskContract && verificationRequirement !== "none"
+            ? `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`
+            : "",
+        taskContract ? `Final claims must not exceed successful ${acceptance.evidence} evidence.` : "",
         acceptance.evidence === "interaction"
             ? "Trace the rendered declaration through its owning implementation, imports/providers, event handler, state transition, and output before editing. Inspect co-located implementation companions referenced by the target. Then use a finite automated interaction test that performs the user-visible action and asserts its observable outcome. A build, typecheck, source read, response-body text search, or unrelated HTTP probe is not sufficient. Prefer an existing project test runner over starting a development server."
             : "",
-        readOnlyRequest ? "Read-only contract: the user explicitly prohibited workspace changes. Do not edit, write, delete, install, scaffold, or run any command that mutates files." : "",
+        readOnlyRequest ? "Read-only task contract: workspace changes are not part of this task. Do not edit, write, delete, install, scaffold, or run any command that mutates files." : "",
         formatProjectChecksPrompt(projectChecks),
         projectRequirement ? formatProjectCompletionPrompt(projectRequirement, projectChecks) : "",
         skillPrompt
@@ -1574,6 +1564,13 @@ async function runAgentLoop(
             options?: Array<{ id: string; label: string; description?: string }>;
             server?: string;
             arguments?: Record<string, unknown>;
+            task?: {
+                intent: string;
+                task_type: WorkflowKind;
+                requires_workspace_changes: boolean;
+                verification: "none" | "command" | "runtime" | "interaction";
+                success_criteria: string[];
+            };
         } | undefined;
         const parseError = action ? undefined : agentTool.explainParseFailure(assistantContent);
         debugLog("LLM response", {
@@ -1630,6 +1627,60 @@ async function runAgentLoop(
                 });
             }
             continue;
+        }
+
+        if (!taskContract && !action.task) {
+            recoveryResponseFormat = initialAgentResponseFormat;
+            const output = "The first action is missing the required model-owned task contract.";
+            spinner.log(`[${stepStatus(turn)}] ${output}`);
+            trace.add({ turn, status: "parse_error", action: "missing_task_contract", observation: output });
+            trace.save();
+            messages.push({
+                role: "user",
+                content: "Return one action again and include task with intent, task_type, requires_workspace_changes, verification, and observable success_criteria. Choose the useful first action in the same JSON object."
+            });
+            continue;
+        }
+
+        if (!taskContract && action.task) {
+            taskContract = action.task;
+            workflow = {
+                kind: taskContract.task_type,
+                reason: `Classified semantically by the agent: ${taskContract.intent}`
+            };
+            readOnlyRequest = !taskContract.requires_workspace_changes;
+            mustWrite = taskContract.requires_workspace_changes;
+            verificationRequirement = taskContract.verification === "interaction"
+                ? "runtime"
+                : taskContract.verification;
+            acceptance = {
+                evidence: taskContract.verification === "interaction"
+                    ? "interaction"
+                    : taskContract.verification === "runtime"
+                        ? "runtime"
+                        : taskContract.verification === "command"
+                            ? "command"
+                            : "source",
+                verification: verificationRequirement,
+                reason: `Defined by the model from the user goal: ${taskContract.success_criteria.join("; ")}`
+            };
+            readOnlyAllowsCommands = verificationRequirement !== "none";
+            verificationSatisfied = verificationRequirement === "none";
+            agentResponseFormat = readOnlyRequest
+                ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands)
+                : getAgentResponseFormat(workflow.kind);
+            systemPrompt = await buildCurrentSystemPrompt();
+            const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
+            if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
+            trace.add({
+                turn,
+                status: "action",
+                action: "task_contract",
+                observation: JSON.stringify(taskContract)
+            });
+            trace.save();
+            segmentEvents.push(`Task contract: ${taskContract.intent}`);
+            spinner.log(`Task understood as ${workflow.kind}: ${taskContract.intent}`);
         }
 
         // The loop ends only when the model explicitly returns final. Until
@@ -1747,29 +1798,12 @@ async function runAgentLoop(
                 };
             }
             answeredClarifications.set(clarificationKey, observation);
-            const previousWorkflowKind = workflow.kind;
-            const previousVerificationRequirement = verificationRequirement;
             effectiveUserMessage = `${userMessage}\n\nUser clarifications:\n${clarificationTranscript.map((line) => `- ${line}`).join("\n")}`;
-            workflow = await decideWorkflowWithLlm(effectiveUserMessage, historyForTask, sessionId, signal);
-            mustWrite = !readOnlyRequest && requiresWorkspaceWriteWithHistory(effectiveUserMessage, historyForTask, continuation);
-            acceptance = acceptanceContractWithHistory(effectiveUserMessage, historyForTask, continuation);
-            verificationRequirement = acceptance.verification;
-            readOnlyAllowsCommands = verificationRequirement !== "none";
-            projectRequirement = inferProjectCompletionRequirementWithHistory(effectiveUserMessage, historyForTask, continuation);
-            agentResponseFormat = readOnlyRequest ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands) : getAgentResponseFormat(workflow.kind);
-            initialAgentResponseFormat = readOnlyRequest ? agentResponseFormat : getInitialAgentResponseFormat(workflow.kind, effectiveUserMessage, mustWrite);
-            if (verificationRequirement !== previousVerificationRequirement) {
-                verificationSatisfied = verificationRequirement === "none";
-            }
             systemPrompt = await buildCurrentSystemPrompt();
             const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
             if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
             guard.resetActionHistory();
             segmentEvents.push(`Step ${segmentTurn}: user clarification answered`);
-            if (workflow.kind !== previousWorkflowKind) {
-                segmentEvents.push(`Workflow reclassified: ${previousWorkflowKind} -> ${workflow.kind}`);
-                spinner.log(`Workflow reclassified after clarification: ${previousWorkflowKind} -> ${workflow.kind}`);
-            }
             messages.push({
                 role: "user",
                 content: `User clarification observation: ${JSON.stringify(observation)}\nContinue the same task using this answer. Do not ask the same question again.`
@@ -1980,7 +2014,7 @@ async function runAgentLoop(
             || (action.action === "run_command" && commandMutatesWorkspaceFiles(action.command ?? ""))
         );
         if (attemptsReadOnlyMutation) {
-            const output = "Blocked by read-only contract: the user explicitly prohibited workspace changes. Inspect with read/list/search or return a factual final answer without mutating files.";
+            const output = "Blocked by the model-owned read-only task contract: workspace changes are outside this task. Inspect with read/list/search or return a factual final answer without mutating files.";
             recoveryResponseFormat = getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands);
             spinner.log(`[${stepStatus(turn)}] ${output}`);
             trace.add({ turn, status: "error", action: "read_only_mutation_blocked", reason: action.reason, arguments: action, observation: output });

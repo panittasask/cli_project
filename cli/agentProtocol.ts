@@ -1,6 +1,23 @@
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 
 const stringProperty = { type: "string" };
+const taskContractProperty = {
+    type: "object",
+    properties: {
+        intent: stringProperty,
+        task_type: { enum: ["general", "web_research", "coding", "mcp_creation"] },
+        requires_workspace_changes: { type: "boolean" },
+        verification: { enum: ["none", "command", "runtime", "interaction"] },
+        success_criteria: {
+            type: "array",
+            minItems: 1,
+            maxItems: 6,
+            items: stringProperty
+        }
+    },
+    required: ["intent", "task_type", "requires_workspace_changes", "verification", "success_criteria"],
+    additionalProperties: false
+};
 const variants: Record<string, Record<string, unknown>> = {
     final: {
         type: "object",
@@ -122,17 +139,22 @@ function getAgentFinalResponseFormat(): Record<string, unknown> {
     return formatForActions(["final"]);
 }
 
-function getInitialAgentResponseFormat(workflow: WorkflowKind, message: string, requiresWrite = false): Record<string, unknown> {
-    if ((workflow === "coding" || workflow === "mcp_creation") && requiresWrite) {
-        return formatForActions(["list_files", "search_files", "read_file", "edit_file", "write_file", "delete_file"]);
-    }
-    if (workflow === "coding" && /(?:^|[\s"'`])(?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml)(?=$|[\s"'`,)])/i.test(message)) {
-        return formatForActions(["read_file"]);
-    }
-    if (workflow === "web_research") {
-        return getAgentResponseFormat(workflow);
-    }
-    return getAgentResponseFormat(workflow);
+function getInitialAgentResponseFormat(): Record<string, unknown> {
+    return {
+        type: "json_object",
+        schema: {
+            oneOf: workflowActions.general.map((action) => {
+                const variant = variants[action]!;
+                const properties = variant.properties as Record<string, unknown>;
+                const required = variant.required as string[];
+                return {
+                    ...variant,
+                    properties: { ...properties, task: taskContractProperty },
+                    required: [...required, "task"]
+                };
+            })
+        }
+    };
 }
 
 function buildInitialAgentMessages(systemPrompt: string, contextSummary: string, userMessage: string): Array<{ role: "system" | "user"; content: string }> {
