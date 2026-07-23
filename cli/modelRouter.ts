@@ -73,6 +73,7 @@ class ModelRouterClient {
 
         const loaded = models.filter((entry) => entry.status === "loaded" && entry.id !== target.id);
         for (const entry of loaded) {
+            await this.assertModelIdle(entry.id);
             await axios.post(endpoint(this.apiUrl, "/models/unload"), { model: entry.id }, { timeout: 30_000 });
         }
 
@@ -96,6 +97,16 @@ class ModelRouterClient {
 
     formatError(error: unknown): string {
         return routerErrorMessage(error);
+    }
+
+    private async assertModelIdle(modelId: string): Promise<void> {
+        const slotsUrl = new URL("/slots", this.apiUrl);
+        slotsUrl.searchParams.set("model", modelId);
+        const response = await axios.get(slotsUrl.toString(), { timeout: 5_000 });
+        const slots = Array.isArray(response.data) ? response.data : [];
+        if (slots.some((slot: { is_processing?: unknown }) => slot.is_processing === true)) {
+            throw new Error(`Cannot switch models while '${modelId}' is processing an active request. Wait for the current response to finish, then retry the model switch.`);
+        }
     }
 }
 

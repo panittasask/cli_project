@@ -4,7 +4,7 @@ import fs = require("node:fs");
 import net = require("node:net");
 import path = require("node:path");
 const { loadCliSettings } = require("../cli/config") as {
-    loadCliSettings: (root?: string) => { defaultModel?: string; modelPath?: string };
+    loadCliSettings: (root?: string) => { defaultModel?: string; modelPath?: string; apiUrl?: string };
 };
 
 type ProbeStatus = "passed" | "failed" | "timed_out" | "skipped";
@@ -22,6 +22,7 @@ type ProbeResult = {
 const appRoot = path.resolve(__dirname, "..");
 const logDirectory = path.join(appRoot, ".cli", "logs", "evaluation");
 const settings = loadCliSettings(appRoot);
+const positionalArguments = process.argv.slice(2).filter((argument) => !argument.startsWith("--"));
 
 function readPositiveInteger(name: string, fallback: number, minimum: number, maximum: number): number {
     const value = Number(process.env[name]);
@@ -32,7 +33,8 @@ function selectedModel(): string {
     const index = process.argv.findIndex((argument) => argument === "--model");
     const inline = process.argv.find((argument) => argument.startsWith("--model="));
     const requested = index >= 0 ? process.argv[index + 1] : inline?.slice("--model=".length);
-    const model = requested?.trim() || process.env.LLAMA_MODEL?.trim() || settings.defaultModel?.trim();
+    const positional = positionalArguments.find((argument) => /\.gguf$/i.test(argument));
+    const model = requested?.trim() || positional?.trim() || process.env.LLAMA_MODEL?.trim() || settings.defaultModel?.trim();
     if (!model) throw new Error("No model selected. Use --model <file.gguf> or configure defaultModel.");
     return model;
 }
@@ -41,7 +43,11 @@ function selectedProbeNames(): Set<string> {
     const index = process.argv.findIndex((argument) => argument === "--probes");
     const inline = process.argv.find((argument) => argument.startsWith("--probes="));
     const raw = index >= 0 ? process.argv[index + 1] : inline?.slice("--probes=".length);
-    const selected = new Set((raw || "protocol,read,coding").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
+    const positional = positionalArguments
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => ["protocol", "read", "coding", "invoice"].includes(value));
+    const selected = new Set((raw ? raw.split(",") : positional.length > 0 ? positional : ["protocol", "read", "coding"])
+        .map((value) => value.trim().toLowerCase()).filter(Boolean));
     const unsupported = [...selected].filter((value) => !["protocol", "read", "coding", "invoice"].includes(value));
     if (unsupported.length > 0) throw new Error(`Unsupported probe name(s): ${unsupported.join(", ")}`);
     if (selected.size === 0) throw new Error("At least one probe must be selected.");
@@ -51,7 +57,8 @@ function selectedProbeNames(): Set<string> {
 function selectedMode(): EvaluationMode {
     const index = process.argv.findIndex((argument) => argument === "--mode");
     const inline = process.argv.find((argument) => argument.startsWith("--mode="));
-    const requested = (index >= 0 ? process.argv[index + 1] : inline?.slice("--mode=".length))?.trim().toLowerCase() || "practical";
+    const positional = positionalArguments.find((argument) => ["practical", "quality"].includes(argument.toLowerCase()));
+    const requested = (index >= 0 ? process.argv[index + 1] : inline?.slice("--mode=".length) || positional)?.trim().toLowerCase() || "practical";
     if (requested !== "practical" && requested !== "quality") {
         throw new Error(`Unsupported evaluation mode: ${requested}`);
     }
@@ -134,6 +141,25 @@ async function waitForIdleSlot(apiUrl: string, timeoutMs = 30_000): Promise<void
     throw new Error(`llama-server did not expose an idle slot within ${(timeoutMs / 1000).toFixed(0)} seconds: ${lastReason}`);
 }
 
+async function assertRouterHasNoLoadedModel(): Promise<void> {
+    const configuredApiUrl = process.env.LLAMA_API_URL?.trim() || settings.apiUrl?.trim();
+    if (!configuredApiUrl) return;
+    try {
+        const modelsUrl = new URL("/models?reload=1", configuredApiUrl).toString();
+        const response = await axios.get(modelsUrl, { timeout: 3_000 });
+        const loaded = Array.isArray(response.data?.data)
+            ? response.data.data.filter((entry: { status?: { value?: unknown } }) => entry.status?.value === "loaded")
+            : [];
+        if (loaded.length > 0) {
+            const names = loaded.map((entry: { id?: unknown }) => String(entry.id || "unknown")).join(", ");
+            throw new Error(`Standalone evaluation refused because the shared router still has a loaded model (${names}). Running both models would distort latency and may interrupt an active CLI request. Confirm the router model is idle before unloading it, then rerun the evaluation.`);
+        }
+    } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Standalone evaluation refused")) throw error;
+        // A missing router is the expected standalone-evaluation setup.
+    }
+}
+
 async function runProbe(name: string, script: string, apiUrl: string, timeoutMs: number, mode: EvaluationMode): Promise<ProbeResult> {
     const startedAt = Date.now();
     const tsx = path.join(appRoot, "node_modules", "tsx", "dist", "cli.mjs");
@@ -179,6 +205,7 @@ async function runProbe(name: string, script: string, apiUrl: string, timeoutMs:
 
 async function main(): Promise<void> {
     fs.mkdirSync(logDirectory, { recursive: true });
+    await assertRouterHasNoLoadedModel();
     const model = selectedModel();
     const requestedProbes = selectedProbeNames();
     const mode = selectedMode();
@@ -257,6 +284,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-    console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+    console.error(`Evaluation failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
 });

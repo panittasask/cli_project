@@ -39,14 +39,22 @@ class LlamaClient {
 
     formatError(error: unknown): string {
         if (!axios.isAxiosError(error)) {
-            return error instanceof Error ? error.message : String(error);
+            const message = error instanceof Error ? error.message : String(error);
+            if (/operation was aborted|request was aborted|socket hang up/i.test(message)) {
+                return "The model connection was interrupted while a response was in progress. The loaded llama.cpp model may have been stopped, unloaded, or switched; retry after confirming the model is loaded.";
+            }
+            return message;
         }
 
+        const rawMessage = error.message || "";
+        if (error.code === "ERR_CANCELED" || /operation was aborted|request was aborted/i.test(rawMessage)) {
+            return "The model connection was interrupted while a response was in progress. The loaded llama.cpp model may have been stopped, unloaded, or switched; retry after confirming the model is loaded.";
+        }
         const code = error.code ? `${error.code}: ` : "";
         const responseMessage = typeof error.response?.data === "string"
             ? error.response.data.slice(0, 500)
             : error.response?.data?.error?.message;
-        return `${code}${responseMessage || error.message}`;
+        return `${code}${responseMessage || rawMessage}`;
     }
 
     close(): void {

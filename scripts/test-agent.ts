@@ -184,6 +184,7 @@ async function testConnectionResetRetry(): Promise<void> {
         assert.equal(completionRequests, 2);
         assert.equal(retries, 1);
         assert.equal(client.formatError(Object.assign(new Error("reset"), { code: "ECONNRESET" })), "reset");
+        assert.match(client.formatError(new Error("This operation was aborted")), /model connection was interrupted/i);
     } finally {
         client.close();
         await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -196,10 +197,17 @@ async function testModelRouterSwitch(): Promise<void> {
         { id: "beta.gguf", path: "C:\\Models\\beta.gguf", status: { value: "unloaded" } }
     ];
     const actions: string[] = [];
+    let alphaBusy = false;
     const server = http.createServer((request, response) => {
         if (request.method === "GET" && request.url?.startsWith("/models")) {
             response.writeHead(200, { "Content-Type": "application/json" });
             response.end(JSON.stringify({ data: models }));
+            return;
+        }
+        if (request.method === "GET" && request.url?.startsWith("/slots")) {
+            const model = new URL(request.url, "http://127.0.0.1").searchParams.get("model");
+            response.writeHead(200, { "Content-Type": "application/json" });
+            response.end(JSON.stringify([{ id: 0, is_processing: model === "alpha.gguf" && alphaBusy }]));
             return;
         }
         let body = "";
@@ -232,6 +240,10 @@ async function testModelRouterSwitch(): Promise<void> {
         assert.equal(resolveRouterModel(listed as any, "2")?.id, "beta.gguf");
         assert.equal(resolveRouterModel(listed as any, "ALPHA.GGUF")?.id, "alpha.gguf");
         assert.equal(resolveRouterModel([{ id: "gamma", status: "unloaded", failed: false }], "gamma.gguf")?.id, "gamma");
+        alphaBusy = true;
+        await assert.rejects(client.switch("beta.gguf"), /processing an active request/);
+        assert.deepEqual(actions, []);
+        alphaBusy = false;
         const result = await client.switch("beta.gguf");
         assert.equal(result.model.id, "beta.gguf");
         assert.deepEqual(result.unloaded, ["alpha.gguf"]);
