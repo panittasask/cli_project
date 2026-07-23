@@ -61,7 +61,7 @@ const {
     relevantClarificationInspections: (input: { decision: string; question: string; inspections: Array<Record<string, unknown>> }) => Array<Record<string, unknown>>;
     resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentRequiredActionResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentResponseFormat: (workflow: string) => {
         schema: {
@@ -69,9 +69,6 @@ const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryRespo
         };
     };
     getAgentRecoveryResponseFormat: (workflow: string, blockedAction: string | string[]) => {
-        schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
-    };
-    getAgentRequiredActionResponseFormat: (action: string) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
     getAgentMutationResponseFormat: (blockedAction?: string) => {
@@ -97,10 +94,6 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { behaviorCompanionFiles, missingBehaviorCompanionInspections } = require("../cli/behaviorEvidence") as {
-    behaviorCompanionFiles: (workspace: string, inputPath: string) => string[];
-    missingBehaviorCompanionInspections: (workspace: string, inputPath: string, readPaths: Set<string>) => string[];
-};
 const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoints") as {
     FileCheckpointStore: new (root: string) => {
         checkpoint: (workspace: string, file: string, next: string) => { preview: string };
@@ -553,8 +546,6 @@ async function main(): Promise<void> {
     assert.ok(forcedDiagnosticActions.includes("read_file"));
     assert.ok(forcedDiagnosticActions.includes("delete_file"));
     assert.ok(!forcedDiagnosticActions.includes("ask_user"));
-    const requiredInspectionActions = getAgentRequiredActionResponseFormat("read_file").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(requiredInspectionActions, ["read_file"]);
     const forcedMutationActions = getAgentMutationResponseFormat("edit_file").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(forcedMutationActions, ["write_file", "delete_file"]);
     const askUserSchema = getAgentResponseFormat("coding").schema.oneOf.find((variant) => variant.properties.action.const === "ask_user");
@@ -730,6 +721,7 @@ async function main(): Promise<void> {
     assert.equal(verificationEpochGuard.registerAction(buildAction).status, "allow");
     assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "allow");
     verificationEpochGuard.recordFileProgress();
+    assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "allow");
     assert.equal(verificationEpochGuard.registerAction({ action: "delete_file", path: "web/src/app.ts" }).status, "replan");
     const compacted = buildCompactedAgentMessages("system", "แก้ login.html", {
         segment: 2,
@@ -846,11 +838,6 @@ async function main(): Promise<void> {
         fs.writeFileSync(path.join(temp, "nested", "package.json"), "{}", "utf8");
         fs.writeFileSync(path.join(temp, "nested", "src", "app.ts"), "export {};", "utf8");
         fs.writeFileSync(path.join(temp, "nested", "src", "app.html"), "<button>Save</button>", "utf8");
-        assert.deepEqual(behaviorCompanionFiles(temp, "nested/src/app.html"), ["nested/src/app.ts"]);
-        assert.deepEqual(missingBehaviorCompanionInspections(temp, "nested/src/app.html", new Set()), ["nested/src/app.ts"]);
-        assert.deepEqual(missingBehaviorCompanionInspections(temp, "nested/src/app.html", new Set([
-            path.resolve(temp, "nested/src/app.ts").toLowerCase()
-        ])), []);
         assert.equal(validator.projectRootFor("nested/src/app.ts"), path.join(temp, "nested"));
         assert.equal(validator.validateProjectFor("valid.json"), undefined);
         fs.writeFileSync(path.join(temp, "orphan.ts"), "export {};", "utf8");

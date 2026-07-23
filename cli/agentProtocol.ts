@@ -112,10 +112,6 @@ function getAgentLocalResponseFormat(workflow: WorkflowKind): Record<string, unk
     return formatForActions(actions.length > 0 ? actions : ["final"]);
 }
 
-function getAgentRequiredActionResponseFormat(action: string): Record<string, unknown> {
-    return formatForActions([action]);
-}
-
 function getAgentReadOnlyResponseFormat(workflow: WorkflowKind, allowCommands = false): Record<string, unknown> {
     const blocked = new Set(["edit_file", "write_file", "delete_file", ...(allowCommands ? [] : ["run_command"])]);
     const actions = workflowActions[workflow].filter((action) => !blocked.has(action));
@@ -156,4 +152,4 @@ function formatForActions(actions: string[]): Record<string, unknown> {
     };
 }
 
-module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentRequiredActionResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat };
+module.exports = { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getAgentFinalResponseFormat, getInitialAgentResponseFormat };

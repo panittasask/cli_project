@@ -51,6 +51,7 @@ class StatusBar {
     private active = false;
     private suspended = true;
     private reservedRows = 0;
+    private refreshTimer: NodeJS.Timeout | undefined;
     private readonly handleResize = (): void => {
         if (!this.active || this.suspended) return;
         this.reserveBottomRow(true);
@@ -69,6 +70,8 @@ class StatusBar {
         process.stdout.on("resize", this.handleResize);
         this.reserveBottomRow(false, true);
         this.render();
+        this.refreshTimer = setInterval(() => this.render(), 250);
+        this.refreshTimer.unref();
     }
 
     suspend(): void {
@@ -116,6 +119,8 @@ class StatusBar {
             this.restoreScrollRegion();
         }
         process.stdout.off("resize", this.handleResize);
+        if (this.refreshTimer) clearInterval(this.refreshTimer);
+        this.refreshTimer = undefined;
         this.active = false;
         this.suspended = true;
         this.reservedRows = 0;
