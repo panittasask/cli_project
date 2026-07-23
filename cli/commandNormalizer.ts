@@ -329,7 +329,11 @@ function diagnosticRecoveryGuidance(errorOutput: string): string | undefined {
 }
 
 function commandInvocationError(errorOutput: string): boolean {
-    return /\b(?:unknown|unrecognized|unsupported|invalid) (?:argument|option|flag|command)\b|\bunexpected argument\b|\brequires? (?:an? )?(?:argument|value)\b|\bcommand not found\b|\bis not recognized as (?:an internal|the name of)/i.test(errorOutput)
+    const plain = errorOutput.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    return /\b(?:unknown|unrecognized|unsupported|invalid) (?:argument|option|flag|command)\b|\bunexpected argument\b|\brequires? (?:an? )?(?:argument|value)\b|\bcommand not found\b|\bis not recognized as (?:an internal|the name of)/i.test(plain)
+        // Angular CLI reports a bad positional project value using this shape
+        // instead of the more common "invalid argument" wording.
+        || /\binvalid values?\s*:[\s\S]{0,240}\bargument\s*:/i.test(plain)
         || missingCommandTargetError(errorOutput);
 }
 

@@ -419,6 +419,11 @@ async function main(): Promise<void> {
     assert.match(diagnosticRecoveryGuidance("NG8001: 'x-view' is not a known element") ?? "", /Do not suppress/);
     assert.equal(commandInvocationError("Error: Unknown argument: prod"), true);
     assert.equal(commandInvocationError('Cannot find "lint" target for the specified project.'), true);
+    assert.equal(commandInvocationError([
+        "Error: Invalid values:",
+        "  Argument: project, Given: \"src/app/dashboard/dashboard.component.spec.ts\", Choices: \"calendar\""
+    ].join("\n")), true);
+    assert.equal(commandInvocationError("Application bundle generation failed. TS2304: Cannot find name 'modalOpen'."), false);
     assert.equal(missingCommandTargetError('Cannot find "quality" target for the specified project.'), true);
     assert.equal(missingCommandTargetError('\u001b[31mCannot find\u001b[0m "quality" target for the specified project.'), true);
     assert.equal(commandAddsTooling("tool add optional-checker"), true);
