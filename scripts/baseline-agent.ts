@@ -10,10 +10,7 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () =
     parseAction: (content: string) => { action?: string; reason?: string } | undefined;
     close: () => Promise<void>;
 } };
-const { workflowInstructions } = require("../cli/workflowRouter") as {
-    workflowInstructions: (kind: "general" | "web_research" | "coding" | "mcp_creation") => string;
-};
-const { getInitialAgentResponseFormat } = require("../cli/agentProtocol") as { getInitialAgentResponseFormat: (workflow: "general" | "web_research" | "coding" | "mcp_creation", message: string) => Record<string, unknown> };
+const { getInitialAgentResponseFormat } = require("../cli/agentProtocol") as { getInitialAgentResponseFormat: () => Record<string, unknown> };
 
 const appRoot = path.resolve(__dirname, "..");
 const settings = loadCliSettings(appRoot);
@@ -42,9 +39,8 @@ async function main(): Promise<void> {
     const agent = new AgentTool();
     try {
         const prompt = "Read README.md before explaining what this project does.";
-        const workflow = "general" as const;
-        const systemPrompt = await agent.buildSystemPrompt(workflowInstructions(workflow));
-        const responseFormat = getInitialAgentResponseFormat(workflow, prompt);
+        const systemPrompt = await agent.buildSystemPrompt();
+        const responseFormat = getInitialAgentResponseFormat();
         const results: Array<{
             attempt: number;
             valid: boolean;
