@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 $appRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$logDirectory = Join-Path $appRoot ".cli\logs"
+$logDirectory = Join-Path $appRoot ".cli\logs\server"
 $logPath = Join-Path $logDirectory "llama-autostart.log"
 $previousLogPath = Join-Path $logDirectory "llama-autostart.previous.log"
 

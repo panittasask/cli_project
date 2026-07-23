@@ -28,7 +28,7 @@ const { aggregateTraceSummaries, readTraceFiles, summarizeTraceEvents } = requir
 const args = process.argv.slice(2);
 const json = args.includes("--json");
 const requestedPaths = args.filter((argument) => argument !== "--json");
-const logDirectory = path.resolve(process.cwd(), ".cli", "logs");
+const logDirectory = path.resolve(process.cwd(), ".cli", "logs", "agent");
 const paths = requestedPaths.length > 0
     ? requestedPaths.map((filePath) => path.resolve(process.cwd(), filePath))
     : fs.existsSync(logDirectory)

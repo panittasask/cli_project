@@ -2,7 +2,7 @@ import fs = require("node:fs");
 import path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const logsDirectory = path.join(root, ".cli", "logs");
+const logsDirectory = path.join(root, ".cli", "logs", "agent");
 const outputPath = path.join(root, ".cli", "log-viewer.html");
 
 function readJsonl(filePath: string): Array<Record<string, unknown>> {

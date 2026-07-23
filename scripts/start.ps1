@@ -40,7 +40,7 @@ if (-not [int]::TryParse($modelsMax.ToString(), [ref]$parsedModelsMax) -or $pars
 }
 
 $serverExecutable = Join-Path $llamaDirectory "llama-server.exe"
-$logDirectory = Join-Path $PSScriptRoot "..\.cli\logs"
+$logDirectory = Join-Path $PSScriptRoot "..\.cli\logs\server"
 $stdoutLog = Join-Path $logDirectory "llama-server.log"
 $stderrLog = Join-Path $logDirectory "llama-server-error.log"
 $healthUrl = "http://127.0.0.1:$parsedServerPort/health"
