@@ -206,6 +206,13 @@ type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRe
 const { commandSatisfiesAcceptance } = require("./workflowRouter") as {
     commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract) => boolean;
 };
+const { deriveTaskEvidencePolicy, isVisualPresentationMutation } = require("./taskEvidence") as {
+    deriveTaskEvidencePolicy: (
+        requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">,
+        verification: "none" | "command" | "runtime" | "interaction"
+    ) => { evidence: AcceptanceContract["evidence"]; verification: VerificationRequirement; visualPresentation: boolean };
+    isVisualPresentationMutation: (filePath: string, replacementText?: string) => boolean;
+};
 const { searchReturnedNoResults } = require("./webResearch") as {
     searchReturnedNoResults: (output: string) => boolean;
 };
@@ -1448,6 +1455,7 @@ async function runAgentLoop(
         task_type: WorkflowKind;
         requires_workspace_changes: boolean;
         verification: "none" | "command" | "runtime" | "interaction";
+        evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
         success_criteria: string[];
     } | undefined;
     let projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
@@ -1474,6 +1482,7 @@ async function runAgentLoop(
     const answeredClarifications = new Map<string, Record<string, unknown>>();
     const contextInspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }> = [];
     const writtenPaths = new Set<string>();
+    const visualPresentationPaths = new Set<string>();
     const satisfiedPaths = new Set<string>();
     const successfulEvidenceRefs = new Set<string>();
     const successfulWorkspaceEvidenceRefs = new Set<string>();
@@ -1525,6 +1534,9 @@ async function runAgentLoop(
         acceptance.evidence === "interaction"
             ? "Trace the rendered declaration through its owning implementation, imports/providers, event handler, state transition, and output before editing. Inspect co-located implementation companions referenced by the target. Then use a finite automated interaction test that performs the user-visible action and asserts its observable outcome. A build, typecheck, source read, response-body text search, or unrelated HTTP probe is not sufficient. Prefer an existing project test runner over starting a development server."
             : "",
+        taskContract?.evidence_requirements.includes("visual")
+            ? "This task has a visual acceptance requirement. Inspect the owning rendered component/template and its styling companion, make a concrete styling change, and run a finite headless interaction check. Do not claim visual success from a build or source read alone."
+            : "",
         readOnlyRequest ? "Read-only task contract: workspace changes are not part of this task. Do not edit, write, delete, install, scaffold, or run any command that mutates files." : "",
         formatProjectChecksPrompt(projectChecks),
         projectRequirement ? formatProjectCompletionPrompt(projectRequirement, projectChecks) : "",
@@ -1554,7 +1566,7 @@ async function runAgentLoop(
             verificationRecoveryActive = shouldActivateVerificationRecovery({
                 boundedRun: Number.isFinite(maxTurns),
                 baseLimitReached: true,
-                unresolvedVerificationFailure
+                ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {})
             });
             if (verificationRecoveryActive) {
                 const observation = `Verification failed at the normal step limit. Continuing for up to ${recoveryTurnAllowance} recovery steps so the agent can inspect the error, correct the project, and rerun verification.`;
@@ -1666,6 +1678,7 @@ async function runAgentLoop(
                 task_type: WorkflowKind;
                 requires_workspace_changes: boolean;
                 verification: "none" | "command" | "runtime" | "interaction";
+                evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
                 success_criteria: string[];
             };
         } | undefined;
@@ -1734,7 +1747,7 @@ async function runAgentLoop(
             trace.save();
             messages.push({
                 role: "user",
-                content: "Return one action again and include task with intent, task_type, requires_workspace_changes, verification, and observable success_criteria. Choose the useful first action in the same JSON object."
+                content: "Return one action again and include task with intent, task_type, requires_workspace_changes, verification, evidence_requirements, and observable success_criteria. Choose all evidence requirements implied by the outcome and choose the useful first action in the same JSON object."
             });
             continue;
         }
@@ -1747,17 +1760,13 @@ async function runAgentLoop(
             };
             readOnlyRequest = !taskContract.requires_workspace_changes;
             mustWrite = taskContract.requires_workspace_changes;
-            verificationRequirement = taskContract.verification === "interaction"
-                ? "runtime"
-                : taskContract.verification;
+            const evidencePolicy = deriveTaskEvidencePolicy(
+                taskContract.evidence_requirements,
+                taskContract.verification
+            );
+            verificationRequirement = evidencePolicy.verification;
             acceptance = {
-                evidence: taskContract.verification === "interaction"
-                    ? "interaction"
-                    : taskContract.verification === "runtime"
-                        ? "runtime"
-                        : taskContract.verification === "command"
-                            ? "command"
-                            : "source",
+                evidence: evidencePolicy.evidence,
                 verification: verificationRequirement,
                 reason: `Defined by the model from the user goal: ${taskContract.success_criteria.join("; ")}`
             };
@@ -1971,6 +1980,15 @@ async function runAgentLoop(
                 rejectFinal(
                     "this request requires a successful file write",
                     "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
+                );
+                continue;
+            }
+            if (taskContract?.evidence_requirements.includes("visual")
+                && visualPresentationPaths.size === 0
+                && !noChangeOutcome) {
+                rejectFinal(
+                    "visual presentation work has no successful styling mutation",
+                    "You cannot return final yet. The task requires a rendered visual result, but no stylesheet or concrete embedded-style mutation succeeded. Inspect the component's styling owner, implement the visual styling, then run the required finite interaction verification."
                 );
                 continue;
             }
@@ -2334,6 +2352,10 @@ async function runAgentLoop(
                 readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                 guard.recordFileProgress();
                 writtenPaths.add(action.path);
+                if (isVisualPresentationMutation(
+                    action.path,
+                    action.action === "write_file" ? action.content ?? "" : action.new_text ?? ""
+                )) visualPresentationPaths.add(action.path);
                 projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
                 projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId) => {
                     successfulProjectChecks.delete(checkId);

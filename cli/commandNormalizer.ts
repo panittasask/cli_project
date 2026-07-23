@@ -345,7 +345,7 @@ function missingCommandTargetError(errorOutput: string): boolean {
 function commandInteractiveRisk(command: string, workspace: string, workdir = "."): string | undefined {
     const normalized = normalizeCommandSignature(command);
 
-    if (/(?:^|\s)--open(?:=|\s|$)|\b(?:start-process|invoke-item|explorer(?:\.exe)?|rundll32(?:\.exe)?)\b[^\r\n]*https?:\/\//.test(normalized)) {
+    if (/(?:^|\s)(?:--open|--headed|--ui)(?:=|\s|$)|\bcypress\s+open\b|\bplaywright\s+show-report\b|\b(?:start-process|invoke-item|explorer(?:\.exe)?|rundll32(?:\.exe)?)\b[^\r\n]*https?:\/\//.test(normalized)) {
         return "automatic browser launching is not allowed in agent run_command";
     }
 
@@ -353,16 +353,17 @@ function commandInteractiveRisk(command: string, workspace: string, workdir = ".
         return "long-running serve/dev/watch commands are not allowed in agent run_command; use a finite build or non-watch test command";
     }
 
+    const finiteHeadlessInteraction = /\b(?:playwright\s+test|cypress\s+run|test:e2e|e2e:test)\b/i.test(normalized);
     if (/(?:^|\s)test(?:\s|$)/.test(normalized)) {
         const browserRunner = readPackageDependencyNames(path.resolve(workspace, workdir)).find((dependency) => (
             /^(?:karma-(?:chrome|firefox|edge)-launcher|@?playwright\/test|playwright|puppeteer|cypress|selenium-webdriver|webdriverio|nightwatch)$/i.test(dependency)
         ));
-        if (browserRunner) {
+        if (browserRunner && !finiteHeadlessInteraction) {
             return `test setup includes browser runner '${browserRunner}', which may launch a browser process; use a finite build, typecheck, lint, or non-browser test target`;
         }
     }
 
-    const npmScript = normalized.match(/^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(start|dev|serve|watch|test)\b/);
+    const npmScript = normalized.match(/^(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(start|dev|serve|watch|test(?::[\w:-]+)?)\b/);
     if (!npmScript) return undefined;
 
     const scriptName = npmScript[1];

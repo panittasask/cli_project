@@ -40,6 +40,7 @@ interface SessionTaskJournal {
     taskType?: string;
     requiresWorkspaceChanges?: boolean;
     verification?: string;
+    evidenceRequirements?: string[];
     successCriteria?: string[];
     steps: SessionTaskStep[];
     finalAnswer?: string;
@@ -220,6 +221,11 @@ class SessionTool {
                     task.requiresWorkspaceChanges = contract.requires_workspace_changes;
                 }
                 if (typeof contract.verification === "string") task.verification = contract.verification;
+                if (Array.isArray(contract.evidence_requirements)) {
+                    task.evidenceRequirements = contract.evidence_requirements
+                        .filter((item): item is string => typeof item === "string")
+                        .slice(0, 5);
+                }
                 if (Array.isArray(contract.success_criteria)) {
                     task.successCriteria = contract.success_criteria
                         .filter((item): item is string => typeof item === "string")
@@ -327,6 +333,7 @@ class SessionTool {
             `Task type: ${task.taskType || "unknown"}`,
             `Workspace changes expected: ${task.requiresWorkspaceChanges === undefined ? "unknown" : task.requiresWorkspaceChanges ? "yes" : "no"}`,
             `Required verification: ${task.verification || "unknown"}`,
+            `Required evidence: ${task.evidenceRequirements?.join(", ") || "unknown"}`,
             "Success criteria:",
             criteria,
             "Recent persisted steps:",

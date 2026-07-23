@@ -22,6 +22,13 @@ const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext
 const { searchReturnedNoResults } = require("../cli/webResearch") as {
     searchReturnedNoResults: (output: string) => boolean;
 };
+const { deriveTaskEvidencePolicy, isVisualPresentationMutation } = require("../cli/taskEvidence") as {
+    deriveTaskEvidencePolicy: (
+        requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">,
+        verification: "none" | "command" | "runtime" | "interaction"
+    ) => { evidence: string; verification: string; visualPresentation: boolean };
+    isVisualPresentationMutation: (filePath: string, replacementText?: string) => boolean;
+};
 const { WriteValidator } = require("../cli/writeValidator") as { WriteValidator: new (workspace: string) => {
     validate: (file: string) => { ok: boolean; validator: string; output: string };
     validateProjectFor: (file: string) => { ok: boolean; validator: string } | undefined;
@@ -233,6 +240,21 @@ async function main(): Promise<void> {
     const deviceScript = fs.readFileSync(path.resolve(__dirname, "llama-device.ps1"), "utf8");
     const serviceScript = fs.readFileSync(path.resolve(__dirname, "start-llama-service.ps1"), "utf8");
     const installServiceScript = fs.readFileSync(path.resolve(__dirname, "install-llama-autostart.ps1"), "utf8");
+    const routedUiPolicy = deriveTaskEvidencePolicy(["command", "interaction", "visual"], "command");
+    assert.deepEqual(routedUiPolicy, {
+        evidence: "interaction",
+        verification: "runtime",
+        visualPresentation: true
+    });
+    const nearbyWorkspacePolicy = deriveTaskEvidencePolicy(["source", "command"], "command");
+    assert.deepEqual(nearbyWorkspacePolicy, {
+        evidence: "command",
+        verification: "command",
+        visualPresentation: false
+    });
+    assert.equal(isVisualPresentationMutation("src/app/table.component.scss", ".table { display: grid; }"), true);
+    assert.equal(isVisualPresentationMutation("src/app/table.component.ts", "export const rows = [];"), false);
+    assert.equal(isVisualPresentationMutation("src/app/table.component.tsx", "return <main style={{display: 'grid'}} />"), true);
     const serverModelScript = fs.readFileSync(path.resolve(__dirname, "server-model.ts"), "utf8");
     assert.match(startScript, /Set-Location -LiteralPath \$appRoot/);
     assert.ok(startScript.indexOf("if ($portInUse)") < startScript.indexOf("Resolve-LlamaDevice"));
@@ -506,6 +528,10 @@ async function main(): Promise<void> {
         assert.match(commandInteractiveRisk("npm start", nestedAngularWorkspace, "dashboard") ?? "", /package lifecycle 'start'/);
         assert.match(commandInteractiveRisk("npm test", nestedAngularWorkspace, "dashboard") ?? "", /browser runner 'karma-chrome-launcher'/);
         assert.match(commandInteractiveRisk("ng test --watch=false", nestedAngularWorkspace, "dashboard") ?? "", /browser runner 'karma-chrome-launcher'/);
+        assert.equal(commandInteractiveRisk("npm run test:e2e", nestedAngularWorkspace, "dashboard"), undefined);
+        assert.equal(commandInteractiveRisk("npx playwright test", nestedAngularWorkspace, "dashboard"), undefined);
+        assert.match(commandInteractiveRisk("npx playwright test --headed", nestedAngularWorkspace, "dashboard") ?? "", /browser launching/);
+        assert.match(commandInteractiveRisk("npx cypress open", nestedAngularWorkspace, "dashboard") ?? "", /browser launching/);
         assert.equal(commandInteractiveRisk("ng build", nestedAngularWorkspace, "dashboard"), undefined);
         assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { start: "ng serve --open" } })), true);
     assert.equal(packageContentAddsBrowserAutoOpen("package.json", JSON.stringify({ scripts: { start: "ng serve" } })), false);
@@ -568,6 +594,7 @@ async function main(): Promise<void> {
             "task_type",
             "requires_workspace_changes",
             "verification",
+            "evidence_requirements",
             "success_criteria"
         ]);
     }
@@ -902,6 +929,7 @@ async function main(): Promise<void> {
                 task_type: "coding",
                 requires_workspace_changes: false,
                 verification: "none",
+                evidence_requirements: ["source"],
                 success_criteria: ["Explain the project from repository evidence"]
             }
         }));

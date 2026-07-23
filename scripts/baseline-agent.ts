@@ -11,6 +11,9 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () =
     close: () => Promise<void>;
 } };
 const { getInitialAgentResponseFormat } = require("../cli/agentProtocol") as { getInitialAgentResponseFormat: () => Record<string, unknown> };
+const { selectActiveModelId } = require("../cli/modelRouter") as {
+    selectActiveModelId: (entries: unknown[]) => string | undefined;
+};
 
 const appRoot = path.resolve(__dirname, "..");
 const settings = loadCliSettings(appRoot);
@@ -31,8 +34,8 @@ function endpoint(route: string): string {
 
 async function main(): Promise<void> {
     const modelsResponse = await axios.get(endpoint("/v1/models"), { timeout: 5000 });
-    const model = modelsResponse.data?.data?.[0]?.id;
-    if (typeof model !== "string" || !model) {
+    const model = selectActiveModelId(Array.isArray(modelsResponse.data?.data) ? modelsResponse.data.data : []);
+    if (!model) {
         throw new Error("llama-server did not report a loaded model at /v1/models");
     }
 

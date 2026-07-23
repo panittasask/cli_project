@@ -91,12 +91,13 @@ const { LlamaClient } = require("../cli/llamaClient") as { LlamaClient: new (api
     formatError: (error: unknown) => string;
     close: () => void;
 } };
-const { ModelRouterClient, resolveRouterModel } = require("../cli/modelRouter") as {
+const { ModelRouterClient, resolveRouterModel, selectActiveModelId } = require("../cli/modelRouter") as {
     ModelRouterClient: new (apiUrl: string, timeoutMs?: number) => {
         list: () => Promise<Array<{ id: string; status: string }>>;
         switch: (selection: string) => Promise<{ model: { id: string; status: string }; unloaded: string[] }>;
     };
     resolveRouterModel: (models: Array<{ id: string; path?: string; status: string; failed: boolean }>, selection: string) => { id: string } | undefined;
+    selectActiveModelId: (entries: unknown[]) => string | undefined;
 };
 const { aggregateTraceSummaries, parseTraceJsonl, summarizeTraceEvents } = require("../cli/traceSummary") as {
     parseTraceJsonl: (content: string) => Array<Record<string, unknown>>;
@@ -198,6 +199,7 @@ async function testModelRouterSwitch(): Promise<void> {
     ];
     const actions: string[] = [];
     let alphaBusy = false;
+    let resetSuccessfulLoadResponse = true;
     const server = http.createServer((request, response) => {
         if (request.method === "GET" && request.url?.startsWith("/models")) {
             response.writeHead(200, { "Content-Type": "application/json" });
@@ -223,6 +225,11 @@ async function testModelRouterSwitch(): Promise<void> {
                 actions.push(`load:${payload.model}`);
                 const entry = models.find((candidate) => candidate.id === payload.model);
                 if (entry) entry.status.value = "loaded";
+                if (resetSuccessfulLoadResponse) {
+                    resetSuccessfulLoadResponse = false;
+                    request.socket.destroy();
+                    return;
+                }
             }
             response.writeHead(200, { "Content-Type": "application/json" });
             response.end(JSON.stringify({ success: true }));
@@ -240,6 +247,12 @@ async function testModelRouterSwitch(): Promise<void> {
         assert.equal(resolveRouterModel(listed as any, "2")?.id, "beta.gguf");
         assert.equal(resolveRouterModel(listed as any, "ALPHA.GGUF")?.id, "alpha.gguf");
         assert.equal(resolveRouterModel([{ id: "gamma", status: "unloaded", failed: false }], "gamma.gguf")?.id, "gamma");
+        assert.equal(selectActiveModelId([
+            { id: "first", status: { value: "unloaded" } },
+            { id: "second", status: { value: "loaded" } }
+        ]), "second");
+        assert.equal(selectActiveModelId([{ id: "standalone" }]), "standalone");
+        assert.equal(selectActiveModelId([{ id: "unloaded", status: { value: "unloaded" } }]), undefined);
         alphaBusy = true;
         await assert.rejects(client.switch("beta.gguf"), /processing an active request/);
         assert.deepEqual(actions, []);
@@ -769,6 +782,7 @@ async function main(): Promise<void> {
                 task_type: "coding",
                 requires_workspace_changes: true,
                 verification: "interaction",
+                evidence_requirements: ["interaction"],
                 success_criteria: ["modal เปิดเมื่อ double click เท่านั้น"]
             })
         });

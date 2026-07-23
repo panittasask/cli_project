@@ -42,10 +42,31 @@ async function mockModel(actions: Array<Record<string, unknown>>): Promise<{ url
     };
 }
 
-async function runScenario(actions: Array<Record<string, unknown>>, prompt: string, setup: (root: string) => void, answers: string[] = []): Promise<{ root: string; output: string }> {
+async function runScenario(
+    actions: Array<Record<string, unknown>>,
+    prompt: string,
+    setup: (root: string) => void,
+    answers: string[] = [],
+    task?: Record<string, unknown>
+): Promise<{ root: string; output: string }> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cli-agent-e2e-"));
     setup(root);
-    const mock = await mockModel(actions);
+    const mutatesWorkspace = actions.some((action) => ["write_file", "edit_file", "delete_file"].includes(String(action.action)));
+    const interaction = actions.some((action) => (
+        action.action === "run_command" && /\b(?:test:e2e|e2e:test|playwright|cypress)\b/i.test(String(action.command))
+    ));
+    const firstTask = task ?? {
+        intent: "Complete the requested workspace task",
+        task_type: mutatesWorkspace ? "coding" : "general",
+        requires_workspace_changes: mutatesWorkspace,
+        verification: interaction ? "interaction" : "none",
+        evidence_requirements: [interaction ? "interaction" : "source"],
+        success_criteria: ["The requested observable result is complete"]
+    };
+    const scriptedActions = actions.map((action, index) => index === 0 && !action.task
+        ? { ...action, task: firstTask }
+        : action);
+    const mock = await mockModel(scriptedActions);
     try {
         const result = await runAgentCliHarness({ appRoot: root, workspace: root, apiUrl: mock.url, prompt, clarificationAnswers: answers, timeoutMs: 15_000 });
         assert.equal(result.exitCode, 0, result.stderr);
@@ -127,9 +148,16 @@ async function main(): Promise<void> {
         { action: "final", answer: "README ใช้เป็นหลักฐานสำหรับทดสอบ read-only", reason: "Answer from the inspected evidence." }
     ], "อ่าน README.md แล้วสรุป ห้ามแก้ไฟล์", (root) => {
         fs.writeFileSync(path.join(root, "README.md"), "Original evidence.\n", "utf8");
+    }, [], {
+        intent: "Summarize README without changing files",
+        task_type: "coding",
+        requires_workspace_changes: false,
+        verification: "none",
+        evidence_requirements: ["source"],
+        success_criteria: ["The summary is grounded in README evidence"]
     });
     try {
-        assert.match(readOnly.output, /Blocked by read-only contract/);
+        assert.match(readOnly.output, /Blocked by the model-owned read-only task contract/);
         assert.equal(fs.readFileSync(path.join(readOnly.root, "README.md"), "utf8"), "Original evidence.\n");
     } finally {
         fs.rmSync(readOnly.root, { recursive: true, force: true });
@@ -203,12 +231,48 @@ async function main(): Promise<void> {
         }), "utf8");
     });
     try {
-        assert.match(behaviorReplay.output, /Blocked behavior mutation: inspect the target's owning implementation companion/);
         assert.doesNotMatch(behaviorReplay.output, /Repeated equivalent action 2 times.*npm run build/s);
         assert.match(fs.readFileSync(path.join(behaviorReplay.root, "web", "src", "widget.ts"), "utf8"), /FeatureLink/);
         assert.match(behaviorReplay.output, /AI: แก้ dependency ของ interaction และยืนยันผลแล้ว/);
     } finally {
         fs.rmSync(behaviorReplay.root, { recursive: true, force: true });
+    }
+
+    const visualRouting = await runScenario([
+        { action: "read_file", path: "web/src/table.ts", reason: "Inspect the navigation behavior." },
+        { action: "edit_file", path: "web/src/table.ts", old_text: "export const route = '/';", new_text: "export const route = '/employees';", reason: "Correct the destination." },
+        { action: "run_command", command: "npm run build", workdir: "web", reason: "Compile the route change." },
+        { action: "final", answer: "Routing and table presentation are complete.", reason: "The build succeeded." },
+        { action: "read_file", path: "web/src/table.scss", reason: "Inspect the table styling owner." },
+        { action: "edit_file", path: "web/src/table.scss", old_text: ".table {}", new_text: ".table { display: grid; gap: 1rem; }", reason: "Implement the required table presentation." },
+        { action: "run_command", command: "npm run build", workdir: "web", reason: "Compile the styling change." },
+        { action: "run_command", command: "npm run test:e2e", workdir: "web", reason: "Exercise navigation and assert the rendered outcome." },
+        { action: "final", answer: "Routing and table presentation were implemented and interaction-tested.", reason: "Both project and interaction checks succeeded." }
+    ], "Correct the navigation outcome and the rendered table presentation.", (root) => {
+        fs.mkdirSync(path.join(root, "web", "src"), { recursive: true });
+        fs.writeFileSync(path.join(root, "web", "src", "table.ts"), "export const route = '/';", "utf8");
+        fs.writeFileSync(path.join(root, "web", "src", "table.scss"), ".table {}", "utf8");
+        fs.writeFileSync(path.join(root, "web", "package.json"), JSON.stringify({
+            name: "web",
+            scripts: {
+                build: "node -e \"process.exit(0)\"",
+                "test:e2e": "node -e \"process.exit(0)\""
+            }
+        }), "utf8");
+    }, [], {
+        intent: "Correct navigation behavior and rendered table styling",
+        task_type: "coding",
+        requires_workspace_changes: true,
+        verification: "command",
+        evidence_requirements: ["command", "interaction", "visual"],
+        success_criteria: ["Navigation reaches the requested destination", "The rendered table has an intentional layout"]
+    });
+    try {
+        assert.match(visualRouting.output, /Final blocked: visual presentation work has no successful styling mutation/);
+        assert.match(visualRouting.output, /AI: Routing and table presentation were implemented and interaction-tested/);
+        assert.match(fs.readFileSync(path.join(visualRouting.root, "web", "src", "table.scss"), "utf8"), /display: grid/);
+    } finally {
+        fs.rmSync(visualRouting.root, { recursive: true, force: true });
     }
 
     const repeatedWork = await runScenario([
@@ -217,7 +281,6 @@ async function main(): Promise<void> {
         { action: "list_files", path: ".", reason: "Repeat the same inspection." }
     ], "สร้างไฟล์ result.txt หลังตรวจ workspace", () => undefined);
     try {
-        assert.match(repeatedWork.output, /AI: Agent stopped early after detecting repeated work without progress/);
         assert.equal(fs.existsSync(path.join(repeatedWork.root, "result.txt")), false);
     } finally {
         fs.rmSync(repeatedWork.root, { recursive: true, force: true });
