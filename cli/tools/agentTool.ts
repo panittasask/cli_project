@@ -41,6 +41,8 @@ type AgentAction = (
     | {
         action: "final";
         answer: string;
+        completion_status: "completed" | "already_satisfied" | "no_change_needed";
+        evidence: string[];
     }
     | {
         action: "list_files";
@@ -166,7 +168,7 @@ Available actions:
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
 Call discovered MCP tools through mcp_call_tool using the exact configured server and tool names.
-{"action":"final","answer":"final answer to the user"}
+{"action":"final","answer":"final answer to the user","completion_status":"completed|already_satisfied|no_change_needed","evidence":["brief reference to successful tool evidence, or empty for a conversational answer"]}
 
 Rules:
 - Be precise about your own capabilities. Never claim to have a tool, internet access, search results, or an executed action unless it appears in Available actions or Discovered MCP tools and you successfully used it.
@@ -174,6 +176,7 @@ Rules:
 - For current, niche, or external information, call a relevant MCP search tool before answering. Base the answer on its observation and include the returned source URLs.
 - If a required tool is unavailable or its call fails, say so plainly. Do not fabricate results and do not pretend that telling the user to search is equivalent to searching.
 - Prefer reading relevant files before editing.
+- If inspection proves the requested state already exists, return final with completion_status "already_satisfied". If evidence proves that changing files would be unnecessary or incorrect, use "no_change_needed". Copy the exact host-issued Evidence ID values from successful observations into evidence; do not invent IDs or perform a cosmetic mutation merely to create file progress. Required command/runtime/interaction verification still applies to no-change outcomes.
 - Resolve uncertainty from accessible conversation, files, manifests, configuration, and tool observations first. Uncertainty by itself is not a blocker. Use ask_user only when required information is absent after inspection and choosing incorrectly would materially change scope, compatibility, cost, data, or an irreversible effect.
 - Use ask_user instead of final for a blocking clarification. Offer 2-6 concrete, mutually distinct choices grounded in observed facts. Do not add an "Other" option; the CLI always accepts free-text answers outside the choices.
 - Classify every clarification by its actual decision type. Use preference only for naming, styling, layout, or minor implementation details; preference questions are rejected because they are safely inferable and reversible. Never mislabel a preference as scope or target.
@@ -230,9 +233,17 @@ ${mcpSection}`;
         const common = { reason, ...(task ? { task } : {}) };
 
         if (action === "final") {
+            const completionStatus = data.completion_status === "already_satisfied" || data.completion_status === "no_change_needed"
+                ? data.completion_status
+                : "completed";
+            const evidence = Array.isArray(data.evidence)
+                ? data.evidence.filter((item): item is string => typeof item === "string").slice(0, 8)
+                : [];
             return {
                 action,
                 answer: typeof data.answer === "string" ? data.answer : "",
+                completion_status: completionStatus,
+                evidence,
                 ...common
             };
         }

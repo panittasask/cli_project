@@ -67,12 +67,25 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     recordCompletionTokens: (tokens: number) => void;
     checkBudget: (turn: number) => string | undefined;
     registerAction: (action: Record<string, unknown>) => { status: "allow" | "replan" | "stop"; message?: string };
+    recordObservation: (action: Record<string, unknown>, observation: { ok: boolean; output: string; changed?: boolean }) => { status: "allow" | "replan" | "stop"; message?: string };
     resetActionHistory: () => void;
     recordFileProgress: () => void;
     pause: () => void;
     resume: () => void;
     formatRemaining: () => string;
 } };
+const { noChangeCompletionBlockReason } = require("./completionPolicy") as {
+    noChangeCompletionBlockReason: (input: {
+        status: "completed" | "already_satisfied" | "no_change_needed";
+        evidence: string[];
+        successfulEvidenceRefs: Set<string>;
+        successfulWorkspaceEvidenceRefs: Set<string>;
+        workspaceChangeRequired: boolean;
+        verificationRequired: boolean;
+        verificationSatisfied: boolean;
+        hasUnresolvedFailures: boolean;
+    }) => string | undefined;
+};
 const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk } = require("./commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
@@ -136,6 +149,8 @@ const { buildCompactedAgentMessages } = require("./agentCompaction") as {
             unresolvedVerificationFailure?: string;
             verificationRequirement?: "none" | "command" | "runtime";
             verificationSatisfied?: boolean;
+            successfulEvidenceRefs?: string[];
+            successfulWorkspaceEvidenceRefs?: string[];
             sourceUrls: string[];
             recentEvents: string[];
             mcpCallsDisabled?: boolean;
@@ -1425,6 +1440,8 @@ async function runAgentLoop(
     const contextInspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }> = [];
     const writtenPaths = new Set<string>();
     const satisfiedPaths = new Set<string>();
+    const successfulEvidenceRefs = new Set<string>();
+    const successfulWorkspaceEvidenceRefs = new Set<string>();
     let successfulMcpDiscovery = false;
     let successfulMcpCall = false;
     let mcpCallsDisabled = false;
@@ -1502,6 +1519,8 @@ async function runAgentLoop(
                 ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {}),
                 verificationRequirement,
                 verificationSatisfied,
+                successfulEvidenceRefs: Array.from(successfulEvidenceRefs),
+                successfulWorkspaceEvidenceRefs: Array.from(successfulWorkspaceEvidenceRefs),
                 sourceUrls: Array.from(sourceUrls),
                 recentEvents: segmentEvents,
                 mcpCallsDisabled
@@ -1550,6 +1569,8 @@ async function runAgentLoop(
         const action = agentTool.parseAction(assistantContent) as {
             action?: string;
             answer?: string;
+            completion_status?: "completed" | "already_satisfied" | "no_change_needed";
+            evidence?: string[];
             tool?: string;
             reason?: string;
             path?: string;
@@ -1827,6 +1848,22 @@ async function runAgentLoop(
                 messages.push({ role: "user", content: feedback });
             };
             const proposedAnswer = action.answer?.trim() || "Done.";
+            const noChangeOutcome = action.completion_status === "already_satisfied"
+                || action.completion_status === "no_change_needed";
+            const noChangeBlocker = noChangeCompletionBlockReason({
+                status: action.completion_status ?? "completed",
+                evidence: action.evidence ?? [],
+                successfulEvidenceRefs,
+                successfulWorkspaceEvidenceRefs,
+                workspaceChangeRequired: mustWrite,
+                verificationRequired: verificationRequirement !== "none",
+                verificationSatisfied,
+                hasUnresolvedFailures: Boolean(
+                    unresolvedToolFailure
+                    || unresolvedVerificationFailure
+                    || validationFailures.size > 0
+                )
+            });
             if (answerLooksLikeBlockingClarification(proposedAnswer)) {
                 rejectFinal(
                     "blocking clarification must use the interactive choice action",
@@ -1841,7 +1878,14 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0) {
+            if (noChangeBlocker) {
+                rejectFinal(
+                    noChangeBlocker,
+                    "You cannot claim already_satisfied or no_change_needed without successful tool evidence. Inspect the relevant state first and cite that observation in evidence, or use completion_status completed for a conversational answer."
+                );
+                continue;
+            }
+            if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0 && !noChangeOutcome) {
                 rejectFinal(
                     "this request requires a successful file write",
                     "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
@@ -1955,44 +1999,25 @@ async function runAgentLoop(
         }
         const guardDecision = guard.registerAction(action as Record<string, unknown>);
         if (guardDecision.status === "replan") {
-            const invocationCorrection = action.action === "run_command"
-                && Boolean(unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure));
-            const failureReview = action.action === "run_command" && unresolvedVerificationFailure
-                ? ` Review the previous failure before choosing another action:\n${unresolvedVerificationFailure}`
-                : "";
-            const repeatObservation = `${guardDecision.message}${failureReview}`;
+            const repeatObservation = guardDecision.message ?? "This exact action is quarantined.";
             spinner.log(`[${stepStatus(turn)}] ${guardDecision.message}`);
-            trace.add({ turn, status: "error", action: "repeat_guard", arguments: action, observation: repeatObservation });
+            trace.add({ turn, status: "error", action: "repeat_quarantine", arguments: action, observation: repeatObservation });
             trace.save();
-            const repeatedMutation = ["edit_file", "write_file", "delete_file"].includes(action.action ?? "");
-            recoveryResponseFormat = invocationCorrection
-                ? recoveryFormat("final")
-                : repeatedMutation
-                    ? recoveryFormat(["edit_file", "write_file", "delete_file"])
-                    : getAgentMutationResponseFormat();
             const completedWrites = writtenPaths.size > 0
                 ? ` Successful writes so far: ${Array.from(writtenPaths).join(", ")}.`
                 : "";
             messages.push({
                 role: "user",
-                content: invocationCorrection
-                    ? `Observation: ${repeatObservation} Correct the rejected command or option and run a finite verification command with a different invocation. Do not edit source/configuration just to preserve the invalid command.`
-                    : repeatedMutation
-                        ? `Observation: ${repeatObservation} Further file mutations are unavailable for your next response.${completedWrites} Read the current file, run a finite verification command, or return final. Do not delete a file as recovery from a repeated mutation.`
-                        : `Observation: ${repeatObservation} The repeated ${action.action} action is unavailable for your next response.${completedWrites} Use the files and errors already observed to make a concrete correction now.`
+                content: `Observation: ${repeatObservation}${completedWrites} This blocks only the exact action signature in the current evidence state; use different arguments, another action, or return an evidence-backed final.`
             });
             continue;
         }
         if (guardDecision.status === "stop") {
-            const failureSummary = unresolvedVerificationFailure
-                ? ` Last unresolved command failure: ${unresolvedVerificationFailure}`
-                : "";
-            const observation = `${guardDecision.message}${failureSummary} The task stopped because repeated work produced no new evidence.`;
+            const observation = guardDecision.message ?? "The model repeatedly ignored an exact-action quarantine.";
             trace.add({ turn, status: "error", action: "repeat_stop", arguments: action, observation });
             trace.save();
-            const writes = writtenPaths.size > 0 ? ` Successful writes before stopping: ${Array.from(writtenPaths).join(", ")}.` : "";
             return {
-                answer: `Agent stopped early after detecting repeated work without progress. ${observation}${writes}`,
+                answer: `Agent stopped because it repeatedly retried an exact action after that action was quarantined. ${observation}`,
                 trace,
                 clarifications: clarificationTranscript
             };
@@ -2304,6 +2329,38 @@ async function runAgentLoop(
             };
         } else if (["write_file", "edit_file", "delete_file", "run_command"].includes(action.action ?? "")) {
             unresolvedToolFailure = undefined;
+        }
+        const observationGuardDecision = guard.recordObservation(action as Record<string, unknown>, result);
+        if (result.ok && (
+            ["list_files", "search_files", "read_file", "run_command", "mcp_list_tools", "mcp_call_tool"].includes(action.action ?? "")
+            || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
+        )) {
+            const evidenceRef = `evidence_${turn}_${action.action}`;
+            successfulEvidenceRefs.add(evidenceRef);
+            if (
+                ["list_files", "search_files", "read_file"].includes(action.action ?? "")
+                || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
+            ) {
+                successfulWorkspaceEvidenceRefs.add(evidenceRef);
+            }
+            result = {
+                ...result,
+                output: `${result.output}\nEvidence ID: ${evidenceRef}`
+            };
+        }
+        if (observationGuardDecision.status === "replan") {
+            const quarantineMessage = observationGuardDecision.message ?? "This exact action is quarantined.";
+            trace.add({
+                turn,
+                status: "error",
+                action: "repeat_quarantine",
+                arguments: action,
+                observation: quarantineMessage
+            });
+            result = {
+                ...result,
+                output: `${result.output}\nLoop guard: ${quarantineMessage}`
+            };
         }
         spinner.update(result.ok
             ? `Completed ${action.action}; reviewing result...`
