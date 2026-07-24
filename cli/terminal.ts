@@ -518,7 +518,6 @@ const llamaClient = new LlamaClient(
     agentGuardSettings.maxDurationMs > 0 ? agentGuardSettings.maxDurationMs + 5000 : 0
 );
 const modelRouterClient = new ModelRouterClient(apiUrl);
-const modelDirectory = process.env.LLAMA_MODEL_DIR?.trim() || cliSettings.modelPath?.trim() || "D:\\Model";
 const defaultModel = process.env.LLAMA_MODEL?.trim()
     || cliSettings.defaultModel?.trim()
     || "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf";
@@ -642,17 +641,6 @@ function printSessionUsage(sessionId: string): void {
     );
 }
 
-function getAvailableModelFiles(): string[] {
-    try {
-        return fs.readdirSync(modelDirectory, { withFileTypes: true })
-            .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".gguf"))
-            .map((entry) => entry.name)
-            .sort((left, right) => left.localeCompare(right));
-    } catch {
-        return [];
-    }
-}
-
 async function getLoadedServerModels(): Promise<string[]> {
     try {
         const routerModels = await modelRouterClient.list();
@@ -714,8 +702,6 @@ async function printModelInfo(): Promise<void> {
         getServerContextInfo(model),
         modelRouterClient.list().catch(() => undefined)
     ]);
-    const availableFiles = getAvailableModelFiles();
-
     if (loadedModels[0]) {
         model = loadedModels[0];
         plannerModel = loadedModels[0];
@@ -733,7 +719,7 @@ async function printModelInfo(): Promise<void> {
     console.log(serverContext
         ? `Active server context: ${serverContext.contextLength.toLocaleString()} tokens per slot${serverContext.totalSlots ? ` (${serverContext.totalSlots} slot${serverContext.totalSlots === 1 ? "" : "s"})` : ""}`
         : "Active server context: unavailable (use /model while llama.cpp is running)");
-    console.log(`Model directory: ${modelDirectory}`);
+    console.log(`llama.cpp API: ${apiUrl}`);
 
     if (routerModels) {
         console.log("Available server models:");
@@ -742,17 +728,9 @@ async function printModelInfo(): Promise<void> {
             console.log(`  [${index + 1}] ${entry.id} (${state})`);
         });
         console.log("Switch with /model <number-or-name>.");
-    } else if (availableFiles.length === 0) {
-        console.log("Available GGUF models: none found");
     } else {
-        console.log("Available GGUF models:");
-        availableFiles.forEach((fileName, index) => {
-            console.log(`  [${index + 1}] ${fileName}`);
-        });
-    }
-
-    if (!routerModels) {
-        console.log("Runtime switching requires llama.cpp router mode. Restart the server with routerMode enabled.");
+        console.log("Available server models: unavailable (the server is offline or llama.cpp router mode is disabled)");
+        console.log("Runtime switching and the full model list require router mode on the server.");
     }
     console.log();
 }
