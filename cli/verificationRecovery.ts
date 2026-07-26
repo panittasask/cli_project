@@ -2,6 +2,8 @@ type VerificationRecoveryInput = {
     boundedRun: boolean;
     baseLimitReached: boolean;
     unresolvedVerificationFailure?: string;
+    verificationRequiredAndUnsatisfied?: boolean;
+    pendingProjectChecks?: boolean;
 };
 
 const MIN_RECOVERY_TURNS = 4;
@@ -15,7 +17,11 @@ function verificationRecoveryTurnAllowance(maxTurnsPerSegment: number): number {
 function shouldActivateVerificationRecovery(input: VerificationRecoveryInput): boolean {
     return input.boundedRun
         && input.baseLimitReached
-        && Boolean(input.unresolvedVerificationFailure?.trim());
+        && (
+            Boolean(input.unresolvedVerificationFailure?.trim())
+            || input.verificationRequiredAndUnsatisfied === true
+            || input.pendingProjectChecks === true
+        );
 }
 
 module.exports = {

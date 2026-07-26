@@ -2,6 +2,9 @@ import axios = require("axios");
 import readline = require("node:readline");
 import fs = require("node:fs");
 import path = require("node:path");
+const { generateLogViewer } = require("../scripts/generate-log-viewer") as {
+    generateLogViewer: (root?: string) => string;
+};
 const {
     answerLooksLikeBlockingClarification,
     clarificationBlockReason,
@@ -30,8 +33,8 @@ const {
     relevantClarificationInspections: (input: {
         decision: ClarificationRequest["decision"];
         question: string;
-        inspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }>;
-    }) => Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }>;
+        inspections: Array<{ action: "list_files" | "search_project" | "search_files" | "read_file"; path?: string; query?: string }>;
+    }) => Array<{ action: "list_files" | "search_project" | "search_files" | "read_file"; path?: string; query?: string }>;
     resolveClarificationAnswer: (request: ClarificationRequest, input: string) => ClarificationAnswer | undefined;
 };
 type ClarificationRequest = import("./clarificationTypes").ClarificationRequest;
@@ -50,12 +53,13 @@ const { ModelRouterClient } = require("./modelRouter") as { ModelRouterClient: n
     switch: (selection: string) => Promise<{ model: RouterModel; unloaded: string[] }>;
     formatError: (error: unknown) => string;
 } };
-const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, initializeCliSettings, validateCliSettingsFile } = require("./config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, getTerminalSettings, initializeCliSettings, validateCliSettingsFile } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
     getAgentGuardSettings: (settings: CliSettings) => AgentGuardSettings;
     getClarificationSettings: (settings: CliSettings) => ClarificationSettings;
     getProjectCheckProviders: (settings: CliSettings) => ProjectCheckProvider[];
+    getTerminalSettings: (settings: CliSettings) => { llmMessageColor: string };
     initializeCliSettings: (appRoot?: string) => { created: boolean; path: string; message: string };
     validateCliSettingsFile: (appRoot?: string) => { ok: boolean; path: string; source: string; errors: string[] };
 };
@@ -74,10 +78,19 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("./completionPolicy") as {
+const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("./completionPolicy") as {
     CompletionBlockerTracker: new (limit: number) => {
         record: (summary: string) => { count: number; shouldStop: boolean };
     };
+    continuationNoWriteCompletionAllowed: (input: {
+        continuation: boolean;
+        evidence: string[];
+        successfulEvidenceRefs: Set<string>;
+        successfulWorkspaceEvidenceRefs: Set<string>;
+        verificationRequired: boolean;
+        verificationSatisfied: boolean;
+        hasUnresolvedFailures: boolean;
+    }) => boolean;
     effectiveCompletionStatus: (
         status: "completed" | "already_satisfied" | "no_change_needed",
         successfulWorkspaceChanges: number
@@ -98,10 +111,12 @@ const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } 
         boundedRun: boolean;
         baseLimitReached: boolean;
         unresolvedVerificationFailure?: string;
+        verificationRequiredAndUnsatisfied?: boolean;
+        pendingProjectChecks?: boolean;
     }) => boolean;
     verificationRecoveryTurnAllowance: (maxTurnsPerSegment: number) => number;
 };
-const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, commandInvokesAgentTool, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk } = require("./commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, commandInvokesAgentTool, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk, packageScriptCommandsEquivalent } = require("./commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
     commandMutatesWorkspaceFiles: (command: string) => boolean;
@@ -112,6 +127,7 @@ const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspac
     normalizeCommandSignature: (command: string) => string;
     packageLifecycleRoleChanges: (beforeContent: string, afterContent: string) => string[];
     packageMutationRisk: (workspace: string, userMessage: string, command: string, requestedWorkdir?: string) => string | undefined;
+    packageScriptCommandsEquivalent: (left: string, right: string) => boolean;
 };
 const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpointStore: new (root: string) => {
     checkpoint: (workspace: string, inputPath: string, nextContent: string) => { id: string; preview: string };
@@ -149,6 +165,19 @@ const { AgentResponseLog } = require("./agentResponseLog") as { AgentResponseLog
         timings?: unknown;
     }) => void;
 } };
+const {
+    MAX_REASONING_ONLY_RETRIES,
+    REASONING_ONLY_PARSE_ERROR,
+    formatReasoningOnlyRecoveryPrompt,
+    isReasoningOnlyTruncation,
+    reasoningOnlyRetryMaxTokens
+} = require("./modelResponseRecovery") as {
+    MAX_REASONING_ONLY_RETRIES: number;
+    REASONING_ONLY_PARSE_ERROR: string;
+    formatReasoningOnlyRecoveryPrompt: (attempt: number) => string;
+    isReasoningOnlyTruncation: (response: { content: unknown; reasoningContent: unknown; finishReason: unknown }) => boolean;
+    reasoningOnlyRetryMaxTokens: (configuredMaxTokens: number) => number;
+};
 const { resolveJsonlLogPath } = require("./dailyLog") as {
     resolveJsonlLogPath: (target: string | { directory: string; basename: string }, date?: Date) => string;
 };
@@ -204,7 +233,7 @@ type AcceptanceContract = { evidence: "source" | "command" | "runtime" | "intera
 type ProjectCheck = import("./projectTypes").ProjectCheck;
 type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRequirement;
 const { commandSatisfiesAcceptance } = require("./workflowRouter") as {
-    commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract) => boolean;
+    commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract, options?: { probe?: boolean }) => boolean;
 };
 const { deriveTaskEvidencePolicy, isVisualPresentationMutation } = require("./taskEvidence") as {
     deriveTaskEvidencePolicy: (
@@ -269,6 +298,10 @@ const { Spinner, formatCompletionLine } = require("./spinner") as { Spinner: new
     update: (message: string) => void;
     log: (message: string) => void;
 }; formatCompletionLine: (milliseconds: number, completed?: boolean) => string };
+const { formatAiResponse, normalizeTerminalColor } = require("./terminalStyle") as {
+    formatAiResponse: (answer: string, colors?: boolean, messageColor?: string | number) => string;
+    normalizeTerminalColor: (value: unknown) => string | undefined;
+};
 const { ImageTool } = require("./tools/imageTool") as { ImageTool: new () => {
     parseImagePrompt: (input: string) => { filePath: string; prompt: string } | undefined;
     toDataUrl: (inputPath: string) => string;
@@ -293,11 +326,20 @@ const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => 
         contextReason: string;
     } | undefined;
 } };
-const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number) => {
+const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number, inferenceApiUrl?: string) => {
     buildSystemPrompt: (workflowInstructions?: string) => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
-    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean }>;
+    execute: (action: unknown) => Promise<{
+        ok: boolean;
+        output: string;
+        changed?: boolean;
+        assertionPassed?: boolean;
+        failureKind?: "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
+        recommendedCommand?: string;
+        recommendedWorkdir?: string;
+        recommendedMode?: "probe";
+    }>;
     inspectCapabilities: () => Promise<{ servers: Array<Record<string, unknown>> }>;
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
@@ -393,6 +435,7 @@ type CliSettings = {
     hardwareProfile?: "auto" | "intel-arc" | "rtx-4070-super" | "default";
     debug?: boolean;
     historyMessages?: number;
+    terminal?: { llmMessageColor?: string | number };
     agent?: { profile?: "quick" | "standard" | "deep"; maxTurns?: number; maxSegments?: number; maxDurationMinutes?: number; maxCompletionTokens?: number; repeatLimit?: number; maxClarifications?: number; requireInspectionBeforeClarification?: boolean; secondClarificationRequiresBlocker?: boolean };
     projectChecks?: ProjectCheckProvider[];
     sampling?: Partial<Record<"chat" | "planner" | "action", Partial<SamplingSettings>>>;
@@ -464,6 +507,8 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/settings validate", description: "validate effective settings" },
     { command: "/capabilities", description: "show tools, checks, and web availability" },
     { command: "/usage", description: "show session token usage" },
+    { command: "/log", description: "refresh the HTML log viewer" },
+    { command: "/color", description: "show or change the LLM message color" },
     { command: "/clear", description: "start a clean task context" },
     { command: "/undo", description: "restore the latest file checkpoint" },
     { command: "/skills", description: "show project-local skills" },
@@ -510,6 +555,7 @@ const apiUrl = process.env.LLAMA_API_URL?.trim()
 const agentGuardSettings = getAgentGuardSettings(cliSettings);
 const clarificationSettings = getClarificationSettings(cliSettings);
 const projectCheckProviders = getProjectCheckProviders(cliSettings);
+const terminalSettings = getTerminalSettings(cliSettings);
 // The request-level Axios timeout must not fire before the user-visible Agent
 // wall-clock guard. A zero guard is deliberately unbounded, so Axios must also
 // receive zero (its no-timeout value) rather than a five-second fallback.
@@ -581,6 +627,32 @@ function persistDebugSetting(enabled: boolean): void {
     cliSettings.debug = enabled;
 }
 
+function persistTerminalColor(color: string): void {
+    const settingsPath = path.resolve(appRoot, ".cli", "settings.json");
+    if (!fs.existsSync(settingsPath)) initializeCliSettings(appRoot);
+    let persisted: Record<string, unknown> = {};
+    try {
+        persisted = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+    } catch {
+        // Preserve the selected color in a valid settings object if the
+        // existing personal settings file cannot be parsed.
+    }
+    const persistedTerminal = persisted.terminal && typeof persisted.terminal === "object" && !Array.isArray(persisted.terminal)
+        ? persisted.terminal as Record<string, unknown>
+        : {};
+    persisted.terminal = {
+        ...persistedTerminal,
+        llmMessageColor: color
+    };
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+    cliSettings.terminal = {
+        ...cliSettings.terminal,
+        llmMessageColor: color
+    };
+    terminalSettings.llmMessageColor = color;
+}
+
 // Sessions belong to the CLI installation, not to whichever workspace the
 // agent is currently inspecting. This also keeps --workspace startup and the
 // interactive /workspace command consistent.
@@ -589,7 +661,7 @@ const imageTool = new ImageTool();
 const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
 const toolRouter = new ToolRouter();
-const agentTool = new AgentTool(appRoot);
+const agentTool = new AgentTool(appRoot, undefined, apiUrl);
 const checkpointStore = new FileCheckpointStore(appRoot);
 const skillLoader = new SkillLoader();
 let activeRequestController: AbortController | undefined;
@@ -776,6 +848,9 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/settings validate        Validate the effective settings file");
     console.log("/capabilities             Show local tools, project checks, MCP, and web search");
     console.log("/usage                    Show session and active context token usage");
+    console.log("/log                      Refresh .cli/log-viewer.html from the latest logs");
+    console.log("/color                    Show the current LLM message color and supported values");
+    console.log("/color <name-or-code>     Change and save the LLM message color");
     console.log("/clear                    Start a new task context; keep session history");
     console.log("/undo                     Restore the latest model file checkpoint");
     console.log("/skills                   Show project-local skills");
@@ -808,7 +883,8 @@ function printEffectiveSettings(): void {
         ["agent.requireInspectionBeforeClarification", clarificationSettings.requireInspection, settingSource("CLI_AGENT_REQUIRE_INSPECTION_BEFORE_CLARIFICATION", agent.requireInspectionBeforeClarification !== undefined)],
         ["agent.secondClarificationRequiresBlocker", clarificationSettings.secondRequiresBlocker, settingSource("CLI_AGENT_SECOND_CLARIFICATION_REQUIRES_BLOCKER", agent.secondClarificationRequiresBlocker !== undefined)],
         ["contextLength", configuredContextLength, settingSource("LLAMA_CONTEXT_LENGTH", cliSettings.contextLength !== undefined)],
-        ["hardwareProfile", process.env.LLAMA_HARDWARE_PROFILE?.trim() || cliSettings.hardwareProfile || "auto", settingSource("LLAMA_HARDWARE_PROFILE", cliSettings.hardwareProfile !== undefined)]
+        ["hardwareProfile", process.env.LLAMA_HARDWARE_PROFILE?.trim() || cliSettings.hardwareProfile || "auto", settingSource("LLAMA_HARDWARE_PROFILE", cliSettings.hardwareProfile !== undefined)],
+        ["terminal.llmMessageColor", terminalSettings.llmMessageColor, cliSettings.terminal?.llmMessageColor !== undefined ? settingsFileSource() : "built-in default"]
     ];
     console.log("Effective settings:");
     rows.forEach(([name, value, source]) => console.log(`  ${name}: ${value} [${source}]`));
@@ -1431,6 +1507,7 @@ async function runAgentLoop(
     let taskContract: {
         intent: string;
         task_type: WorkflowKind;
+        continuation: boolean;
         requires_workspace_changes: boolean;
         verification: "none" | "command" | "runtime" | "interaction";
         evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
@@ -1451,6 +1528,8 @@ async function runAgentLoop(
     const validationFailures = new Set<string>();
     let unresolvedVerificationFailure: string | undefined;
     let unresolvedToolFailure: { action: string; output: string } | undefined;
+    let pendingRuntimePortCorrection: string | undefined;
+    let pendingPackageScriptRecovery: { command: string; workdir: string; mode?: "probe" } | undefined;
     let unresolvedMissingCommandTarget = false;
     let lastFailedCommand: string | undefined;
     let verificationSatisfied = verificationRequirement === "none";
@@ -1458,7 +1537,7 @@ async function runAgentLoop(
     const pendingProjectChecks = new Set<string>();
     const clarificationTranscript: string[] = [];
     const answeredClarifications = new Map<string, Record<string, unknown>>();
-    const contextInspections: Array<{ action: "list_files" | "search_files" | "read_file"; path?: string; query?: string }> = [];
+    const contextInspections: Array<{ action: "list_files" | "search_project" | "search_files" | "read_file"; path?: string; query?: string }> = [];
     const writtenPaths = new Set<string>();
     const visualPresentationPaths = new Set<string>();
     const satisfiedPaths = new Set<string>();
@@ -1523,6 +1602,8 @@ async function runAgentLoop(
     let systemPrompt = await buildCurrentSystemPrompt();
     let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
     let recoveryResponseFormat: Record<string, unknown> | undefined;
+    let reasoningOnlyRetryPending = false;
+    let consecutiveReasoningOnlyTruncations = 0;
     const recoveryFormat = (extra: string | string[] = []) => getAgentRecoveryResponseFormat(
         workflow.kind,
         Array.from(new Set(Array.isArray(extra) ? extra : [extra])).filter(Boolean)
@@ -1544,6 +1625,8 @@ async function runAgentLoop(
             verificationRecoveryActive = shouldActivateVerificationRecovery({
                 boundedRun: Number.isFinite(maxTurns),
                 baseLimitReached: true,
+                verificationRequiredAndUnsatisfied: verificationRequirement !== "none" && !verificationSatisfied,
+                pendingProjectChecks: Array.from(pendingProjectChecks).some((checkId) => !successfulProjectChecks.has(checkId)),
                 ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {})
             });
             if (verificationRecoveryActive) {
@@ -1616,13 +1699,17 @@ async function runAgentLoop(
             ? `Planning next step (step ${turn}, ${guard.formatRemaining()})...`
             : `Reviewing results (step ${turn}, ${guard.formatRemaining()})...`);
 
+        const samplingForRequest = reasoningOnlyRetryPending
+            ? { ...actionSampling, max_tokens: reasoningOnlyRetryMaxTokens(actionSampling.max_tokens) }
+            : actionSampling;
+        reasoningOnlyRetryPending = false;
         const modelStartedAt = Date.now();
-        debugLog("LLM request", { turn, model, messages, responseFormat: requestFormat, sampling: actionSampling });
+        debugLog("LLM request", { turn, model, messages, responseFormat: requestFormat, sampling: samplingForRequest });
         const response = await llamaClient.post({
             model,
             messages,
             response_format: requestFormat,
-            ...actionSampling
+            ...samplingForRequest
         }, (_attempt, errorCode) => {
             spinner.update(`llama.cpp connection ${errorCode}; retrying...`);
         }, signal);
@@ -1632,6 +1719,11 @@ async function runAgentLoop(
         const choice = response.data.choices[0];
         const rawAssistantContent = choice.message.content;
         const assistantContent = typeof rawAssistantContent === "string" ? rawAssistantContent.trim() : "";
+        const reasoningOnlyTruncation = isReasoningOnlyTruncation({
+            content: rawAssistantContent,
+            reasoningContent: choice.message.reasoning_content,
+            finishReason: choice.finish_reason
+        });
         const action = agentTool.parseAction(assistantContent) as {
             action?: string;
             answer?: string;
@@ -1646,6 +1738,13 @@ async function runAgentLoop(
             new_text?: string;
             command?: string;
             workdir?: string;
+            mode?: "normal" | "probe";
+            timeout_ms?: number;
+            expect?: {
+                exit_code?: 0;
+                output_includes?: string[];
+                output_excludes?: string[];
+            };
             question?: string;
             decision?: ClarificationRequest["decision"];
             options?: Array<{ id: string; label: string; description?: string }>;
@@ -1654,13 +1753,18 @@ async function runAgentLoop(
             task?: {
                 intent: string;
                 task_type: WorkflowKind;
+                continuation: boolean;
                 requires_workspace_changes: boolean;
                 verification: "none" | "command" | "runtime" | "interaction";
                 evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
                 success_criteria: string[];
             };
         } | undefined;
-        const parseError = action ? undefined : agentTool.explainParseFailure(assistantContent);
+        const parseError = action
+            ? undefined
+            : reasoningOnlyTruncation
+                ? REASONING_ONLY_PARSE_ERROR
+                : agentTool.explainParseFailure(assistantContent);
         debugLog("LLM response", {
             turn,
             rawContent: rawAssistantContent,
@@ -1693,6 +1797,7 @@ async function runAgentLoop(
         });
 
         if (!action) {
+            if (!reasoningOnlyTruncation) consecutiveReasoningOnlyTruncations = 0;
             segmentEvents.push(`Step ${segmentTurn}: invalid model action (${parseError ?? "unknown parse error"})`);
             spinner.log(`[${stepStatus(turn)}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
             trace.add({
@@ -1702,7 +1807,26 @@ async function runAgentLoop(
                 observation: assistantContent.slice(0, 1000)
             });
             trace.save();
-            if (choice.finish_reason === "length") {
+            if (reasoningOnlyTruncation) {
+                consecutiveReasoningOnlyTruncations += 1;
+                if (consecutiveReasoningOnlyTruncations > MAX_REASONING_ONLY_RETRIES) {
+                    const answer = `Agent stopped safely after ${MAX_REASONING_ONLY_RETRIES} reasoning-only recovery retries because the model still emitted no action JSON. The response log contains the truncated reasoning for diagnosis.`;
+                    trace.add({
+                        turn,
+                        status: "error",
+                        action: "reasoning_only_recovery_exhausted",
+                        observation: answer
+                    });
+                    trace.save();
+                    return { answer, trace, clarifications: clarificationTranscript };
+                }
+                reasoningOnlyRetryPending = true;
+                recoveryResponseFormat = recoveryFormat();
+                messages.push({
+                    role: "user",
+                    content: formatReasoningOnlyRecoveryPrompt(consecutiveReasoningOnlyTruncations)
+                });
+            } else if (choice.finish_reason === "length") {
                 recoveryResponseFormat = recoveryFormat("write_file");
                 messages.push({
                     role: "user",
@@ -1716,6 +1840,7 @@ async function runAgentLoop(
             }
             continue;
         }
+        consecutiveReasoningOnlyTruncations = 0;
 
         if (!taskContract && !action.task) {
             recoveryResponseFormat = initialAgentResponseFormat;
@@ -1725,7 +1850,7 @@ async function runAgentLoop(
             trace.save();
             messages.push({
                 role: "user",
-                content: "Return one action again and include task with intent, task_type, requires_workspace_changes, verification, evidence_requirements, and observable success_criteria. Choose all evidence requirements implied by the outcome and choose the useful first action in the same JSON object."
+                content: "Return one action again and include task with intent, task_type, continuation, requires_workspace_changes, verification, evidence_requirements, and observable success_criteria. Set continuation semantically from the current request and session context. Choose all evidence requirements implied by the outcome and choose the useful first action in the same JSON object."
             });
             continue;
         }
@@ -1765,6 +1890,77 @@ async function runAgentLoop(
             trace.save();
             segmentEvents.push(`Task contract: ${taskContract.intent}`);
             spinner.log(`Task understood as ${workflow.kind}: ${taskContract.intent}`);
+        }
+
+        if (action.action === "refine_task") {
+            const refinedTask = action.task;
+            const citedEvidence = action.evidence ?? [];
+            const invalidEvidence = citedEvidence.filter((evidenceId) => !successfulWorkspaceEvidenceRefs.has(evidenceId));
+            const scopeChanged = !taskContract
+                || refinedTask?.task_type !== taskContract.task_type
+                || refinedTask?.requires_workspace_changes !== taskContract.requires_workspace_changes
+                || refinedTask?.continuation !== taskContract.continuation;
+            if (!refinedTask || citedEvidence.length === 0 || invalidEvidence.length > 0 || scopeChanged) {
+                const reasons = [
+                    !refinedTask ? "a complete refined task contract is required" : "",
+                    citedEvidence.length === 0 ? "at least one successful workspace Evidence ID is required" : "",
+                    invalidEvidence.length > 0 ? `unknown or non-workspace evidence: ${invalidEvidence.join(", ")}` : "",
+                    scopeChanged ? "task_type, continuation, and requires_workspace_changes cannot change during refinement" : ""
+                ].filter(Boolean);
+                const observation = `Task contract refinement rejected: ${reasons.join("; ")}.`;
+                recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "run_command", "edit_file", "write_file", "final"]);
+                spinner.log(`[${stepStatus(turn)}] ${observation}`);
+                trace.add({ turn, status: "error", action: "task_contract_refinement_blocked", reason: action.reason, observation });
+                trace.save();
+                messages.push({
+                    role: "user",
+                    content: `${observation} Do not repeat refine_task unchanged. Continue the current contract using file actions or the distinct verification it still requires. Successful workspace Evidence IDs currently available: ${Array.from(successfulWorkspaceEvidenceRefs).join(", ") || "none yet"}.`
+                });
+                continue;
+            }
+
+            const previousTaskContract = taskContract;
+            taskContract = refinedTask;
+            const evidencePolicy = deriveTaskEvidencePolicy(
+                taskContract.evidence_requirements,
+                taskContract.verification
+            );
+            verificationRequirement = evidencePolicy.verification;
+            acceptance = {
+                evidence: evidencePolicy.evidence,
+                verification: verificationRequirement,
+                reason: `Refined by the model from workspace evidence ${citedEvidence.join(", ")}: ${taskContract.success_criteria.join("; ")}`
+            };
+            readOnlyAllowsCommands = verificationRequirement !== "none";
+            verificationSatisfied = verificationRequirement === "none";
+            recoveryResponseFormat = undefined;
+            agentResponseFormat = readOnlyRequest
+                ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands)
+                : getAgentResponseFormat(workflow.kind);
+            systemPrompt = await buildCurrentSystemPrompt();
+            const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
+            if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
+            guard.resetActionHistory();
+            const observation = JSON.stringify({
+                previous: previousTaskContract,
+                refined: taskContract,
+                evidence: citedEvidence
+            });
+            trace.add({
+                turn,
+                status: "action",
+                action: "task_contract_refined",
+                reason: action.reason,
+                observation
+            });
+            trace.save();
+            segmentEvents.push(`Task contract refined from workspace evidence: ${taskContract.intent}`);
+            spinner.log(`[${stepStatus(turn)}] Task contract refined: ${taskContract.intent}`);
+            messages.push({
+                role: "user",
+                content: `Task contract refinement accepted: ${observation}\nContinue using the refined verification and evidence requirements.`
+            });
+            continue;
         }
 
         // The loop ends only when the model explicitly returns final. Until
@@ -1919,6 +2115,20 @@ async function runAgentLoop(
             );
             const noChangeOutcome = completionStatus === "already_satisfied"
                 || completionStatus === "no_change_needed";
+            const continuationStateSatisfied = continuationNoWriteCompletionAllowed({
+                continuation: taskContract?.continuation === true,
+                evidence: action.evidence ?? [],
+                successfulEvidenceRefs,
+                successfulWorkspaceEvidenceRefs,
+                verificationRequired: verificationRequirement !== "none",
+                verificationSatisfied,
+                hasUnresolvedFailures: Boolean(
+                    unresolvedToolFailure
+                    || unresolvedVerificationFailure
+                    || validationFailures.size > 0
+                    || pendingProjectChecks.size > 0
+                )
+            });
             const noChangeBlocker = noChangeCompletionBlockReason({
                 status: completionStatus,
                 evidence: action.evidence ?? [],
@@ -1947,26 +2157,34 @@ async function runAgentLoop(
                 );
                 continue;
             }
-            if (noChangeBlocker) {
+            if (taskContract?.continuation && verificationRequirement !== "none" && !verificationSatisfied) {
+                const requiredCheck = verificationRequirement === "runtime"
+                    ? acceptance.evidence === "interaction"
+                        ? "run a finite automated interaction test that performs the action and asserts the resulting state"
+                        : "run the manifest-defined runtime lifecycle or an OS-compatible probe of the requested URL, endpoint, server, or UI; use mode probe with a finite timeout for start/dev/serve scripts"
+                    : "run the relevant test, build, lint, or verification command";
                 rejectFinal(
-                    noChangeBlocker,
-                    "You cannot claim already_satisfied or no_change_needed without successful tool evidence. Inspect the relevant state first and cite that observation in evidence, or use completion_status completed for a conversational answer."
+                    `required ${verificationRequirement} verification has not succeeded for this continuation`,
+                    `You cannot return final yet. ${requiredCheck}. A successful build, typecheck, or file read alone does not prove runtime behavior. Continue the current contract; do not use refine_task merely to remove continuation or weaken its evidence requirement.`
                 );
                 continue;
             }
-            if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0 && !noChangeOutcome) {
+            if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0 && !noChangeOutcome && !continuationStateSatisfied) {
                 rejectFinal(
                     "this request requires a successful file write",
-                    "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
+                    taskContract?.continuation
+                        ? "This is continuation work. If current workspace evidence proves the prior edits already satisfy the task, run every required verification and return final citing both workspace and verification Evidence IDs; do not create a cosmetic change. Otherwise use edit_file or write_file for the real remaining correction."
+                        : "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
                 );
                 continue;
             }
             if (taskContract?.evidence_requirements.includes("visual")
                 && visualPresentationPaths.size === 0
-                && !noChangeOutcome) {
+                && !noChangeOutcome
+                && !continuationStateSatisfied) {
                 rejectFinal(
                     "visual presentation work has no successful styling mutation",
-                    "You cannot return final yet. The task requires a rendered visual result, but no stylesheet or concrete embedded-style mutation succeeded. Inspect the component's styling owner, implement the visual styling, then run the required finite interaction verification."
+                    "You cannot return final yet. The current task contract requires a rendered visual result, but no stylesheet or concrete embedded-style mutation succeeded. If successful workspace inspection proves the initial visual requirement was incorrect, use refine_task with those exact Evidence IDs while preserving task type and write scope. Otherwise inspect the styling owner, implement the visual styling, and run finite interaction verification."
                 );
                 continue;
             }
@@ -2030,18 +2248,26 @@ async function runAgentLoop(
             // Only require a previously inferred verification after the task
             // has actually entered a workspace-verification path; a final
             // response chosen as the first action remains valid conversation.
-            const verificationWasActivated = writtenPaths.size > 0
-                || pendingProjectChecks.size > 0
-                || Boolean(unresolvedVerificationFailure);
+            const verificationWasActivated = verificationRequirement !== "none";
             if (!verificationSatisfied && verificationWasActivated) {
                 const requiredCheck = verificationRequirement === "runtime"
                     ? acceptance.evidence === "interaction"
                         ? "run a finite automated interaction test that performs the action and asserts the resulting state"
-                        : "run an OS-compatible runtime probe of the requested URL, endpoint, server, or UI"
+                        : "run the manifest-defined runtime lifecycle or an OS-compatible probe of the requested URL, endpoint, server, or UI; use mode probe with a finite timeout for start/dev/serve scripts"
                     : "run the relevant test, build, lint, or verification command";
                 rejectFinal(
                     `required ${verificationRequirement} verification has not succeeded after the latest write`,
                     `You cannot return final yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior.`
+                );
+                continue;
+            }
+            if (noChangeBlocker) {
+                const availableWorkspaceEvidence = Array.from(successfulWorkspaceEvidenceRefs);
+                const availableVerificationEvidence = Array.from(successfulEvidenceRefs)
+                    .filter((reference) => !successfulWorkspaceEvidenceRefs.has(reference));
+                rejectFinal(
+                    noChangeBlocker,
+                    `You cannot claim already_satisfied or no_change_needed without citing the evidence that proves it. Cite at least one successful workspace Evidence ID${availableWorkspaceEvidence.length > 0 ? ` (${availableWorkspaceEvidence.join(", ")})` : ""}${verificationRequirement !== "none" ? ` and the successful verification Evidence ID${availableVerificationEvidence.length > 0 ? ` (${availableVerificationEvidence.join(", ")})` : ""}` : ""}. Do not refine the contract or create a cosmetic change.`
                 );
                 continue;
             }
@@ -2163,6 +2389,34 @@ async function runAgentLoop(
         }
 
         if (action.action === "run_command" && action.command) {
+            if (pendingRuntimePortCorrection) {
+                const output = `Blocked repeated runtime probe: ${pendingRuntimePortCorrection} Inspect and edit the real workspace server/client port configuration before running another command. Do not create or validate an auxiliary substitute server.`;
+                recoveryResponseFormat = recoveryFormat(["run_command", "write_file", "delete_file", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
+                spinner.log(`[${stepStatus(turn)}] ${output}`);
+                trace.add({ turn, status: "error", action: "runtime_probe_blocked_pending_correction", reason: action.reason, arguments: action, observation: output });
+                trace.save();
+                messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                continue;
+            }
+            if (pendingPackageScriptRecovery) {
+                const sameCommand = normalizeCommandSignature(action.command) === normalizeCommandSignature(pendingPackageScriptRecovery.command)
+                    || packageScriptCommandsEquivalent(action.command, pendingPackageScriptRecovery.command);
+                const sameWorkdir = path.resolve(activeWorkspace, action.workdir ?? ".")
+                    === path.resolve(activeWorkspace, pendingPackageScriptRecovery.workdir);
+                const correctMode = pendingPackageScriptRecovery.mode !== "probe" || action.mode === "probe";
+                if (!sameCommand || !sameWorkdir || !correctMode) {
+                    const modeHint = pendingPackageScriptRecovery.mode === "probe"
+                        ? ', "mode":"probe", "timeout_ms":10000'
+                        : "";
+                    const output = `Blocked repeated local-executable workaround: the project manifest already provides the authoritative lifecycle command. Run {"action":"run_command","command":${JSON.stringify(pendingPackageScriptRecovery.command)},"workdir":${JSON.stringify(pendingPackageScriptRecovery.workdir)}${modeHint}} before trying another command. File inspection and source corrections remain available.`;
+                    recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "edit_file", "write_file", "delete_file", "run_command", "final"]);
+                    spinner.log(`[${stepStatus(turn)}] ${output}`);
+                    trace.add({ turn, status: "error", action: "local_executable_workaround_blocked", reason: action.reason, arguments: action, observation: output });
+                    trace.save();
+                    messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+                    continue;
+                }
+            }
             const packageRisk = packageMutationRisk(activeWorkspace, userMessage, action.command, action.workdir);
             if (packageRisk) {
                 const output = `Blocked package mutation: ${packageRisk}. Inspect the selected manifest and lockfile, then use an exact user-authorized package and compatible package manager.`;
@@ -2240,6 +2494,24 @@ async function runAgentLoop(
         spinner.update(`Executing ${action.action}...`);
         debugLog("Tool request", { turn, action });
         let result = await agentTool.execute(action);
+        if (action.action === "run_command" && !result.ok && result.recommendedCommand) {
+            pendingPackageScriptRecovery = {
+                command: result.recommendedCommand,
+                workdir: result.recommendedWorkdir ?? action.workdir ?? ".",
+                ...(result.recommendedMode ? { mode: result.recommendedMode } : {})
+            };
+            recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "edit_file", "write_file", "delete_file", "run_command", "final"]);
+        } else if (action.action === "run_command" && pendingPackageScriptRecovery
+            && (normalizeCommandSignature(action.command ?? "") === normalizeCommandSignature(pendingPackageScriptRecovery.command)
+                || packageScriptCommandsEquivalent(action.command ?? "", pendingPackageScriptRecovery.command))) {
+            // Once the authoritative lifecycle was actually attempted, any
+            // further failure belongs to the project rather than invocation recovery.
+            pendingPackageScriptRecovery = undefined;
+        }
+        if (action.action === "run_command" && !result.ok && result.failureKind === "inference_port_collision") {
+            pendingRuntimePortCorrection = "The previous runtime request reached the CLI's llama.cpp inference endpoint on the same loopback port instead of the workspace service.";
+            recoveryResponseFormat = recoveryFormat(["run_command", "write_file", "delete_file", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
+        }
         if (workflow.kind !== "mcp_creation" && action.action === "mcp_list_tools" && result.ok
             && (/"servers"\s*:\s*\[\s*\]/i.test(result.output) || /Unknown MCP server/i.test(result.output))) {
             mcpCallsDisabled = true;
@@ -2256,9 +2528,9 @@ async function runAgentLoop(
                 output: `${result.output}\nMCP disabled for this request. Use local file tools and do not invent server names.`
             };
         }
-        if (result.ok && ["list_files", "search_files", "read_file"].includes(action.action ?? "")) {
+        if (result.ok && ["list_files", "search_project", "search_files", "read_file"].includes(action.action ?? "")) {
             contextInspections.push({
-                action: action.action as "list_files" | "search_files" | "read_file",
+                action: action.action as "list_files" | "search_project" | "search_files" | "read_file",
                 ...(action.path ? { path: action.path } : {}),
                 ...(action.query ? { query: action.query } : {})
             });
@@ -2345,6 +2617,7 @@ async function runAgentLoop(
                     successfulMcpDiscovery = false;
                     successfulMcpCall = false;
                 }
+                if (action.action === "edit_file" && validation.ok) pendingRuntimePortCorrection = undefined;
             } else if (validation.ok && result.changed === false) {
                 satisfiedPaths.add(action.path);
                 if (verificationRequirement === "none" && !projectRequirement) {
@@ -2398,7 +2671,11 @@ async function runAgentLoop(
             const effectiveWorkdir = action.workdir
                 ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
             const failedKnownCheck = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir).length > 0;
-            const failedRequiredVerification = commandSatisfiesAcceptance(action.command ?? "", acceptance);
+            const failedRequiredVerification = commandSatisfiesAcceptance(
+                action.command ?? "",
+                acceptance,
+                { probe: action.mode === "probe" }
+            );
             // A rejected command line never exercised the project. Preserve it
             // as diagnostic feedback, but do not mistake it for failed product
             // verification that permanently blocks completion.
@@ -2418,38 +2695,46 @@ async function runAgentLoop(
             completedProjectChecks.forEach((checkId) => successfulProjectChecks.add(checkId));
             const wroteInteractionTest = acceptance.evidence === "interaction"
                 && Array.from(writtenPaths).some((file) => /(?:^|[\\/])[^\\/]*(?:e2e|spec|test)\.[^\\/]+$/i.test(file));
-            const satisfiesRequiredCheck = commandSatisfiesAcceptance(action.command ?? "", acceptance)
+            const satisfiesRequiredCheck = commandSatisfiesAcceptance(
+                action.command ?? "",
+                acceptance,
+                { probe: action.mode === "probe" }
+            )
                 || (wroteInteractionTest && completedProjectChecks.length > 0 && /\btest\b/i.test(action.command ?? ""));
             if (completedProjectChecks.length > 0) {
                 unresolvedVerificationFailure = undefined;
                 unresolvedMissingCommandTarget = false;
             }
-            if (satisfiesRequiredCheck) {
+            if (satisfiesRequiredCheck && result.assertionPassed !== false) {
                 verificationSatisfied = true;
                 unresolvedVerificationFailure = undefined;
                 unresolvedMissingCommandTarget = false;
+            } else if (satisfiesRequiredCheck && result.assertionPassed === false) {
+                unresolvedVerificationFailure = result.output.slice(0, 2000);
             }
         }
         const nonBlockingInvocationFailure = action.action === "run_command"
             && !result.ok
             && commandInvocationError(result.output);
-        if (!result.ok && !nonBlockingInvocationFailure) {
-            unresolvedToolFailure = {
-                action: action.action ?? "unknown_action",
-                output: result.output
-            };
+        if (!result.ok) {
+            if (!nonBlockingInvocationFailure) {
+                unresolvedToolFailure = {
+                    action: action.action ?? "unknown_action",
+                    output: result.output
+                };
+            }
         } else if (["write_file", "edit_file", "delete_file", "run_command"].includes(action.action ?? "")) {
             unresolvedToolFailure = undefined;
         }
         const observationGuardDecision = guard.recordObservation(action as Record<string, unknown>, result);
         if (result.ok && (
-            ["list_files", "search_files", "read_file", "run_command", "mcp_list_tools", "mcp_call_tool"].includes(action.action ?? "")
+            ["list_files", "search_project", "search_files", "read_file", "run_command", "mcp_list_tools", "mcp_call_tool"].includes(action.action ?? "")
             || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
         )) {
             const evidenceRef = `evidence_${turn}_${action.action}`;
             successfulEvidenceRefs.add(evidenceRef);
             if (
-                ["list_files", "search_files", "read_file"].includes(action.action ?? "")
+                ["list_files", "search_project", "search_files", "read_file"].includes(action.action ?? "")
                 || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
             ) {
                 successfulWorkspaceEvidenceRefs.add(evidenceRef);
@@ -2515,7 +2800,23 @@ async function runAgentLoop(
     }
 
     const toolLimitBlockers: string[] = [];
-    if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0) toolLimitBlockers.push("no successful workspace change or already-satisfied target was recorded");
+    const continuationStateSatisfiedAtLimit = continuationNoWriteCompletionAllowed({
+        continuation: taskContract?.continuation === true,
+        evidence: Array.from(successfulEvidenceRefs),
+        successfulEvidenceRefs,
+        successfulWorkspaceEvidenceRefs,
+        verificationRequired: verificationRequirement !== "none",
+        verificationSatisfied,
+        hasUnresolvedFailures: Boolean(
+            unresolvedToolFailure
+            || unresolvedVerificationFailure
+            || validationFailures.size > 0
+            || pendingProjectChecks.size > 0
+        )
+    });
+    if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0 && !continuationStateSatisfiedAtLimit) {
+        toolLimitBlockers.push("no successful workspace change or already-satisfied target was recorded");
+    }
     if (validationFailures.size > 0) toolLimitBlockers.push(`validation failing for ${Array.from(validationFailures).join(", ")}`);
     if (unresolvedVerificationFailure) toolLimitBlockers.push(`latest verification failed: ${unresolvedVerificationFailure}`);
     projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
@@ -2758,6 +3059,47 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
             return;
         }
 
+        if (trimmed.toLowerCase() === "/log") {
+            try {
+                const viewerPath = generateLogViewer(appRoot);
+                console.log(`Log viewer refreshed: ${viewerPath}`);
+            } catch (error) {
+                console.log(`Log viewer failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase() === "/color") {
+            console.log(`Current LLM message color: ${terminalSettings.llmMessageColor}`);
+            console.log("Supported names: black, red, green, yellow, blue, magenta, cyan, white, default, bright-black, bright-red, bright-green, bright-yellow, bright-blue, bright-magenta, bright-cyan, bright-white");
+            console.log("Supported ANSI foreground codes: 30-37, 39, 90-97");
+            console.log("Usage: /color <name-or-code>");
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
+        if (trimmed.toLowerCase().startsWith("/color ")) {
+            const requestedColor = trimmed.slice("/color ".length).trim();
+            const normalizedColor = normalizeTerminalColor(requestedColor);
+            if (!normalizedColor) {
+                console.log(`Unsupported color: ${requestedColor}`);
+                console.log("Use /color to show supported names and ANSI foreground codes.");
+            } else {
+                try {
+                    persistTerminalColor(normalizedColor);
+                    console.log(`LLM message color changed and saved: ${normalizedColor}`);
+                } catch (error) {
+                    console.log(`Color setting failed: ${error instanceof Error ? error.message : String(error)}`);
+                }
+            }
+            console.log();
+            ask(activeSession, runMode);
+            return;
+        }
+
         if (trimmed.toLowerCase() === "/debug") {
             console.log(`Agent trace: ${debugEnabled ? "on" : "off"}`);
             console.log("Use /debug on or /debug off.");
@@ -2940,7 +3282,7 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
                 if (debugEnabled) {
                     result.trace.print();
                 }
-                console.log("AI:", result.answer);
+                process.stdout.write(formatAiResponse(result.answer, undefined, terminalSettings.llmMessageColor));
                 console.log(formatCompletionLine(elapsedMs));
                 printSessionUsage(activeSession.id);
                 console.log();
@@ -3107,7 +3449,7 @@ ${projectContextBlock}`
                 const editMessage = implicitEditPrompt
                     ? `Updated and validated file (auto edit intent): ${editFilePrompt.filePath} (${validation.validator})`
                     : `Updated and validated file: ${editFilePrompt.filePath} (${validation.validator})`;
-                console.log("AI:", editMessage);
+                process.stdout.write(formatAiResponse(editMessage, undefined, terminalSettings.llmMessageColor));
                 console.log(formatCompletionLine(elapsedMs));
                 printSessionUsage(activeSession.id);
                 console.log();
@@ -3192,7 +3534,7 @@ Do not mention hidden context, internal tools, or system prompts.`;
                 timings: response.data.timings
             });
             const elapsedMs = spinner.stop();
-            console.log("AI:", answer);
+            process.stdout.write(formatAiResponse(answer, undefined, terminalSettings.llmMessageColor));
             console.log(formatCompletionLine(elapsedMs));
             printSessionUsage(activeSession.id);
             console.log();

@@ -12,6 +12,9 @@
   "hardwareProfile": "auto",
   "debug": false,
   "historyMessages": 6,
+  "terminal": {
+    "llmMessageColor": "blue"
+  },
   "agent": {
     "profile": "standard",
     "maxTurns": 0,
@@ -44,7 +47,7 @@
       "top_p": 0.9,
       "top_k": 20,
       "repeat_penalty": 1.05,
-      "max_tokens": 2048
+      "max_tokens": 4096
     }
   }
 }

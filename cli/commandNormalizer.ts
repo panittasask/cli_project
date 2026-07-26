@@ -151,6 +151,17 @@ function packageScriptRequest(command: string): string | undefined {
     return requested;
 }
 
+function packageScriptCommandsEquivalent(left: string, right: string): boolean {
+    const leftNormalized = normalizeCommandSignature(left);
+    const rightNormalized = normalizeCommandSignature(right);
+    const leftManager = leftNormalized.match(/^(npm|pnpm|yarn|bun)(?:\.cmd)?\b/)?.[1];
+    const rightManager = rightNormalized.match(/^(npm|pnpm|yarn|bun)(?:\.cmd)?\b/)?.[1];
+    if (!leftManager || leftManager !== rightManager) return false;
+    const leftScript = packageScriptRequest(leftNormalized);
+    const rightScript = packageScriptRequest(rightNormalized);
+    return Boolean(leftScript && leftScript === rightScript);
+}
+
 function commandExecutable(command: string): string | undefined {
     const normalized = normalizeCommandSignature(command);
     const tokens = normalized.split(/\s+/).filter(Boolean);
@@ -274,10 +285,183 @@ function projectRootSummary(workspace: string, relativeDirectory: string): strin
     return `${relativeDirectory}: scripts=[${scripts.join(", ") || "none"}], structural-config=[${configs.join(", ") || "none"}], lockfiles=[${locks.join(", ") || "none"}]`;
 }
 
-function commandFailureGuidance(workspace: string, command: string, errorOutput: string): string {
+type CommandFailureKind = "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
+
+type PackageScriptRecovery = {
+    command: string;
+    executable: string;
+    scriptName: string;
+    workdir: string;
+    mode?: "probe";
+};
+
+function packageManagerFor(directory: string): "npm" | "pnpm" | "yarn" | "bun" {
+    if (fs.existsSync(path.join(directory, "pnpm-lock.yaml"))) return "pnpm";
+    if (fs.existsSync(path.join(directory, "yarn.lock"))) return "yarn";
+    if (fs.existsSync(path.join(directory, "bun.lock")) || fs.existsSync(path.join(directory, "bun.lockb"))) return "bun";
+    return "npm";
+}
+
+function missingExecutableCandidates(command: string, errorOutput: string): string[] {
+    const candidates = new Set<string>();
+    const add = (candidate?: string): void => {
+        if (!candidate) return;
+        const basename = candidate
+            .replace(/^["'`]+|["'`]+$/g, "")
+            .replace(/\\/g, "/")
+            .split("/")
+            .filter(Boolean)
+            .at(-1)
+            ?.replace(/\.cmd$/i, "")
+            .toLowerCase();
+        if (basename && /^[\w@.+-]+$/.test(basename)) candidates.add(basename);
+    };
+
+    for (const match of errorOutput.matchAll(/\bthe term\s+['"`]([^'"`]+)['"`]\s+is not recognized/gi)) add(match[1]);
+    for (const match of errorOutput.matchAll(/(?:^|[\r\n])\s*([@\w.+-]+)\s*:\s*the term\s+['"`][^'"`]+['"`]\s+is not recognized/gim)) add(match[1]);
+    for (const match of errorOutput.matchAll(/\b([@\w.+-]+)\s+not found\b/gi)) add(match[1]);
+    for (const match of `${command}\n${errorOutput}`.matchAll(/node_modules[\\/]\.bin[\\/]([@\w.+-]+)/gi)) add(match[1]);
+
+    const normalized = normalizeCommandSignature(command);
+    const startProcess = normalized.match(/\bstart-process\s+(?:-filepath\s+)?["'`]?([^\s"'`;]+)/i);
+    if (startProcess) add(startProcess[1]);
+    add(commandExecutable(command));
+    return Array.from(candidates);
+}
+
+function packageScriptRecovery(
+    workspace: string,
+    command: string,
+    errorOutput: string,
+    requestedWorkdir?: string
+): PackageScriptRecovery | undefined {
+    const plain = errorOutput.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    const missingExecutableFailure = /\bcommandnotfoundexception\b|\bthe term\s+['"`][^'"`]+['"`]\s+is not recognized|\bcommand not found\b|\bcould not determine executable\b/i.test(plain)
+        || /\bstart-process\b[\s\S]{0,400}\b(?:cannot find the file specified|file specified cannot be found)\b/i.test(plain)
+        || /\bnpm error code enoent\b[\s\S]{0,600}\bnode_modules[\\/]\.bin[\\/]/i.test(plain)
+        || /\b[^\s]+\s+not found\b/i.test(plain);
+    if (!missingExecutableFailure) return undefined;
+
+    const executables = missingExecutableCandidates(command, plain);
+    if (executables.length === 0) return undefined;
+
+    const requestedDirectory = requestedWorkdir?.trim()
+        ? path.resolve(workspace, requestedWorkdir)
+        : path.resolve(workspace);
+    const manifestDirectories = Array.from(new Set([
+        requestedDirectory,
+        ...findManifestDirectories(workspace, "package.json", 30)
+    ])).filter((directory) => {
+        const relative = path.relative(workspace, directory);
+        return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    });
+
+    const matches: Array<PackageScriptRecovery & { directory: string }> = [];
+    for (const directory of manifestDirectories) {
+        const scripts = readPackageScripts(directory);
+        for (const [scriptName, scriptCommand] of Object.entries(scripts)) {
+            const normalizedScript = normalizeCommandSignature(scriptCommand).replace(/\\/g, "/");
+            for (const executable of executables) {
+                const escaped = executable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const executablePattern = new RegExp(
+                    `(?:^|[\\s;&|])(?:\\.?/?node_modules/\\.bin/)?${escaped}(?:\\.cmd)?(?=\\s|$)`,
+                    "i"
+                );
+                if (!executablePattern.test(normalizedScript)) continue;
+                const manager = packageManagerFor(directory);
+                matches.push({
+                    command: manager === "npm" && scriptName === "start"
+                        ? "npm start"
+                        : `${manager} run ${scriptName}`,
+                    directory,
+                    executable,
+                    scriptName,
+                    workdir: path.relative(workspace, directory) || ".",
+                    ...(/^(?:start|dev|serve|watch)$/i.test(scriptName) ? { mode: "probe" as const } : {})
+                });
+            }
+        }
+    }
+
+    const requestedMatches = matches.filter((match) => path.resolve(match.directory) === path.resolve(requestedDirectory));
+    const relevant = requestedMatches.length > 0 ? requestedMatches : matches;
+    const unique = Array.from(new Map(
+        relevant.map((match) => [`${match.workdir}\0${match.scriptName}\0${match.executable}`, match])
+    ).values());
+    const selected = unique.length === 1 ? unique[0] : undefined;
+    if (!selected) return undefined;
+    return {
+        command: selected.command,
+        executable: selected.executable,
+        scriptName: selected.scriptName,
+        workdir: selected.workdir,
+        ...(selected.mode ? { mode: selected.mode } : {})
+    };
+}
+
+function loopbackPort(rawUrl: string): number | undefined {
+    try {
+        const parsed = new URL(rawUrl);
+        if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(parsed.hostname.toLowerCase())) return undefined;
+        if (parsed.port) return Number(parsed.port);
+        return parsed.protocol === "https:" ? 443 : parsed.protocol === "http:" ? 80 : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function commandFailureKind(command: string, errorOutput: string, inferenceApiUrl?: string): CommandFailureKind {
+    const plain = errorOutput.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    const inferencePort = inferenceApiUrl ? loopbackPort(inferenceApiUrl) : undefined;
+    const targetPorts = `${command}\n${plain}`.match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?(?:\/[^\s"'`]*)?/gi)
+        ?.flatMap((candidate) => {
+            const port = loopbackPort(candidate);
+            return port === undefined ? [] : [port];
+        }) ?? [];
+    const llamaNotFound = /\bfile not found\b[\s\S]{0,240}\bnot_found_error\b|\bnot_found_error\b[\s\S]{0,240}\b404\b/i.test(plain);
+    if (inferencePort !== undefined && targetPorts.includes(inferencePort) && llamaNotFound) return "inference_port_collision";
+    if (commandInvocationError(plain)
+        || /invoke-webrequest\s*:\s*cannot bind parameter ['"]headers['"]/i.test(plain)
+        || /missing ['"]?=['"]? operator after key in hash literal/i.test(plain)
+        || /the token ['"]&&['"] is not a valid statement separator/i.test(plain)
+        || /start-sleep\s*:\s*the input object cannot be bound/i.test(plain)) return "invocation";
+    if (/etimedout|timed out|timeout/.test(plain.toLowerCase())) return "timeout";
+    if (/blocked unsafe command|blocked interactive command|unsupported unix command|unsupported nested powershell/i.test(plain)) return "unsafe";
+    return "runtime";
+}
+
+function commandFailureGuidance(
+    workspace: string,
+    command: string,
+    errorOutput: string,
+    inferenceApiUrl?: string,
+    requestedWorkdir?: string
+): string {
     const normalized = normalizeCommandSignature(command);
     const error = errorOutput.toLowerCase();
     const retryRule = "Do not repeat the unchanged command. Change the source/configuration, command, or workdir before retrying.";
+    const failureKind = commandFailureKind(command, errorOutput, inferenceApiUrl);
+
+    if (failureKind === "inference_port_collision") {
+        const inferencePort = inferenceApiUrl ? loopbackPort(inferenceApiUrl) : undefined;
+        return `The response matches the active llama.cpp inference API, and the workspace runtime is targeting the same loopback port${inferencePort ? ` (${inferencePort})` : ""}. This is a port collision, not an application route or startup-delay bug. Inspect the real project server and client configuration, move them together to an unused project port, and rerun the actual project entrypoint. Do not retry URL/header variants or validate an auxiliary substitute server.`;
+    }
+
+    const scriptRecovery = packageScriptRecovery(workspace, command, errorOutput, requestedWorkdir);
+    if (scriptRecovery) {
+        const probeInstruction = scriptRecovery.mode === "probe"
+            ? ` with run_command mode "probe" and a finite timeout`
+            : "";
+        return `The unavailable executable '${scriptRecovery.executable}' is project-local and is already owned by package script '${scriptRecovery.scriptName}' in workdir '${scriptRecovery.workdir}'. Run '${scriptRecovery.command}'${probeInstruction} in that workdir. Do not invoke the executable directly, construct a node_modules/.bin path, or pass a binary path to npx. ${retryRule}`;
+    }
+
+    if (/invoke-webrequest\s*:\s*cannot bind parameter ['"]headers['"]/i.test(errorOutput)) {
+        return `PowerShell resolved the bare curl command to Invoke-WebRequest, so curl flags such as -H were parsed incorrectly. Use curl.exe for curl syntax or valid native Invoke-RestMethod parameters. This is a command invocation error; do not edit project source to preserve the invalid command. ${retryRule}`;
+    }
+
+    if (/the token ['"]&&['"] is not a valid statement separator/i.test(errorOutput)) {
+        return `This Windows PowerShell version does not support && as a statement separator. Use one finite PowerShell-compatible command or the project's existing package script. This is a command invocation error; do not edit project source merely to preserve the invalid shell syntax. ${retryRule}`;
+    }
 
     if (/etimedout|timed out|timeout/.test(error)) {
         return `The command timed out and its child process may have continued. Inspect generated files and dependency state before deciding whether another command is needed. ${retryRule}`;
@@ -311,6 +495,15 @@ function commandFailureGuidance(workspace: string, command: string, errorOutput:
 }
 
 function diagnosticRecoveryGuidance(errorOutput: string): string | undefined {
+    if (/invoke-webrequest\s*:\s*cannot bind parameter ['"]headers['"]/i.test(errorOutput)) {
+        return "The bare curl name resolved to PowerShell Invoke-WebRequest. Use curl.exe for curl flags, or use Invoke-RestMethod with native PowerShell parameter syntax.";
+    }
+    if (/the token ['"]&&['"] is not a valid statement separator/i.test(errorOutput)) {
+        return "The shell is Windows PowerShell and does not accept && here. Use a PowerShell-compatible finite command or an existing package script.";
+    }
+    if (/missing ['"]?=['"]? operator after key in hash literal/i.test(errorOutput)) {
+        return "The PowerShell hashtable syntax is invalid. Correct the command syntax instead of changing workspace source.";
+    }
     if (commandInvocationError(errorOutput)) {
         return "The command invocation itself is invalid or unsupported. Correct or remove the rejected command/option based on this error; do not edit project source or configuration merely to preserve the same invalid invocation.";
     }
@@ -331,6 +524,13 @@ function diagnosticRecoveryGuidance(errorOutput: string): string | undefined {
 function commandInvocationError(errorOutput: string): boolean {
     const plain = errorOutput.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
     return /\b(?:unknown|unrecognized|unsupported|invalid) (?:argument|option|flag|command)\b|\bunexpected argument\b|\brequires? (?:an? )?(?:argument|value)\b|\bcommand not found\b|\bis not recognized as (?:an internal|the name of)/i.test(plain)
+        || /\bthe term\s+['"`][^'"`]+['"`]\s+is not recognized as the name of\b/i.test(plain)
+        || /\bstart-process\b[\s\S]{0,400}\b(?:cannot find the file specified|file specified cannot be found)\b/i.test(plain)
+        || /\bnpm error code enoent\b[\s\S]{0,600}\bnode_modules[\\/]\.bin[\\/]/i.test(plain)
+        || /invoke-webrequest\s*:\s*cannot bind parameter ['"]headers['"]/i.test(plain)
+        || /missing ['"]?=['"]? operator after key in hash literal/i.test(plain)
+        || /the token ['"]&&['"] is not a valid statement separator/i.test(plain)
+        || /start-sleep\s*:\s*the input object cannot be bound/i.test(plain)
         // Angular CLI reports a bad positional project value using this shape
         // instead of the more common "invalid argument" wording.
         || /\binvalid values?\s*:[\s\S]{0,240}\bargument\s*:/i.test(plain)
@@ -342,14 +542,22 @@ function missingCommandTargetError(errorOutput: string): boolean {
     return /\bcannot\s+find[\s\S]{0,100}\btarget\b|\btarget\b[\s\S]{0,100}(?:does\s+not\s+exist|was\s+not\s+found)/i.test(plain);
 }
 
-function commandInteractiveRisk(command: string, workspace: string, workdir = "."): string | undefined {
+function commandInteractiveRisk(
+    command: string,
+    workspace: string,
+    workdir = ".",
+    options: { probe?: boolean } = {}
+): string | undefined {
     const normalized = normalizeCommandSignature(command);
 
-    if (/(?:^|\s)(?:--open|--headed|--ui)(?:=|\s|$)|\bcypress\s+open\b|\bplaywright\s+show-report\b|\b(?:start-process|invoke-item|explorer(?:\.exe)?|rundll32(?:\.exe)?)\b[^\r\n]*https?:\/\//.test(normalized)) {
+    const explicitBrowserFlag = /(?:^|\s)(?:--open|--headed|--ui)(?:=|\s|$)|\bcypress\s+open\b|\bplaywright\s+show-report\b/.test(normalized);
+    const directUrlLauncher = /\b(?:invoke-item|explorer(?:\.exe)?|rundll32(?:\.exe)?)\b[^;|\r\n]*https?:\/\//.test(normalized)
+        || /\bstart-process\b\s+(?:(?:-filepath)\s+)?(?:(?:["']?https?:\/\/)|(?:["']?(?:chrome|msedge|firefox)(?:\.exe)?\b))/.test(normalized);
+    if (explicitBrowserFlag || directUrlLauncher) {
         return "automatic browser launching is not allowed in agent run_command";
     }
 
-    if (/(?:^|\s)--watch(?:=|\s+)(?!false\b)|(?:^|\s)--watch(?:\s|$)|(?:^|\s)(?:serve|dev|watch)(?:\s|$)/.test(normalized)) {
+    if (!options.probe && /(?:^|\s)--watch(?:=|\s+)(?!false\b)|(?:^|\s)--watch(?:\s|$)|(?:^|\s)(?:serve|dev|watch)(?:\s|$)/.test(normalized)) {
         return "long-running serve/dev/watch commands are not allowed in agent run_command; use a finite build or non-watch test command";
     }
 
@@ -368,12 +576,12 @@ function commandInteractiveRisk(command: string, workspace: string, workdir = ".
 
     const scriptName = npmScript[1];
     if (!scriptName) return undefined;
-    if (["start", "dev", "serve", "watch"].includes(scriptName)) {
+    if (!options.probe && ["start", "dev", "serve", "watch"].includes(scriptName)) {
         return `package lifecycle '${scriptName}' is expected to be long-running; use a finite build or test script`;
     }
     const script = readPackageScripts(path.resolve(workspace, workdir))[scriptName];
     if (typeof script === "string") {
-        const scriptRisk = commandInteractiveRisk(script, workspace, workdir);
+        const scriptRisk = commandInteractiveRisk(script, workspace, workdir, options);
         if (scriptRisk) return `package script '${scriptName}' is interactive: ${scriptRisk}`;
     }
 
@@ -400,7 +608,7 @@ function packageLifecycleRoleChanges(beforeContent: string, afterContent: string
         if (/\b(?:serve|server|dev|start|watch)\b/.test(normalized)) return "runtime";
         if (/\b(?:build|bundle|compile)\b/.test(normalized)) return "build";
         if (/\b(?:test|spec)\b/.test(normalized)) return "test";
-        if (/\b(?:lint|typecheck|type-check|check-types)\b/.test(normalized)) return "analysis";
+        if (/\b(?:lint|typecheck|type-check|check-types|tsc)\b/.test(normalized)) return "analysis";
         return undefined;
     };
     try {
@@ -525,6 +733,7 @@ function packageMutationRisk(workspace: string, userMessage: string, command: st
 
 module.exports = {
     commandFailureGuidance,
+    commandFailureKind,
     commandInvocationError,
     diagnosticRecoveryGuidance,
     commandInteractiveRisk,
@@ -540,6 +749,8 @@ module.exports = {
     packageMutationRisk,
     parsePackageMutation,
     packageContentAddsBrowserAutoOpen,
+    packageScriptCommandsEquivalent,
+    packageScriptRecovery,
     resolveCommandWorkdir,
     unwrapWindowsPowerShellCommand
 };

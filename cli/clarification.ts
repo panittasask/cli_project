@@ -1,7 +1,7 @@
 type ClarificationOption = import("./clarificationTypes").ClarificationOption;
 type ClarificationRequest = import("./clarificationTypes").ClarificationRequest;
 type ClarificationAnswer = import("./clarificationTypes").ClarificationAnswer;
-type ClarificationInspection = { action: "list_files" | "search_files" | "read_file"; path?: string; query?: string };
+type ClarificationInspection = { action: "list_files" | "search_project" | "search_files" | "read_file"; path?: string; query?: string };
 
 function normalizeClarificationRequest(
     question: unknown,
@@ -112,7 +112,7 @@ function relevantClarificationInspections(input: {
         const overlapsQuestion = questionTerms.some((term) => evidence.includes(term));
         if (input.decision === "preference") return false;
         if (input.decision === "target") {
-            return inspection.action === "list_files" || manifestOrConfig.test(inspection.path ?? "") || overlapsQuestion;
+            return inspection.action === "list_files" || inspection.action === "search_project" || manifestOrConfig.test(inspection.path ?? "") || overlapsQuestion;
         }
         if (input.decision === "compatibility") {
             return manifestOrConfig.test(inspection.path ?? "")
@@ -120,7 +120,7 @@ function relevantClarificationInspections(input: {
                 || overlapsQuestion;
         }
         if (input.decision === "destructive") {
-            return inspection.action === "read_file" || inspection.action === "list_files" || overlapsQuestion;
+            return inspection.action === "read_file" || inspection.action === "list_files" || inspection.action === "search_project" || overlapsQuestion;
         }
         if (input.decision === "scope") {
             return manifestOrConfig.test(inspection.path ?? "")
@@ -150,7 +150,7 @@ function clarificationBlockReason(input: {
         return "Clarifications are disabled by the effective agent settings. Continue only with safe, reversible actions supported by workspace evidence.";
     }
     if (input.requireInspection && input.workspaceMutationRequired && input.successfulInspections === 0) {
-        return "Inspect the workspace before asking. Use list_files, search_files, or read_file to resolve project structure and existing conventions first.";
+        return "Inspect the workspace before asking. Use search_project, list_files, search_files, or read_file to resolve project structure and existing conventions first.";
     }
     if (input.asksNewVersusExisting && input.knownProjectRoots === 1) {
         return "One project root is already known. Use that existing project unless the user explicitly requested a separate project.";

@@ -35,6 +35,11 @@ function formatSpinnerLine(
     return `${prefix}${visibleMessage}${separator}${timing}`;
 }
 
+function formatSpinnerLog(message: string): string {
+    const endsAgentStep = /^\[step \d+(?:\/\d+)?\]/.test(message);
+    return `${message}\n${endsAgentStep ? "\n" : ""}`;
+}
+
 class Spinner {
     private readonly frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     private timer: NodeJS.Timeout | undefined;
@@ -91,7 +96,7 @@ class Spinner {
             process.stdout.write("\r\x1b[K");
         }
 
-        process.stdout.write(`${message}\n`);
+        process.stdout.write(formatSpinnerLog(message));
     }
 
     private render(now: number): void {
@@ -110,5 +115,6 @@ module.exports = {
     Spinner,
     formatCompletionLine,
     formatElapsedTime,
+    formatSpinnerLog,
     formatSpinnerLine
 };

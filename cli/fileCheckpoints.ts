@@ -1,5 +1,9 @@
 import fs = require("node:fs");
 import path = require("node:path");
+const { colorDiffLine, terminalColorsEnabled } = require("./terminalStyle") as {
+    colorDiffLine: (line: string, colors?: boolean) => string;
+    terminalColorsEnabled: () => boolean;
+};
 
 type Checkpoint = { id: string; workspace: string; relativePath: string; existed: boolean; content: string; createdAt: number };
 
@@ -54,7 +58,13 @@ class FileCheckpointStore {
     }
 }
 
-function formatDiffPreview(before: string, after: string, label: string, maxLines = 12): string {
+function formatDiffPreview(
+    before: string,
+    after: string,
+    label: string,
+    maxLines = 12,
+    colors = terminalColorsEnabled()
+): string {
     const oldLines = before.split(/\r?\n/);
     const newLines = after.split(/\r?\n/);
     let prefix = 0;
@@ -66,8 +76,12 @@ function formatDiffPreview(before: string, after: string, label: string, maxLine
     const added = newLines.slice(prefix, newEnd + 1).map((line) => `+ ${line}`);
     const changed = [...removed, ...added];
     const visible = changed.slice(0, maxLines);
-    const suffix = changed.length > maxLines ? `\n… ${changed.length - maxLines} more changed lines` : "";
-    return `Diff preview: ${label} (-${removed.length} +${added.length})\n${visible.join("\n") || "(no content change)"}${suffix}`;
+    const suffix = changed.length > maxLines ? `… ${changed.length - maxLines} more changed lines` : "";
+    return [
+        `Diff preview: ${label} (-${removed.length} +${added.length})`,
+        ...(visible.length > 0 ? visible : ["(no content change)"]),
+        suffix
+    ].filter(Boolean).map((line) => colorDiffLine(line, colors)).join("\n");
 }
 
 module.exports = { FileCheckpointStore, formatDiffPreview };

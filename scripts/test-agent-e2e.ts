@@ -7,8 +7,9 @@ const { runAgentCliHarness } = require("./agent-cli-harness") as {
     runAgentCliHarness: (options: Record<string, unknown>) => Promise<{ output: string; stderr: string; exitCode: number }>;
 };
 
-async function mockModel(actions: Array<Record<string, unknown>>): Promise<{ url: string; close: () => Promise<void> }> {
+async function mockModel(actions: Array<Record<string, unknown>>): Promise<{ url: string; requestedMaxTokens: number[]; close: () => Promise<void> }> {
     let actionIndex = 0;
+    const requestedMaxTokens: number[] = [];
     const server = http.createServer((request, response) => {
         if (request.method === "GET" && request.url === "/v1/models") {
             response.setHeader("content-type", "application/json");
@@ -21,13 +22,35 @@ async function mockModel(actions: Array<Record<string, unknown>>): Promise<{ url
             return;
         }
         if (request.method === "POST" && request.url === "/v1/chat/completions") {
-            request.resume();
-            const action = actions[actionIndex++];
-            response.setHeader("content-type", "application/json");
-            response.end(JSON.stringify({
-                choices: [{ message: { content: JSON.stringify(action ?? { action: "final", answer: "Unexpected extra turn" }) }, finish_reason: "stop" }],
-                usage: { prompt_tokens: 50, completion_tokens: 20, total_tokens: 70 }
-            }));
+            let body = "";
+            request.setEncoding("utf8");
+            request.on("data", (chunk) => { body += chunk; });
+            request.on("end", () => {
+                const payload = JSON.parse(body) as { max_tokens?: number };
+                requestedMaxTokens.push(Number(payload.max_tokens ?? 0));
+                const scripted = actions[actionIndex++];
+                const explicit = scripted?.__modelResponse as {
+                    content?: string;
+                    reasoning_content?: string;
+                    finish_reason?: string;
+                    completion_tokens?: number;
+                } | undefined;
+                const content = explicit
+                    ? explicit.content ?? ""
+                    : JSON.stringify(scripted ?? { action: "final", answer: "Unexpected extra turn" });
+                const completionTokens = explicit?.completion_tokens ?? 20;
+                response.setHeader("content-type", "application/json");
+                response.end(JSON.stringify({
+                    choices: [{
+                        message: {
+                            content,
+                            ...(explicit?.reasoning_content ? { reasoning_content: explicit.reasoning_content } : {})
+                        },
+                        finish_reason: explicit?.finish_reason ?? "stop"
+                    }],
+                    usage: { prompt_tokens: 50, completion_tokens: completionTokens, total_tokens: 50 + completionTokens }
+                }));
+            });
             return;
         }
         response.statusCode = 404;
@@ -38,6 +61,7 @@ async function mockModel(actions: Array<Record<string, unknown>>): Promise<{ url
     if (!address || typeof address === "string") throw new Error("Mock server did not bind a TCP port.");
     return {
         url: `http://127.0.0.1:${address.port}/v1/chat/completions`,
+        requestedMaxTokens,
         close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     };
 }
@@ -48,7 +72,7 @@ async function runScenario(
     setup: (root: string) => void,
     answers: string[] = [],
     task?: Record<string, unknown>
-): Promise<{ root: string; output: string }> {
+): Promise<{ root: string; output: string; requestedMaxTokens: number[] }> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cli-agent-e2e-"));
     setup(root);
     const mutatesWorkspace = actions.some((action) => ["write_file", "edit_file", "delete_file"].includes(String(action.action)));
@@ -58,25 +82,70 @@ async function runScenario(
     const firstTask = task ?? {
         intent: "Complete the requested workspace task",
         task_type: mutatesWorkspace ? "coding" : "general",
+        continuation: false,
         requires_workspace_changes: mutatesWorkspace,
         verification: interaction ? "interaction" : "none",
         evidence_requirements: [interaction ? "interaction" : "source"],
         success_criteria: ["The requested observable result is complete"]
     };
-    const scriptedActions = actions.map((action, index) => index === 0 && !action.task
-        ? { ...action, task: firstTask }
-        : action);
+    let taskAttached = false;
+    const scriptedActions = actions.map((action) => {
+        if (action.__modelResponse || taskAttached) return action;
+        if (action.task) {
+            taskAttached = true;
+            return action;
+        }
+        taskAttached = true;
+        return { ...action, task: firstTask };
+    });
     const mock = await mockModel(scriptedActions);
     try {
         const result = await runAgentCliHarness({ appRoot: root, workspace: root, apiUrl: mock.url, prompt, clarificationAnswers: answers, timeoutMs: 15_000 });
         assert.equal(result.exitCode, 0, result.stderr);
-        return { root, output: result.output };
+        return { root, output: result.output, requestedMaxTokens: mock.requestedMaxTokens };
     } finally {
         await mock.close();
     }
 }
 
 async function main(): Promise<void> {
+    const reasoningOnlyRecovery = await runScenario([
+        {
+            __modelResponse: {
+                content: "",
+                reasoning_content: "I should inspect the requested evidence before returning one action.",
+                finish_reason: "length",
+                completion_tokens: 4096
+            }
+        },
+        { action: "read_file", path: "README.md", reason: "Inspect the requested evidence." },
+        { action: "final", answer: "Recovered after reasoning-only truncation.", reason: "The requested evidence was inspected." }
+    ], "อ่าน README.md แล้วสรุป", (root) => {
+        fs.writeFileSync(path.join(root, "README.md"), "Recovery evidence.\n", "utf8");
+    });
+    try {
+        assert.match(reasoningOnlyRecovery.output, /reasoning-only model response reached completion limit before action JSON/);
+        assert.match(reasoningOnlyRecovery.output, /AI:\s+Recovered after reasoning-only truncation/);
+        assert.deepEqual(reasoningOnlyRecovery.requestedMaxTokens, [4096, 8192, 4096]);
+    } finally {
+        fs.rmSync(reasoningOnlyRecovery.root, { recursive: true, force: true });
+    }
+
+    const repeatedReasoningOnly = await runScenario(Array.from({ length: 3 }, () => ({
+        __modelResponse: {
+            content: "",
+            reasoning_content: "The model continued reasoning without producing its action object.",
+            finish_reason: "length",
+            completion_tokens: 4096
+        }
+    })), "ตรวจ workspace แล้วตอบผล", () => undefined);
+    try {
+        assert.match(repeatedReasoningOnly.output, /stopped safely after 2 reasoning-only recovery retries/);
+        assert.deepEqual(repeatedReasoningOnly.requestedMaxTokens, [4096, 8192, 8192]);
+    } finally {
+        fs.rmSync(repeatedReasoningOnly.root, { recursive: true, force: true });
+    }
+
     const mutation = await runScenario([
         { action: "list_files", path: ".", reason: "Inspect the workspace first." },
         { action: "write_file", path: "hello.txt", content: "hello e2e\n", reason: "Create the requested file." },
@@ -85,7 +154,7 @@ async function main(): Promise<void> {
     try {
         assert.equal(fs.readFileSync(path.join(mutation.root, "hello.txt"), "utf8"), "hello e2e\n");
         assert.doesNotMatch(mutation.output, /AI needs clarification/);
-        assert.match(mutation.output, /AI: สร้าง hello\.txt เรียบร้อยแล้ว/);
+        assert.match(mutation.output, /AI:\s+สร้าง hello\.txt เรียบร้อยแล้ว/);
     } finally {
         fs.rmSync(mutation.root, { recursive: true, force: true });
     }
@@ -99,7 +168,7 @@ async function main(): Promise<void> {
     });
     try {
         assert.equal(fs.readFileSync(path.join(alreadySatisfied.root, "status.txt"), "utf8"), "status=ready");
-        assert.match(alreadySatisfied.output, /AI: status\.txt อยู่ในสถานะ ready อยู่แล้ว/);
+        assert.match(alreadySatisfied.output, /AI:\s+status\.txt อยู่ในสถานะ ready อยู่แล้ว/);
         assert.equal(fs.existsSync(path.join(alreadySatisfied.root, ".cli", "checkpoints.json")), false);
     } finally {
         fs.rmSync(alreadySatisfied.root, { recursive: true, force: true });
@@ -151,6 +220,7 @@ async function main(): Promise<void> {
     }, [], {
         intent: "Summarize README without changing files",
         task_type: "coding",
+        continuation: false,
         requires_workspace_changes: false,
         verification: "none",
         evidence_requirements: ["source"],
@@ -161,6 +231,100 @@ async function main(): Promise<void> {
         assert.equal(fs.readFileSync(path.join(readOnly.root, "README.md"), "utf8"), "Original evidence.\n");
     } finally {
         fs.rmSync(readOnly.root, { recursive: true, force: true });
+    }
+
+    const satisfiedContinuation = await runScenario([
+        { action: "read_file", path: "src/index.ts", reason: "Inspect the implementation left by the previous task." },
+        {
+            action: "run_command",
+            command: "npm start",
+            mode: "probe",
+            timeout_ms: 10000,
+            expect: { exit_code: 0, output_includes: ["verification-ready"] },
+            reason: "Exercise the self-contained runtime entrypoint."
+        },
+        {
+            action: "final",
+            answer: "The continued task is complete and the current project check passes.",
+            completion_status: "completed",
+            evidence: ["evidence_1_read_file", "evidence_2_run_command"],
+            reason: "Current workspace and verification evidence prove no further edit is needed."
+        }
+    ], "Resume the unfinished implementation and finish its verification.", (root) => {
+        fs.mkdirSync(path.join(root, "src"), { recursive: true });
+        fs.writeFileSync(path.join(root, "src", "index.ts"), "export const ready = true;\n", "utf8");
+        fs.writeFileSync(path.join(root, "verify.js"), "console.log('verification-ready');\n", "utf8");
+        fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({
+            name: "continuation-fixture",
+            scripts: { start: "node verify.js" }
+        }), "utf8");
+    }, [], {
+        intent: "Continue and verify the unfinished implementation",
+        task_type: "coding",
+        continuation: true,
+        requires_workspace_changes: true,
+        verification: "runtime",
+        evidence_requirements: ["source", "runtime"],
+        success_criteria: ["The self-contained runtime entrypoint completes successfully"]
+    });
+    try {
+        assert.match(satisfiedContinuation.output, /The continued task is complete/);
+        assert.doesNotMatch(satisfiedContinuation.output, /requires a successful file write/);
+        assert.equal(fs.readFileSync(path.join(satisfiedContinuation.root, "src", "index.ts"), "utf8"), "export const ready = true;\n");
+    } finally {
+        fs.rmSync(satisfiedContinuation.root, { recursive: true, force: true });
+    }
+
+    const continuationBuildIsNotRuntime = await runScenario([
+        { action: "read_file", path: "src/index.ts", reason: "Inspect the implementation left by the previous task." },
+        { action: "run_command", command: "npm test", reason: "Run the manifest-defined typecheck." },
+        {
+            action: "final",
+            answer: "The typecheck passed, so the continuation is complete.",
+            completion_status: "already_satisfied",
+            evidence: ["evidence_1_read_file", "evidence_2_run_command"],
+            reason: "Attempt to finish from command evidence alone."
+        },
+        {
+            action: "run_command",
+            command: "npm start",
+            mode: "probe",
+            timeout_ms: 10000,
+            expect: { exit_code: 0, output_includes: ["runtime-ready"] },
+            reason: "Exercise the manifest-defined runtime lifecycle."
+        },
+        {
+            action: "final",
+            answer: "The continuation is complete after both source inspection and runtime verification.",
+            completion_status: "already_satisfied",
+            evidence: ["evidence_1_read_file", "evidence_4_run_command"],
+            reason: "The existing implementation now has the required runtime evidence."
+        }
+    ], "Continue the unfinished runtime verification.", (root) => {
+        fs.mkdirSync(path.join(root, "src"), { recursive: true });
+        fs.writeFileSync(path.join(root, "src", "index.ts"), "export const ready = true;\n", "utf8");
+        fs.writeFileSync(path.join(root, "verify.js"), "console.log('runtime-ready');\n", "utf8");
+        fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({
+            name: "continuation-runtime-gate",
+            scripts: {
+                test: "node -e \"process.exit(0)\"",
+                start: "node verify.js"
+            }
+        }), "utf8");
+    }, [], {
+        intent: "Continue the unfinished runtime verification",
+        task_type: "coding",
+        continuation: true,
+        requires_workspace_changes: true,
+        verification: "runtime",
+        evidence_requirements: ["source", "runtime"],
+        success_criteria: ["The manifest-defined runtime lifecycle completes successfully"]
+    });
+    try {
+        assert.match(continuationBuildIsNotRuntime.output, /Final blocked: required runtime verification has not succeeded for this continuation/);
+        assert.match(continuationBuildIsNotRuntime.output, /AI:\s+The continuation is complete after both source inspection and runtime verification/);
+    } finally {
+        fs.rmSync(continuationBuildIsNotRuntime.root, { recursive: true, force: true });
     }
 
     const scopedMutation = await runScenario([
@@ -204,9 +368,59 @@ async function main(): Promise<void> {
     });
     try {
         assert.match(interactionEvidence.output, /Final blocked: required runtime verification has not succeeded/);
-        assert.match(interactionEvidence.output, /AI: แก้และยืนยัน interaction แล้ว/);
+        assert.match(interactionEvidence.output, /AI:\s+แก้และยืนยัน interaction แล้ว/);
     } finally {
         fs.rmSync(interactionEvidence.root, { recursive: true, force: true });
+    }
+
+    const refinedConsoleRuntime = await runScenario([
+        { action: "read_file", path: "app.txt", reason: "Inspect the console program evidence." },
+        {
+            action: "refine_task",
+            task: {
+                intent: "Repair and verify a console network program",
+                task_type: "coding",
+                continuation: false,
+                requires_workspace_changes: true,
+                verification: "runtime",
+                evidence_requirements: ["source", "runtime"],
+                success_criteria: ["The finite runtime probe emits its success marker without an error marker"]
+            },
+            evidence: ["evidence_1_read_file"],
+            reason: "The inspected workspace contains a console program and no rendered visual outcome."
+        },
+        { action: "edit_file", path: "app.txt", old_text: "status=broken", new_text: "status=fixed", reason: "Repair the console program state." },
+        {
+            action: "run_command",
+            command: "node -e \"console.log('http://127.0.0.1 runtime-ready')\"",
+            mode: "probe",
+            timeout_ms: 5000,
+            expect: {
+                exit_code: 0,
+                output_includes: ["runtime-ready"],
+                output_excludes: ["runtime-failed"]
+            },
+            reason: "Run a bounded runtime probe with explicit output assertions."
+        },
+        { action: "final", answer: "แก้ console runtime และตรวจสอบแล้ว", reason: "The refined runtime contract is satisfied." }
+    ], "แก้ console program ที่ runtime ล้มเหลวและตรวจสอบให้ด้วย", (root) => {
+        fs.writeFileSync(path.join(root, "app.txt"), "status=broken", "utf8");
+    }, [], {
+        intent: "Repair runtime behavior and its rendered visual result",
+        task_type: "coding",
+        continuation: false,
+        requires_workspace_changes: true,
+        verification: "interaction",
+        evidence_requirements: ["interaction", "visual"],
+        success_criteria: ["The runtime behavior and visual output are correct"]
+    });
+    try {
+        assert.equal(fs.readFileSync(path.join(refinedConsoleRuntime.root, "app.txt"), "utf8"), "status=fixed");
+        assert.match(refinedConsoleRuntime.output, /Task contract refined: Repair and verify a console network program/);
+        assert.doesNotMatch(refinedConsoleRuntime.output, /visual presentation work has no successful styling mutation/);
+        assert.match(refinedConsoleRuntime.output, /AI:\s+แก้ console runtime และตรวจสอบแล้ว/);
+    } finally {
+        fs.rmSync(refinedConsoleRuntime.root, { recursive: true, force: true });
     }
 
     const behaviorReplay = await runScenario([
@@ -233,7 +447,7 @@ async function main(): Promise<void> {
     try {
         assert.doesNotMatch(behaviorReplay.output, /Repeated equivalent action 2 times.*npm run build/s);
         assert.match(fs.readFileSync(path.join(behaviorReplay.root, "web", "src", "widget.ts"), "utf8"), /FeatureLink/);
-        assert.match(behaviorReplay.output, /AI: แก้ dependency ของ interaction และยืนยันผลแล้ว/);
+        assert.match(behaviorReplay.output, /AI:\s+แก้ dependency ของ interaction และยืนยันผลแล้ว/);
     } finally {
         fs.rmSync(behaviorReplay.root, { recursive: true, force: true });
     }
@@ -262,6 +476,7 @@ async function main(): Promise<void> {
     }, [], {
         intent: "Correct navigation behavior and rendered table styling",
         task_type: "coding",
+        continuation: false,
         requires_workspace_changes: true,
         verification: "command",
         evidence_requirements: ["command", "interaction", "visual"],
@@ -269,7 +484,7 @@ async function main(): Promise<void> {
     });
     try {
         assert.match(visualRouting.output, /Final blocked: visual presentation work has no successful styling mutation/);
-        assert.match(visualRouting.output, /AI: Routing and table presentation were implemented and interaction-tested/);
+        assert.match(visualRouting.output, /AI:\s+Routing and table presentation were implemented and interaction-tested/);
         assert.match(fs.readFileSync(path.join(visualRouting.root, "web", "src", "table.scss"), "utf8"), /display: grid/);
     } finally {
         fs.rmSync(visualRouting.root, { recursive: true, force: true });

@@ -11,6 +11,16 @@ type NoChangeCompletionInput = {
     hasUnresolvedFailures: boolean;
 };
 
+type ContinuationCompletionInput = {
+    continuation: boolean;
+    evidence: string[];
+    successfulEvidenceRefs: Set<string>;
+    successfulWorkspaceEvidenceRefs: Set<string>;
+    verificationRequired: boolean;
+    verificationSatisfied: boolean;
+    hasUnresolvedFailures: boolean;
+};
+
 class CompletionBlockerTracker {
     private readonly counts = new Map<string, number>();
 
@@ -49,4 +59,17 @@ function noChangeCompletionBlockReason(input: NoChangeCompletionInput): string |
     return undefined;
 }
 
-module.exports = { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionBlockReason };
+function continuationNoWriteCompletionAllowed(input: ContinuationCompletionInput): boolean {
+    if (!input.continuation || input.hasUnresolvedFailures) return false;
+    if (input.verificationRequired && !input.verificationSatisfied) return false;
+    const citedSuccessfulEvidence = input.evidence.some((reference) => input.successfulEvidenceRefs.has(reference));
+    const citedWorkspaceEvidence = input.evidence.some((reference) => input.successfulWorkspaceEvidenceRefs.has(reference));
+    return citedSuccessfulEvidence && citedWorkspaceEvidence;
+}
+
+module.exports = {
+    CompletionBlockerTracker,
+    continuationNoWriteCompletionAllowed,
+    effectiveCompletionStatus,
+    noChangeCompletionBlockReason
+};

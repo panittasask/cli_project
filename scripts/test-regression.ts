@@ -9,10 +9,10 @@ const { forbidsWorkspaceWrite, requiresWorkspaceWrite, requiresWorkspaceWriteWit
     requiresWorkspaceWriteWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => boolean;
     verificationRequirement: (message: string) => "none" | "command" | "runtime";
     verificationRequirementWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => "none" | "command" | "runtime";
-    commandSatisfiesVerification: (command: string, requirement: "none" | "command" | "runtime") => boolean;
+    commandSatisfiesVerification: (command: string, requirement: "none" | "command" | "runtime", options?: { probe?: boolean }) => boolean;
     acceptanceContract: (message: string) => { evidence: "source" | "command" | "runtime" | "interaction"; verification: "none" | "command" | "runtime"; reason: string };
     acceptanceContractWithHistory: (message: string, history: Array<{ role: "user" | "assistant"; content: string }>, continuation: boolean) => { evidence: string; verification: string; reason: string };
-    commandSatisfiesAcceptance: (command: string, contract: { evidence: "source" | "command" | "runtime" | "interaction"; verification: "none" | "command" | "runtime"; reason: string }) => boolean;
+    commandSatisfiesAcceptance: (command: string, contract: { evidence: "source" | "command" | "runtime" | "interaction"; verification: "none" | "command" | "runtime"; reason: string }, options?: { probe?: boolean }) => boolean;
     workflowInstructions: (kind: string) => string;
 };
 const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext") as {
@@ -105,10 +105,19 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { CompletionBlockerTracker, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
+const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
     CompletionBlockerTracker: new (limit: number) => {
         record: (summary: string) => { count: number; shouldStop: boolean };
     };
+    continuationNoWriteCompletionAllowed: (input: {
+        continuation: boolean;
+        evidence: string[];
+        successfulEvidenceRefs: Set<string>;
+        successfulWorkspaceEvidenceRefs: Set<string>;
+        verificationRequired: boolean;
+        verificationSatisfied: boolean;
+        hasUnresolvedFailures: boolean;
+    }) => boolean;
     effectiveCompletionStatus: (
         status: "completed" | "already_satisfied" | "no_change_needed",
         successfulWorkspaceChanges: number
@@ -129,6 +138,8 @@ const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } 
         boundedRun: boolean;
         baseLimitReached: boolean;
         unresolvedVerificationFailure?: string;
+        verificationRequiredAndUnsatisfied?: boolean;
+        pendingProjectChecks?: boolean;
     }) => boolean;
     verificationRecoveryTurnAllowance: (maxTurnsPerSegment: number) => number;
 };
@@ -137,7 +148,7 @@ const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoin
         checkpoint: (workspace: string, file: string, next: string) => { preview: string };
         undoLatest: (workspace: string, checkpointId?: string) => { ok: boolean };
     };
-    formatDiffPreview: (before: string, after: string, label: string) => string;
+    formatDiffPreview: (before: string, after: string, label: string, maxLines?: number, colors?: boolean) => string;
 };
 const { SkillLoader } = require("../cli/skillLoader") as { SkillLoader: new () => {
     discover: (workspace: string) => Array<{ name: string; description: string; body: string }>;
@@ -214,12 +225,13 @@ const {
     requiredProjectChecks: (requirement: Record<string, unknown>, checks: Array<Record<string, unknown>>) => Array<{ id: string }>;
     protectedProjectDeletionReason: (workspace: string, filePath: string, request: string) => string | undefined;
 };
-const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandInteractiveRisk, commandInvocationError, commandInvokesAgentTool, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, packageMutationRisk, parsePackageMutation, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
+const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandFailureGuidance, commandFailureKind, commandInteractiveRisk, commandInvocationError, commandInvokesAgentTool, commandTimeoutMs, diagnosticRecoveryGuidance, missingCommandTargetError, packageContentAddsBrowserAutoOpen, packageLifecycleRoleChanges, packageMutationRisk, packageScriptCommandsEquivalent, packageScriptRecovery, parsePackageMutation, resolveCommandWorkdir } = require("../cli/commandNormalizer") as {
     commandAddsTooling: (command: string) => boolean;
     commandCreatesWorkspaceFiles: (command: string) => boolean;
     commandMutatesWorkspaceFiles: (command: string) => boolean;
-    commandFailureGuidance: (workspace: string, command: string, errorOutput: string) => string;
-    commandInteractiveRisk: (command: string, workspace: string, workdir?: string) => string | undefined;
+    commandFailureGuidance: (workspace: string, command: string, errorOutput: string, inferenceApiUrl?: string, requestedWorkdir?: string) => string;
+    commandFailureKind: (command: string, errorOutput: string, inferenceApiUrl?: string) => "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
+    commandInteractiveRisk: (command: string, workspace: string, workdir?: string, options?: { probe?: boolean }) => string | undefined;
     commandInvocationError: (errorOutput: string) => boolean;
     commandInvokesAgentTool: (command: string) => boolean;
     commandTimeoutMs: (command: string) => number;
@@ -228,6 +240,14 @@ const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspac
     packageContentAddsBrowserAutoOpen: (filePath: string, content: string) => boolean;
     packageLifecycleRoleChanges: (beforeContent: string, afterContent: string) => string[];
     packageMutationRisk: (workspace: string, userMessage: string, command: string, requestedWorkdir?: string) => string | undefined;
+    packageScriptCommandsEquivalent: (left: string, right: string) => boolean;
+    packageScriptRecovery: (workspace: string, command: string, errorOutput: string, requestedWorkdir?: string) => {
+        command: string;
+        executable: string;
+        scriptName: string;
+        workdir: string;
+        mode?: "probe";
+    } | undefined;
     parsePackageMutation: (command: string) => Record<string, any> | undefined;
     resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
 };
@@ -271,6 +291,12 @@ async function main(): Promise<void> {
     assert.match(standaloneStartScript, /"--models-max"/);
     assert.match(terminalScript, /Current model: unavailable \(configured fallback:/);
     assert.match(terminalScript, /model: serverModelSynced \? model : "server unavailable"/);
+    assert.match(terminalScript, /\{ command: "\/log", description: "refresh the HTML log viewer" \}/);
+    assert.match(terminalScript, /trimmed\.toLowerCase\(\) === "\/log"/);
+    assert.match(terminalScript, /generateLogViewer\(appRoot\)/);
+    assert.match(terminalScript, /\{ command: "\/color", description: "show or change the LLM message color" \}/);
+    assert.match(terminalScript, /trimmed\.toLowerCase\(\) === "\/color"/);
+    assert.match(terminalScript, /persistTerminalColor\(normalizedColor\)/);
     assert.equal(packageJson.scripts["serve:tailscale"], "tailscale serve --bg --tcp=8080 tcp://127.0.0.1:8080");
     assert.match(packageJson.scripts["server:install"], /install-llama-autostart\.ps1/);
     assert.match(packageJson.scripts["server:status"], /status-llama-autostart\.ps1/);
@@ -343,6 +369,14 @@ async function main(): Promise<void> {
     assert.equal(failedInteraction.verification, "runtime");
     assert.equal(commandSatisfiesAcceptance("npm run build", failedInteraction), false);
     assert.equal(commandSatisfiesAcceptance("npm run test:e2e", failedInteraction), true);
+    const boundedRuntimeProgram = {
+        evidence: "runtime" as const,
+        verification: "runtime" as const,
+        reason: "A bounded program must exercise its runtime behavior."
+    };
+    assert.equal(commandSatisfiesAcceptance("npm start", boundedRuntimeProgram, { probe: true }), true);
+    assert.equal(commandSatisfiesAcceptance("npm start", boundedRuntimeProgram), false);
+    assert.equal(commandSatisfiesAcceptance("npm test", boundedRuntimeProgram, { probe: true }), false);
     assert.equal(acceptanceContract("ปรับชื่อหัวข้อใน README").evidence, "source");
     assert.equal(acceptanceContractWithHistory("ทำงานต่อให้เสร็จ", [
         { role: "user", content: "When I submit the form it still stays on the same screen" },
@@ -454,6 +488,96 @@ async function main(): Promise<void> {
         "  Argument: project, Given: \"src/app/dashboard/dashboard.component.spec.ts\", Choices: \"calendar\""
     ].join("\n")), true);
     assert.equal(commandInvocationError("Application bundle generation failed. TS2304: Cannot find name 'modalOpen'."), false);
+    assert.equal(commandInvocationError("Invoke-WebRequest : Cannot bind parameter 'Headers'. Cannot convert the \"Content-Type: application/json\" value"), true);
+    assert.equal(commandInvocationError("The token '&&' is not a valid statement separator in this version."), true);
+    assert.equal(packageScriptCommandsEquivalent("npm test", "npm run test"), true);
+    assert.equal(packageScriptCommandsEquivalent("npm run start", "npm start"), true);
+    assert.equal(packageScriptCommandsEquivalent("pnpm run test", "npm run test"), false);
+    assert.equal(packageScriptCommandsEquivalent("npm run lint", "npm run test"), false);
+    const localExecutableWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-local-script-recovery-"));
+    try {
+        fs.writeFileSync(path.join(localExecutableWorkspace, "package.json"), JSON.stringify({
+            scripts: {
+                test: "tsc --noEmit",
+                start: "tsx src/index.ts",
+                lint: "eslint ."
+            },
+            devDependencies: {
+                eslint: "latest",
+                tsx: "latest",
+                typescript: "latest"
+            }
+        }), "utf8");
+        fs.writeFileSync(path.join(localExecutableWorkspace, "package-lock.json"), "{}", "utf8");
+        const directExecutableError = [
+            "Command failed with exit code 1: tsx src/index.ts",
+            "tsx : The term 'tsx' is not recognized as the name of a cmdlet, function, script file, or operable program.",
+            "FullyQualifiedErrorId : CommandNotFoundException"
+        ].join("\n");
+        assert.equal(commandInvocationError(directExecutableError), true);
+        assert.deepEqual(packageScriptRecovery(localExecutableWorkspace, "tsx src/index.ts", directExecutableError, "."), {
+            command: "npm start",
+            executable: "tsx",
+            scriptName: "start",
+            workdir: ".",
+            mode: "probe"
+        });
+        const directGuidance = commandFailureGuidance(localExecutableWorkspace, "tsx src/index.ts", directExecutableError, undefined, ".");
+        assert.match(directGuidance, /Run 'npm start'/);
+        assert.match(directGuidance, /mode "probe"/);
+        assert.match(directGuidance, /Do not invoke the executable directly/);
+
+        const binaryPathError = [
+            "npm error code ENOENT",
+            `npm error path ${path.join(localExecutableWorkspace, "node_modules", ".bin", "tsx", "package.json")}`,
+            "npm error enoent Could not read package.json"
+        ].join("\n");
+        assert.equal(commandInvocationError(binaryPathError), true);
+        assert.equal(
+            packageScriptRecovery(localExecutableWorkspace, "npx node_modules/.bin/tsx src/index.ts", binaryPathError)?.command,
+            "npm start"
+        );
+
+        const nearbyUnrelatedFailure = [
+            "prettier : The term 'prettier' is not recognized as the name of a cmdlet.",
+            "FullyQualifiedErrorId : CommandNotFoundException"
+        ].join("\n");
+        assert.equal(packageScriptRecovery(localExecutableWorkspace, "prettier .", nearbyUnrelatedFailure), undefined);
+        assert.doesNotMatch(
+            commandFailureGuidance(localExecutableWorkspace, "prettier .", nearbyUnrelatedFailure),
+            /npm start|package script 'start'/i
+        );
+    } finally {
+        fs.rmSync(localExecutableWorkspace, { recursive: true, force: true });
+    }
+    assert.match(
+        commandFailureGuidance(process.cwd(), "curl http://127.0.0.1:3000/health", "Invoke-WebRequest : Cannot bind parameter 'Headers'."),
+        /curl\.exe/
+    );
+    const inferenceCollisionOutput = [
+        "Target: http://127.0.0.1:8080/chat",
+        "{\"error\":{\"message\":\"File Not Found\",\"type\":\"not_found_error\",\"code\":404}}"
+    ].join("\n");
+    assert.equal(
+        commandFailureKind("npm start", inferenceCollisionOutput, "http://127.0.0.1:8080/v1/chat/completions"),
+        "inference_port_collision"
+    );
+    assert.match(
+        commandFailureGuidance(process.cwd(), "npm start", inferenceCollisionOutput, "http://127.0.0.1:8080/v1/chat/completions"),
+        /port collision/i
+    );
+    const unrelatedRuntime404 = [
+        "Target: http://127.0.0.1:3000/chat",
+        "{\"error\":{\"message\":\"File Not Found\",\"type\":\"not_found_error\",\"code\":404}}"
+    ].join("\n");
+    assert.equal(
+        commandFailureKind("npm start", unrelatedRuntime404, "http://127.0.0.1:8080/v1/chat/completions"),
+        "runtime"
+    );
+    assert.doesNotMatch(
+        commandFailureGuidance(process.cwd(), "npm start", unrelatedRuntime404, "http://127.0.0.1:8080/v1/chat/completions"),
+        /port collision/i
+    );
     assert.equal(missingCommandTargetError('Cannot find "quality" target for the specified project.'), true);
     assert.equal(missingCommandTargetError('\u001b[31mCannot find\u001b[0m "quality" target for the specified project.'), true);
     assert.equal(commandAddsTooling("tool add optional-checker"), true);
@@ -474,6 +598,14 @@ async function main(): Promise<void> {
     assert.deepEqual(packageLifecycleRoleChanges(
         JSON.stringify({ scripts: { start: "tool serve --port 3000" } }),
         JSON.stringify({ scripts: { start: "tool serve --port 4000" } })
+    ), []);
+    assert.deepEqual(packageLifecycleRoleChanges(
+        JSON.stringify({ scripts: { test: "tsc --noEmit" } }),
+        JSON.stringify({ scripts: { test: "tsc --noEmit && node test-server.js" } })
+    ), ["test"]);
+    assert.deepEqual(packageLifecycleRoleChanges(
+        JSON.stringify({ scripts: { test: "tsc --noEmit" } }),
+        JSON.stringify({ scripts: { test: "tsc --noEmit --pretty false" } })
     ), []);
     const nestedAngularWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-angular-workdir-"));
     try {
@@ -526,6 +658,19 @@ async function main(): Promise<void> {
         );
         assert.match(commandInteractiveRisk("ng serve --open", nestedAngularWorkspace, "dashboard") ?? "", /browser launching/);
         assert.match(commandInteractiveRisk("npm start", nestedAngularWorkspace, "dashboard") ?? "", /package lifecycle 'start'/);
+        assert.equal(commandInteractiveRisk("npm start", process.cwd(), ".", { probe: true }), undefined);
+        assert.equal(
+            commandInteractiveRisk(
+                "Start-Process node -ArgumentList app.js; Invoke-RestMethod http://127.0.0.1:8080/health",
+                nestedAngularWorkspace,
+                "dashboard"
+            ),
+            undefined
+        );
+        assert.match(
+            commandInteractiveRisk("Start-Process https://example.com", nestedAngularWorkspace, "dashboard") ?? "",
+            /browser launching/
+        );
         assert.match(commandInteractiveRisk("npm test", nestedAngularWorkspace, "dashboard") ?? "", /browser runner 'karma-chrome-launcher'/);
         assert.match(commandInteractiveRisk("ng test --watch=false", nestedAngularWorkspace, "dashboard") ?? "", /browser runner 'karma-chrome-launcher'/);
         assert.equal(commandInteractiveRisk("npm run test:e2e", nestedAngularWorkspace, "dashboard"), undefined);
@@ -562,6 +707,7 @@ async function main(): Promise<void> {
     assert.match(formatIncompleteTaskAnswer(["node check not passed"], ["main.go"]), /ก่อนงานเสร็จ/);
     const webActions = getAgentResponseFormat("web_research").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.ok(webActions.includes("mcp_call_tool"));
+    assert.ok(webActions.includes("search_project"));
     assert.ok(webActions.includes("read_file"));
     assert.ok(webActions.includes("search_files"));
     const localWebActions = getAgentLocalResponseFormat("web_research").schema.oneOf.map((variant) => variant.properties.action.const);
@@ -569,7 +715,7 @@ async function main(): Promise<void> {
     assert.ok(!localWebActions.includes("mcp_call_tool"));
     assert.ok(!localWebActions.includes("mcp_list_tools"));
     const generalActions = getAgentResponseFormat("general").schema.oneOf.map((variant) => variant.properties.action.const);
-    assert.deepEqual(generalActions, ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
+    assert.deepEqual(generalActions, ["search_project", "read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "refine_task", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
     const codingActions = getAgentResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(codingActions, generalActions);
     const readOnlyActions = getAgentReadOnlyResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
@@ -583,8 +729,10 @@ async function main(): Promise<void> {
     const initialVariants = getInitialAgentResponseFormat().schema.oneOf;
     const ambiguousWorkspaceActions = initialVariants.map((variant) => variant.properties.action.const);
     assert.ok(ambiguousWorkspaceActions.includes("read_file"));
+    assert.ok(ambiguousWorkspaceActions.includes("search_project"));
     assert.ok(ambiguousWorkspaceActions.includes("edit_file"));
     assert.ok(ambiguousWorkspaceActions.includes("write_file"));
+    assert.ok(!ambiguousWorkspaceActions.includes("refine_task"));
     assert.ok(ambiguousWorkspaceActions.includes("ask_user"));
     assert.ok(ambiguousWorkspaceActions.includes("final"));
     for (const variant of initialVariants) {
@@ -592,6 +740,7 @@ async function main(): Promise<void> {
         assert.deepEqual(variant.properties.task.required, [
             "intent",
             "task_type",
+            "continuation",
             "requires_workspace_changes",
             "verification",
             "evidence_requirements",
@@ -776,6 +925,16 @@ async function main(): Promise<void> {
         baseLimitReached: true
     }), false);
     assert.equal(shouldActivateVerificationRecovery({
+        boundedRun: true,
+        baseLimitReached: true,
+        verificationRequiredAndUnsatisfied: true
+    }), true);
+    assert.equal(shouldActivateVerificationRecovery({
+        boundedRun: true,
+        baseLimitReached: true,
+        pendingProjectChecks: true
+    }), true);
+    assert.equal(shouldActivateVerificationRecovery({
         boundedRun: false,
         baseLimitReached: true,
         unresolvedVerificationFailure: "test failed"
@@ -815,6 +974,33 @@ async function main(): Promise<void> {
     assert.equal(effectiveCompletionStatus("already_satisfied", 2), "completed");
     assert.equal(effectiveCompletionStatus("no_change_needed", 1), "completed");
     assert.equal(effectiveCompletionStatus("already_satisfied", 0), "already_satisfied");
+    assert.equal(continuationNoWriteCompletionAllowed({
+        continuation: true,
+        evidence: ["evidence_2_read_file", "evidence_3_run_command"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        verificationRequired: true,
+        verificationSatisfied: true,
+        hasUnresolvedFailures: false
+    }), true);
+    assert.equal(continuationNoWriteCompletionAllowed({
+        continuation: false,
+        evidence: ["evidence_2_read_file", "evidence_3_run_command"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        verificationRequired: true,
+        verificationSatisfied: true,
+        hasUnresolvedFailures: false
+    }), false);
+    assert.equal(continuationNoWriteCompletionAllowed({
+        continuation: true,
+        evidence: ["evidence_2_read_file", "evidence_3_run_command"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        verificationRequired: true,
+        verificationSatisfied: false,
+        hasUnresolvedFailures: false
+    }), false);
     const blockerTracker = new CompletionBlockerTracker(3);
     assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, false);
     assert.equal(blockerTracker.record("latest command failed").shouldStop, false);
@@ -913,13 +1099,15 @@ async function main(): Promise<void> {
     try {
         const generalPrompt = await agent.buildSystemPrompt(workflowInstructions("general"));
         const mcpPrompt = await agent.buildSystemPrompt(workflowInstructions("mcp_creation"));
+        assert.match(generalPrompt, /current project index and successful tool observations as authoritative over prior assistant claims/);
         assert.ok(!generalPrompt.includes("Put servers under mcp/servers"));
         if (process.platform === "win32") assert.match(generalPrompt, /run_command executes Windows PowerShell/);
         assert.match(generalPrompt, /Never assume a localhost server is running/);
         assert.match(generalPrompt, /Use ask_user only when required information/);
         assert.match(generalPrompt, /Uncertainty by itself is not a blocker/);
         assert.match(generalPrompt, /Never ask whether to create a new project/);
-        assert.match(generalPrompt, /Workspace map \(paths only/);
+        assert.match(generalPrompt, /Project index summary/);
+        assert.match(generalPrompt, /Use search_project first/);
         const parsedFirstAction = agent.parseAction(JSON.stringify({
             action: "read_file",
             path: "package.json",
@@ -927,6 +1115,7 @@ async function main(): Promise<void> {
             task: {
                 intent: "Understand the project",
                 task_type: "coding",
+                continuation: false,
                 requires_workspace_changes: false,
                 verification: "none",
                 evidence_requirements: ["source"],
@@ -1032,6 +1221,9 @@ async function main(): Promise<void> {
         assert.equal(checkpoints.undoLatest(temp).ok, true);
         assert.equal(fs.readFileSync(trackedPath, "utf8"), "before\n");
         assert.match(formatDiffPreview("a", "b", "x.txt"), /-1 \+1/);
+        const coloredDiff = formatDiffPreview("old", "new", "x.txt", 12, true);
+        assert.match(coloredDiff, /\x1b\[31m- old\x1b\[0m/);
+        assert.match(coloredDiff, /\x1b\[32m\+ new\x1b\[0m/);
 
         const skillDirectory = path.join(temp, ".cli", "skills", "test-helper");
         fs.mkdirSync(skillDirectory, { recursive: true });

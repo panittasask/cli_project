@@ -6,6 +6,7 @@ const taskContractProperty = {
     properties: {
         intent: stringProperty,
         task_type: { enum: ["general", "web_research", "coding", "mcp_creation"] },
+        continuation: { type: "boolean" },
         requires_workspace_changes: { type: "boolean" },
         verification: { enum: ["none", "command", "runtime", "interaction"] },
         evidence_requirements: {
@@ -22,7 +23,26 @@ const taskContractProperty = {
             items: stringProperty
         }
     },
-    required: ["intent", "task_type", "requires_workspace_changes", "verification", "evidence_requirements", "success_criteria"],
+    required: ["intent", "task_type", "continuation", "requires_workspace_changes", "verification", "evidence_requirements", "success_criteria"],
+    additionalProperties: false
+};
+const commandExpectationProperty = {
+    type: "object",
+    properties: {
+        exit_code: { const: 0 },
+        output_includes: {
+            type: "array",
+            maxItems: 8,
+            uniqueItems: true,
+            items: stringProperty
+        },
+        output_excludes: {
+            type: "array",
+            maxItems: 8,
+            uniqueItems: true,
+            items: stringProperty
+        }
+    },
     additionalProperties: false
 };
 const variants: Record<string, Record<string, unknown>> = {
@@ -47,6 +67,17 @@ const variants: Record<string, Record<string, unknown>> = {
         properties: { action: { const: "search_files" }, query: stringProperty, path: stringProperty, reason: stringProperty },
         required: ["action", "query", "reason"], additionalProperties: false
     },
+    search_project: {
+        type: "object",
+        properties: {
+            action: { const: "search_project" },
+            query: stringProperty,
+            path: stringProperty,
+            limit: { type: "integer", minimum: 1, maximum: 30 },
+            reason: stringProperty
+        },
+        required: ["action", "query", "reason"], additionalProperties: false
+    },
     read_file: {
         type: "object",
         properties: { action: { const: "read_file" }, path: stringProperty, reason: stringProperty },
@@ -69,8 +100,33 @@ const variants: Record<string, Record<string, unknown>> = {
     },
     run_command: {
         type: "object",
-        properties: { action: { const: "run_command" }, command: stringProperty, workdir: stringProperty, reason: stringProperty },
+        properties: {
+            action: { const: "run_command" },
+            command: stringProperty,
+            workdir: stringProperty,
+            mode: { enum: ["normal", "probe"] },
+            timeout_ms: { type: "integer", minimum: 1000, maximum: 30000 },
+            expect: commandExpectationProperty,
+            reason: stringProperty
+        },
         required: ["action", "command", "reason"], additionalProperties: false
+    },
+    refine_task: {
+        type: "object",
+        properties: {
+            action: { const: "refine_task" },
+            task: taskContractProperty,
+            evidence: {
+                type: "array",
+                minItems: 1,
+                maxItems: 8,
+                uniqueItems: true,
+                items: stringProperty
+            },
+            reason: stringProperty
+        },
+        required: ["action", "task", "evidence", "reason"],
+        additionalProperties: false
     },
     ask_user: {
         type: "object",
@@ -111,13 +167,13 @@ const workflowActions: Record<WorkflowKind, string[]> = {
     // therefore refine ambiguous natural language semantically (for example,
     // choosing web search for an external fact) instead of being constrained
     // by a keyword classifier before its first action.
-    general: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
-    web_research: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
+    general: ["search_project", "read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "refine_task", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
+    web_research: ["search_project", "read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "refine_task", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
     // A coding-shaped request can still require external evidence (for
     // example, researching a dependency or a model).  Do not let a lexical
     // workflow hint remove the model's ability to select a discovered tool.
-    coding: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
-    mcp_creation: ["read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "mcp_list_tools", "mcp_call_tool", "ask_user", "final"]
+    coding: ["search_project", "read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "refine_task", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"],
+    mcp_creation: ["search_project", "read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "refine_task", "mcp_list_tools", "mcp_call_tool", "ask_user", "final"]
 };
 
 function getAgentResponseFormat(workflow: WorkflowKind): Record<string, unknown> {
@@ -173,7 +229,7 @@ function getInitialAgentResponseFormat(): Record<string, unknown> {
     return {
         type: "json_object",
         schema: {
-            oneOf: workflowActions.general.map((action) => {
+            oneOf: workflowActions.general.filter((action) => action !== "refine_task").map((action) => {
                 const variant = variants[action]!;
                 const properties = variant.properties as Record<string, unknown>;
                 const required = variant.required as string[];

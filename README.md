@@ -75,6 +75,9 @@ Prototype contents:
   "hardwareProfile": "auto",
   "debug": true,
   "historyMessages": 6,
+  "terminal": {
+    "llmMessageColor": "blue"
+  },
   "agent": {
     "profile": "standard",
     "maxTurns": 12,
@@ -99,7 +102,7 @@ Prototype contents:
   "sampling": {
     "chat": { "temperature": 0.6, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.08, "max_tokens": 2048 },
     "planner": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 1024 },
-    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 2048 }
+    "action": { "temperature": 0.1, "top_p": 0.9, "top_k": 20, "repeat_penalty": 1.05, "max_tokens": 4096 }
   }
 }
 ```
@@ -136,6 +139,24 @@ from the environment, `settings.json`, or a default. Run `/settings validate`
 to report invalid ranges, types, unsafe provider paths, or malformed JSON. Run `/capabilities` to see
 the active mode's local actions, discovered project checks, MCP servers, and
 whether a real MCP web-search tool is currently available.
+
+`terminal.llmMessageColor` controls the foreground color used for the `AI:`
+label and the LLM response body. It accepts `black`, `red`, `green`, `yellow`,
+`blue`, `magenta`, `cyan`, `white`, their `bright-*` variants, `default`, or a
+standard ANSI foreground code: `30`-`37`, `39`, or `90`-`97`. Codes may be JSON
+strings or numbers. For example:
+
+```json
+{
+  "terminal": {
+    "llmMessageColor": "bright-blue"
+  }
+}
+```
+
+Set `NO_COLOR` in the environment to disable all terminal coloring regardless
+of this setting. Completed `[step x/y]` messages are followed by a blank line
+so consecutive agent actions remain visually separated.
 
 To use one machine as the inference server for other copies of this repo on a
 trusted LAN, set `serverHost` to `0.0.0.0` on the server, allow `serverPort`
@@ -232,10 +253,22 @@ common secret fields are omitted. This trace is an operational summary, not
 the model's private chain-of-thought. `/clear` starts a clean task context while
 keeping the saved session history on disk.
 
+Use `/log` to refresh `.cli/log-viewer.html` from the latest agent traces,
+model responses, and saved sessions. The same viewer can be generated outside
+the interactive CLI with `npm run logs:view`.
+
+Use `/color` to show the current LLM message color and supported values, or
+`/color <name-or-code>` to update `terminal.llmMessageColor` in
+`.cli/settings.json` immediately.
+
 Agent mode also writes every raw model message to daily files named
 `.cli/logs/agent/agent-model-responses-YYYY-MM-DD.jsonl`, including the requested response
 format, finish reason, parsed action, and parse failure reason. This local file
 is ignored by Git and can contain model-generated content from the active task.
+The generated log viewer presents saved `reasoningContent` in a collapsed
+**Thinking** section that can be opened per response. It renders the complete
+saved text without a viewer-side preview cut and labels responses whose
+`finish_reason` shows that the model itself reached its output limit.
 In an interactive terminal, a fixed status banner stays on the bottom row and
 shows the loaded model, current context usage and limit, and active workspace.
 Agent output, spinners, and the input prompt use the reserved scroll region
@@ -248,6 +281,20 @@ read, search, write, command, or final actions from the request and relevant
 session context. A temporal word such as `current` or `ปัจจุบัน` only selects web
 research when it is paired with an online subject such as news, price, weather,
 or version. Web research keeps local file tools available as a recovery path.
+
+Agent mode maintains an incremental project index at
+`.cli/cache/project-index-v1.json`. The index records eligible paths, project
+roots, manifests, languages, file kinds, imports, exported symbols, and bounded
+text excerpts. It uses Git's tracked/unignored file set when available, falls
+back to a bounded filesystem walk, and reuses unchanged entries by file size and
+modification time. Secret-shaped files, generated output, dependencies, logs,
+and cache directories are not persisted. The system prompt receives only a
+compact project summary. When a relevant path is unknown, the model calls
+`search_project` to receive ranked JSON results and then calls `read_file` for
+the authoritative current content. Successful file mutations and commands mark
+the index dirty, so the next indexed search refreshes added, changed, and removed
+files without rebuilding unchanged records.
+
 Existing files must be read before an agent write. JSON, TypeScript, and
 `.gitignore` changes receive automatic validation, and a failed validation
 blocks a final success response. Source-like mutations must also belong to a
@@ -260,6 +307,13 @@ changes may use read-back evidence, command outcomes require a finite project
 check, runtime outcomes require a runtime probe, and reported interaction
 failures require an automated interaction test. A successful build cannot prove
 that an observable user action produced the expected state.
+
+After inspecting the workspace, the model may use `refine_task` with exact
+successful workspace Evidence IDs when those files disprove an initial evidence
+requirement. Refinement may adjust verification, evidence, intent, and success
+criteria, but cannot change the task type or read-only/write scope. This lets a
+console or network task remove an incorrectly inferred visual gate without
+weakening genuine UI work.
 
 Creation requests for Go APIs, React or Angular applications, and Swagger/OpenAPI also
 receive a deterministic project-completion profile. A Go API profile requires a
@@ -281,6 +335,11 @@ file inside one JSON response. The replacement must match exactly once and gets
 the same diff checkpoint, undo support, and validation as a full write. If a
 full-file response reaches the completion limit, the truncated response is
 omitted from active context and the next turn is constrained to a smaller action.
+If a reasoning model consumes the limit before emitting any action JSON, the CLI
+records a distinct reasoning-only truncation, retries with a compact action-only
+instruction and a temporarily expanded output allowance, and permits at most two
+consecutive specialized retries. This prevents both blank tool turns and an
+unbounded recovery loop. The default action output allowance is 4,096 tokens.
 
 On Windows, agent verification commands run explicitly in PowerShell and the
 model receives matching platform guidance. `run_command.workdir` selects a
@@ -292,6 +351,19 @@ timeout. File-content checks should use
 `read_file` or `search_files`; the agent must not assume a localhost server is
 running. A failed verification command blocks verified success until a relevant
 file read/search or an OS-compatible command succeeds.
+
+`run_command` supports optional output assertions through
+`expect.output_includes` and `expect.output_excludes`; an exit code of zero does
+not pass when an explicit assertion fails. Normally interactive package
+lifecycle commands remain blocked. For a necessary bounded runtime check, the
+model can select `mode: "probe"` with a 1–30 second `timeout_ms`; the process
+tree is terminated at the deadline. Browser-opening flags and direct URL
+launchers remain blocked in probe mode.
+
+Interactive output separates the colored `AI:` label from the response body for
+readability. Diff previews use red removed lines and green added lines when
+stdout is a color-capable TTY. `NO_COLOR` or `TERM=dumb` disables ANSI colors,
+and persisted traces remain plain JSON without terminal escapes.
 
 Package mutations run through a deterministic preflight before execution. The
 selected workdir must contain `package.json`, its package manager must match an

@@ -38,6 +38,7 @@ interface SessionTaskJournal {
     updatedAt: number;
     intent?: string;
     taskType?: string;
+    continuation?: boolean;
     requiresWorkspaceChanges?: boolean;
     verification?: string;
     evidenceRequirements?: string[];
@@ -217,6 +218,7 @@ class SessionTool {
                 const contract = JSON.parse(entry.observation) as Record<string, unknown>;
                 if (typeof contract.intent === "string") task.intent = this.trimTaskText(contract.intent, 600);
                 if (typeof contract.task_type === "string") task.taskType = contract.task_type;
+                if (typeof contract.continuation === "boolean") task.continuation = contract.continuation;
                 if (typeof contract.requires_workspace_changes === "boolean") {
                     task.requiresWorkspaceChanges = contract.requires_workspace_changes;
                 }
@@ -331,6 +333,7 @@ class SessionTool {
             `Original user request: ${task.userRequest}`,
             `Interpreted intent: ${task.intent || "not recorded before interruption"}`,
             `Task type: ${task.taskType || "unknown"}`,
+            `Continuation request: ${task.continuation === undefined ? "unknown" : task.continuation ? "yes" : "no"}`,
             `Workspace changes expected: ${task.requiresWorkspaceChanges === undefined ? "unknown" : task.requiresWorkspaceChanges ? "yes" : "no"}`,
             `Required verification: ${task.verification || "unknown"}`,
             `Required evidence: ${task.evidenceRequirements?.join(", ") || "unknown"}`,

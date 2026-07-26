@@ -9,11 +9,17 @@ const { normalizeClarificationRequest } = require("../clarification") as {
         reason?: string
     ) => import("../clarificationTypes").ClarificationRequest | undefined;
 };
-const { commandFailureGuidance, commandInteractiveRisk, commandTimeoutMs, packageContentAddsBrowserAutoOpen, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
-    commandFailureGuidance: (workspace: string, command: string, errorOutput: string) => string;
-    commandInteractiveRisk: (command: string, workspace: string, workdir?: string) => string | undefined;
+const { commandFailureGuidance, commandFailureKind, commandInteractiveRisk, commandTimeoutMs, packageContentAddsBrowserAutoOpen, packageScriptRecovery, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
+    commandFailureGuidance: (workspace: string, command: string, errorOutput: string, inferenceApiUrl?: string, requestedWorkdir?: string) => string;
+    commandFailureKind: (command: string, errorOutput: string, inferenceApiUrl?: string) => "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
+    commandInteractiveRisk: (command: string, workspace: string, workdir?: string, options?: { probe?: boolean }) => string | undefined;
     commandTimeoutMs: (command: string) => number;
     packageContentAddsBrowserAutoOpen: (filePath: string, content: string) => boolean;
+    packageScriptRecovery: (workspace: string, command: string, errorOutput: string, requestedWorkdir?: string) => {
+        command: string;
+        workdir: string;
+        mode?: "probe";
+    } | undefined;
     resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
     unwrapWindowsPowerShellCommand: (command: string) => string;
 };
@@ -28,14 +34,27 @@ const { McpTool } = require("./mcpTool") as { McpTool: new (configRoot?: string)
     } | undefined;
     close: () => Promise<void>;
 } };
+const { ProjectIndex } = require("../projectIndex") as { ProjectIndex: new (workspace: string) => {
+    markDirty: () => void;
+    refresh: (force?: boolean) => void;
+    summary: () => string;
+    search: (query: string, limit?: number, path?: string) => string;
+} };
 
 type AgentTaskContract = {
     intent: string;
     task_type: "general" | "web_research" | "coding" | "mcp_creation";
+    continuation: boolean;
     requires_workspace_changes: boolean;
     verification: "none" | "command" | "runtime" | "interaction";
     evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
     success_criteria: string[];
+};
+
+type CommandExpectation = {
+    exit_code?: 0;
+    output_includes?: string[];
+    output_excludes?: string[];
 };
 
 type AgentAction = (
@@ -53,6 +72,12 @@ type AgentAction = (
         action: "search_files";
         query: string;
         path?: string;
+    }
+    | {
+        action: "search_project";
+        query: string;
+        path?: string;
+        limit?: number;
     }
     | {
         action: "read_file";
@@ -77,6 +102,14 @@ type AgentAction = (
         action: "run_command";
         command: string;
         workdir?: string;
+        mode?: "normal" | "probe";
+        timeout_ms?: number;
+        expect?: CommandExpectation;
+    }
+    | {
+        action: "refine_task";
+        task: AgentTaskContract;
+        evidence: string[];
     }
     | ({ action: "ask_user" } & import("../clarificationTypes").ClarificationRequest)
     | {
@@ -97,6 +130,11 @@ type AgentToolResult = {
     ok: boolean;
     output: string;
     changed?: boolean;
+    assertionPassed?: boolean;
+    failureKind?: "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
+    recommendedCommand?: string;
+    recommendedWorkdir?: string;
+    recommendedMode?: "probe";
 };
 
 class AgentTool {
@@ -115,8 +153,14 @@ class AgentTool {
         "recovery"
     ]);
     private readonly mcpTool: InstanceType<typeof McpTool>;
+    private projectIndex: InstanceType<typeof ProjectIndex> | undefined;
+    private indexedWorkspace: string | undefined;
 
-    constructor(configRoot = process.cwd(), private readonly commandTimeoutOverrideMs?: number) {
+    constructor(
+        configRoot = process.cwd(),
+        private readonly commandTimeoutOverrideMs?: number,
+        private readonly inferenceApiUrl?: string
+    ) {
         this.mcpTool = new McpTool(configRoot);
     }
 
@@ -131,16 +175,26 @@ class AgentTool {
 
     async buildSystemPrompt(workflowInstructions = ""): Promise<string> {
         const mcpSection = await this.mcpTool.buildPromptSection();
-        const workspaceMap = this.listFiles();
+        const projectSummary = this.currentProjectIndex().summary();
         const runtimeSection = process.platform === "win32"
             ? `Runtime platform: Windows. run_command executes Windows PowerShell.
 Use PowerShell commands such as Get-ChildItem, Get-Content, and Select-String. Do not use Unix-only commands such as grep, sed, or awk.
+In Windows PowerShell, a bare curl command may resolve to Invoke-WebRequest; use curl.exe when curl flags are required. Do not use && as a command separator.
 Set run_command.workdir to a relative workspace directory instead of using Set-Location or cd.
 If workdir is omitted and exactly one nested package manifest matches the requested executable or package script, the runner selects that directory automatically.
 Dependency installation and project scaffolding may run for up to three minutes. After a real timeout, inspect files before retrying because the command may have created partial output.
 Never add automatic browser-opening flags such as --open to package scripts. Do not run dev servers, watch commands, or headed/manual browser sessions. Finite headless automated interaction tests are allowed.
 Do not wrap commands in another powershell.exe invocation. Do not use Bash separators such as && or a bare & to background a process.`
             : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
+        const inferenceBoundary = (() => {
+            if (!this.inferenceApiUrl) return "";
+            try {
+                const origin = new URL(this.inferenceApiUrl).origin;
+                return `CLI inference endpoint reserved by llama.cpp: ${origin}. If workspace server/client code uses this same loopback port, treat it as a port collision. Move the workspace runtime to a different unused port consistently before probing the real entrypoint; never substitute an auxiliary server to make verification pass.`;
+            } catch {
+                return "";
+            }
+        })();
         // The model is controlled through a small JSON protocol so the CLI can
         // safely decide which local capability to execute on each agent turn.
         return `You are a helpful local CLI assistant and coding agent running inside a user's project workspace.
@@ -149,23 +203,29 @@ Work in small steps. Use tools until you have enough evidence, then return final
 
 ${runtimeSection}
 
+${inferenceBoundary}
+
 ${workflowInstructions}
 
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
 For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. Use the user's language when practical. This is a decision summary, not private chain-of-thought.
 On the first response for a task, include "task" in the same JSON object as the first action:
-{"intent":"what the user wants","task_type":"general|web_research|coding|mcp_creation","requires_workspace_changes":true,"verification":"interaction","evidence_requirements":["interaction","visual"],"success_criteria":["observable result"]}
-Classify the task semantically from the complete request and context. Choose the first evidence-producing action in that same response; there is no separate routing phase. For repository work, inspect the workspace map and request only relevant file contents rather than asking for every file.
+{"intent":"what the user wants","task_type":"general|web_research|coding|mcp_creation","continuation":false,"requires_workspace_changes":true,"verification":"interaction","evidence_requirements":["interaction","visual"],"success_criteria":["observable result"]}
+Classify the task semantically from the complete request and context. Choose the first evidence-producing action in that same response; there is no separate routing phase. For repository work, use the project index summary and request only relevant search results or file contents rather than asking for every file.
+Set continuation true only when the current request semantically asks to resume unfinished work from the session context. A continuation may already be satisfied by the current workspace state: inspect it, run every required verification, then return final citing both workspace and verification Evidence IDs without making a cosmetic file change.
 Choose every applicable evidence requirement from the requested outcome, not merely the cheapest check. Use interaction whenever success depends on a user action and its observable result. Use visual whenever success depends on rendered appearance, layout, or styling; visual work also requires interaction evidence. A build proves compilation only and must not be used as evidence that navigation, clicks, state transitions, or appearance work.
 
 Available actions:
 {"action":"list_files","path":"optional relative path","reason":"brief rationale"}
-{"action":"search_files","query":"text or regex","path":"optional relative path","reason":"brief rationale"}
+{"action":"search_project","query":"semantic or lexical project query","path":"optional relative path","limit":12,"reason":"brief rationale"}
+{"action":"search_files","query":"exact text","path":"optional relative path","reason":"brief rationale"}
 {"action":"read_file","path":"relative path","reason":"brief rationale"}
 {"action":"write_file","path":"relative path","content":"full updated file content","reason":"brief rationale"}
 {"action":"edit_file","path":"relative path","old_text":"exact existing text","new_text":"replacement text","reason":"brief rationale"}
 {"action":"delete_file","path":"relative file path","reason":"brief rationale"}
 {"action":"run_command","command":"safe read-only or verification command","workdir":"optional relative directory","reason":"brief rationale"}
+{"action":"run_command","command":"bounded runtime command","workdir":".","mode":"probe","timeout_ms":10000,"expect":{"exit_code":0,"output_includes":["observable success"],"output_excludes":["observable failure"]},"reason":"brief rationale"}
+{"action":"refine_task","task":{"intent":"refined intent","task_type":"coding","continuation":false,"requires_workspace_changes":true,"verification":"runtime","evidence_requirements":["source","runtime"],"success_criteria":["observable result"]},"evidence":["evidence_N_read_file"],"reason":"why inspected workspace evidence changes the initial contract"}
 {"action":"ask_user","decision":"target|scope|compatibility|destructive|cost|external|preference","question":"one concrete decision needed","options":[{"id":"stable_id","label":"short choice","description":"impact of choosing it"},{"id":"second_id","label":"another choice","description":"impact of choosing it"}],"reason":"why this ambiguity blocks a correct action"}
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
@@ -178,6 +238,7 @@ Rules:
 - For current, niche, or external information, call a relevant MCP search tool before answering. Base the answer on its observation and include the returned source URLs.
 - If a required tool is unavailable or its call fails, say so plainly. Do not fabricate results and do not pretend that telling the user to search is equivalent to searching.
 - Prefer reading relevant files before editing.
+- Treat the current project index and successful tool observations as authoritative over prior assistant claims or an interrupted journal. Session history may mention files that were later moved or deleted. If a path is absent from the current index or read_file reports it missing, do not retry or assume it is still required solely from history; use the visible manifest/source evidence to continue.
 - If inspection proves the requested state already exists, return final with completion_status "already_satisfied". If evidence proves that changing files would be unnecessary or incorrect, use "no_change_needed". Copy the exact host-issued Evidence ID values from successful observations into evidence; do not invent IDs or perform a cosmetic mutation merely to create file progress. Required command/runtime/interaction verification still applies to no-change outcomes.
 - Resolve uncertainty from accessible conversation, files, manifests, configuration, and tool observations first. Uncertainty by itself is not a blocker. Use ask_user only when required information is absent after inspection and choosing incorrectly would materially change scope, compatibility, cost, data, or an irreversible effect.
 - Use ask_user instead of final for a blocking clarification. Offer 2-6 concrete, mutually distinct choices grounded in observed facts. Do not add an "Other" option; the CLI always accepts free-text answers outside the choices.
@@ -194,6 +255,11 @@ Rules:
 - Use delete_file when the user asks to remove an obsolete file. Read it first. Never simulate deletion by replacing a manifest or source file with empty content.
 - Use write_file for new files or when a complete replacement is genuinely necessary. For write_file, provide the full final file content.
 - Use write_file to create files and parent directories. Use run_command for read-only inspection, finite verification, or package/scaffold operations explicitly requested by the user; never use mkdir, New-Item, redirection, or generic shell commands to create files.
+- Use search_project first when the relevant path, symbol, import, manifest, or configuration is unknown. Use search_files for an exact text search and read_file for authoritative contents before editing.
+- If workspace inspection disproves an initial evidence requirement, use refine_task with successful workspace Evidence IDs. Do not keep an impossible visual or interaction gate after evidence shows the task has no such outcome. Refinement cannot change read-only/write scope or task type.
+- For runtime verification, prefer one finite command with expect.output_includes/output_excludes. Use mode probe only when a normally long-running package lifecycle must be exercised under a hard timeout. A zero exit code does not satisfy an explicit output assertion that failed.
+- Add output_includes/output_excludes only for exact observable text grounded in inspected source, tests, or documentation. Omit output text assertions for silent build/typecheck/test scripts; their zero exit code is the command evidence. Never invent generic success text.
+- When package.json exposes the lifecycle needed for a project-local executable, invoke that package script. Do not bypass it by calling the executable directly, constructing node_modules/.bin paths, or passing a binary path to npx. Run start/dev/serve/watch lifecycle scripts with mode "probe" and a finite timeout.
 - Verify file contents with read_file or search_files instead of shell pipelines whenever possible.
 - Never assume a localhost server is running or that a workspace file is available over HTTP. Call a local URL only after a successful observation confirms that exact server and port are running.
 - If a verification command fails, recover with an OS-compatible command or a relevant read_file/search_files action before reporting verified success.
@@ -204,8 +270,8 @@ Rules:
 - Do not run destructive commands.
 - Answer the final user in Thai unless the user asks for another language.
 
-Workspace map (paths only; request relevant contents with read_file):
-${workspaceMap}
+Project index summary (metadata and searchable excerpts only; request authoritative contents with read_file):
+${projectSummary}
 
 ${mcpSection}`;
     }
@@ -266,6 +332,21 @@ ${mcpSection}`;
             return pathValue ? { action, query, path: pathValue, ...common } : { action, query, ...common };
         }
 
+        if (action === "search_project") {
+            const query = typeof data.query === "string" ? data.query : "";
+            const pathValue = typeof data.path === "string" ? data.path : undefined;
+            const limit = typeof data.limit === "number" && Number.isFinite(data.limit)
+                ? Math.max(1, Math.min(30, Math.floor(data.limit)))
+                : undefined;
+            return {
+                action,
+                query,
+                ...(pathValue ? { path: pathValue } : {}),
+                ...(limit ? { limit } : {}),
+                ...common
+            };
+        }
+
         if (action === "read_file") {
             return {
                 action,
@@ -303,12 +384,43 @@ ${mcpSection}`;
 
         if (action === "run_command") {
             const workdir = typeof data.workdir === "string" ? data.workdir : undefined;
+            const mode = data.mode === "probe" ? "probe" : data.mode === "normal" ? "normal" : undefined;
+            const timeoutMs = typeof data.timeout_ms === "number" && Number.isFinite(data.timeout_ms)
+                ? Math.max(1000, Math.min(30000, Math.floor(data.timeout_ms)))
+                : undefined;
+            const rawExpectation = data.expect && typeof data.expect === "object" && !Array.isArray(data.expect)
+                ? data.expect as Record<string, unknown>
+                : undefined;
+            const includes = Array.isArray(rawExpectation?.output_includes)
+                ? rawExpectation.output_includes.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
+                : undefined;
+            const excludes = Array.isArray(rawExpectation?.output_excludes)
+                ? rawExpectation.output_excludes.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
+                : undefined;
+            const expect = rawExpectation ? {
+                ...(rawExpectation.exit_code === 0 ? { exit_code: 0 as const } : {}),
+                ...(includes && includes.length > 0 ? { output_includes: includes } : {}),
+                ...(excludes && excludes.length > 0 ? { output_excludes: excludes } : {})
+            } : undefined;
             return {
                 action,
                 command: typeof data.command === "string" ? data.command : "",
                 ...(workdir ? { workdir } : {}),
+                ...(mode ? { mode } : {}),
+                ...(timeoutMs ? { timeout_ms: timeoutMs } : {}),
+                ...(expect && Object.keys(expect).length > 0 ? { expect } : {}),
                 ...common
             };
+        }
+
+        if (action === "refine_task") {
+            const refinedTask = this.normalizeTaskContract(data.task);
+            const evidence = Array.isArray(data.evidence)
+                ? data.evidence.filter((item): item is string => typeof item === "string").slice(0, 8)
+                : [];
+            return refinedTask && evidence.length > 0
+                ? { action, task: refinedTask, evidence, ...common }
+                : undefined;
         }
 
         if (action === "mcp_list_tools") {
@@ -423,12 +535,14 @@ ${mcpSection}`;
         const builtInActions = new Set([
             "final",
             "list_files",
+            "search_project",
             "search_files",
             "read_file",
             "write_file",
             "edit_file",
             "delete_file",
             "run_command",
+            "refine_task",
             "mcp_list_tools",
             "mcp_call_tool"
         ]);
@@ -458,6 +572,14 @@ ${mcpSection}`;
                 }
 
                 return { ok: true, output: this.searchFiles(action.query, action.path) };
+            }
+
+            if (action.action === "search_project") {
+                if (!action.query.trim()) {
+                    return { ok: false, output: "Missing project search query." };
+                }
+                if (action.path) this.resolveInsideWorkspace(action.path);
+                return { ok: true, output: this.currentProjectIndex().search(action.query, action.limit, action.path) };
             }
 
             if (action.action === "read_file") {
@@ -490,6 +612,7 @@ ${mcpSection}`;
                 }
 
                 this.writeFile(action.path, action.content);
+                this.currentProjectIndex().markDirty();
                 return { ok: true, changed: true, output: `Wrote ${action.path}` };
             }
 
@@ -508,6 +631,7 @@ ${mcpSection}`;
                     return { ok: true, changed: false, output: `No change needed: ${action.path} already contains the requested replacement.` };
                 }
                 this.writeFile(action.path, prepared.content);
+                this.currentProjectIndex().markDirty();
                 return { ok: true, changed: true, output: `Edited ${action.path} with one exact replacement` };
             }
 
@@ -517,6 +641,7 @@ ${mcpSection}`;
                 if (!fs.existsSync(resolved)) return { ok: false, output: this.missingFileMessage(action.path) };
                 if (!fs.statSync(resolved).isFile()) return { ok: false, output: `delete_file only removes files: ${action.path}` };
                 fs.rmSync(resolved);
+                this.currentProjectIndex().markDirty();
                 return { ok: true, changed: true, output: `Deleted ${action.path}` };
             }
 
@@ -531,18 +656,49 @@ ${mcpSection}`;
                 };
             }
 
+            if (action.action === "refine_task") {
+                return { ok: false, output: "refine_task must be handled by the interactive agent loop." };
+            }
+
             if (!action.command.trim()) {
                 return { ok: false, output: "Missing command." };
             }
 
-            return { ok: true, output: await this.runCommand(action.command, action.workdir) };
+            const commandOutput = await this.runCommand(
+                action.command,
+                action.workdir,
+                action.mode,
+                action.timeout_ms,
+                action.expect
+            );
+            // Finite checks are usually read-only, but package/scaffold commands
+            // may create files. Refresh lazily before the next indexed search.
+            this.currentProjectIndex().markDirty();
+            return { ok: true, output: commandOutput };
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             if (action.action === "run_command") {
-                const guidance = commandFailureGuidance(process.cwd(), action.command, message);
+                const commandError = error as Error & { code?: string; commandOutput?: string };
+                if (commandError.code === "EOUTPUTASSERT") {
+                    return {
+                        ok: true,
+                        assertionPassed: false,
+                        output: `Command exited with code 0, but its explicit output assertion did not match. Treat the exit code as command/build evidence only; it does not prove the asserted runtime behavior. Do not repeat the same command with invented output text. Run the distinct verification required by the task or use an exact observable string grounded in inspected project evidence.\n${message}`
+                    };
+                }
+                // A timed-out or failed scaffold/install may still leave files.
+                this.currentProjectIndex().markDirty();
+                const scriptRecovery = packageScriptRecovery(process.cwd(), action.command, message, action.workdir);
+                const guidance = commandFailureGuidance(process.cwd(), action.command, message, this.inferenceApiUrl, action.workdir);
                 const sourceContext = this.diagnosticSourceContext(message, action.command, action.workdir);
                 return {
                     ok: false,
+                    failureKind: commandFailureKind(action.command, message, this.inferenceApiUrl),
+                    ...(scriptRecovery ? {
+                        recommendedCommand: scriptRecovery.command,
+                        recommendedWorkdir: scriptRecovery.workdir,
+                        ...(scriptRecovery.mode ? { recommendedMode: scriptRecovery.mode } : {})
+                    } : {}),
                     output: `Recovery guidance: ${guidance}${sourceContext ? `\n${sourceContext}` : ""}\nOriginal command error:\n${message}`
                 };
             }
@@ -552,6 +708,15 @@ ${mcpSection}`;
 
     async close(): Promise<void> {
         await this.mcpTool.close();
+    }
+
+    private currentProjectIndex(): InstanceType<typeof ProjectIndex> {
+        const workspace = path.resolve(process.cwd());
+        if (!this.projectIndex || this.indexedWorkspace !== workspace) {
+            this.projectIndex = new ProjectIndex(workspace);
+            this.indexedWorkspace = workspace;
+        }
+        return this.projectIndex;
     }
 
     prepareEdit(inputPath: string, oldText: string, newText: string): { ok: boolean; output: string; content?: string; changed?: boolean } {
@@ -603,6 +768,7 @@ ${mcpSection}`;
         };
         const target = (() => {
             if (action.action === "list_files") return `Listing files: ${clean(action.path || ".")}`;
+            if (action.action === "search_project") return `Searching project index: ${clean(action.query)}`;
             if (action.action === "search_files") return `Searching files: ${clean(action.query)}`;
             if (action.action === "read_file") return `Reading file: ${clean(action.path)}`;
             if (action.action === "write_file") return `Writing file: ${clean(action.path)}`;
@@ -610,8 +776,9 @@ ${mcpSection}`;
             if (action.action === "delete_file") return `Deleting file: ${clean(action.path)}`;
             if (action.action === "run_command") {
                 const location = action.workdir ? ` in ${clean(action.workdir)}` : "";
-                return `Running check${location}: ${clean(action.command)}`;
+                return `Running ${action.mode === "probe" ? "bounded probe" : "check"}${location}: ${clean(action.command)}`;
             }
+            if (action.action === "refine_task") return `Refining task contract: ${clean(action.task.intent)}`;
             if (action.action === "ask_user") return `Waiting for clarification: ${clean(action.question)}`;
             if (action.action === "mcp_list_tools") return `Discovering MCP tools${action.server ? `: ${clean(action.server)}` : ""}`;
             if (action.action === "mcp_call_tool") return `Calling tool: ${clean(`${action.server}.${action.tool}`)}`;
@@ -820,6 +987,7 @@ ${mcpSection}`;
         const evidenceTypes = new Set(["source", "command", "runtime", "interaction", "visual"]);
         if (typeof task.intent !== "string"
             || !taskTypes.has(String(task.task_type))
+            || typeof task.continuation !== "boolean"
             || typeof task.requires_workspace_changes !== "boolean"
             || !verificationTypes.has(String(task.verification))
             || !Array.isArray(task.evidence_requirements)
@@ -839,6 +1007,7 @@ ${mcpSection}`;
         return {
             intent: task.intent.trim().slice(0, 500),
             task_type: task.task_type as AgentTaskContract["task_type"],
+            continuation: task.continuation,
             requires_workspace_changes: task.requires_workspace_changes,
             verification: task.verification as AgentTaskContract["verification"],
             evidence_requirements: evidenceRequirements,
@@ -846,7 +1015,13 @@ ${mcpSection}`;
         };
     }
 
-    private async runCommand(command: string, workdir?: string): Promise<string> {
+    private async runCommand(
+        command: string,
+        workdir?: string,
+        mode: "normal" | "probe" = "normal",
+        requestedTimeoutMs?: number,
+        expectation?: CommandExpectation
+    ): Promise<string> {
         const normalizedCommand = process.platform === "win32"
             ? unwrapWindowsPowerShellCommand(command)
             : command.trim();
@@ -866,12 +1041,20 @@ ${mcpSection}`;
         if (!fs.existsSync(commandCwd) || !fs.statSync(commandCwd).isDirectory()) {
             throw new Error(`Command workdir is not a directory: ${workdirResolution.workdir}`);
         }
-        const interactiveRisk = commandInteractiveRisk(normalizedCommand, process.cwd(), workdirResolution.workdir);
+        const interactiveRisk = commandInteractiveRisk(
+            normalizedCommand,
+            process.cwd(),
+            workdirResolution.workdir,
+            { probe: mode === "probe" }
+        );
         if (interactiveRisk) {
             throw new Error(`Blocked interactive command: ${interactiveRisk}.`);
         }
 
-        const timeout = this.commandTimeoutOverrideMs ?? commandTimeoutMs(normalizedCommand);
+        const timeout = this.commandTimeoutOverrideMs
+            ?? (mode === "probe"
+                ? Math.max(1000, Math.min(30000, requestedTimeoutMs ?? 10000))
+                : commandTimeoutMs(normalizedCommand));
         let output = "";
         for (let attempt = 1; attempt <= 2; attempt += 1) {
             try {
@@ -885,9 +1068,26 @@ ${mcpSection}`;
         }
 
         const commandOutput = output.trim() || "[Command completed with no output]";
+        this.assertCommandOutput(commandOutput, expectation);
         return workdirResolution.autoSelected
             ? `${commandOutput}\n[Auto-selected workdir: ${workdirResolution.workdir}]`
             : commandOutput;
+    }
+
+    private assertCommandOutput(output: string, expectation?: CommandExpectation): void {
+        if (!expectation) return;
+        const missing = (expectation.output_includes ?? []).filter((text) => !output.includes(text));
+        const forbidden = (expectation.output_excludes ?? []).filter((text) => output.includes(text));
+        if (missing.length === 0 && forbidden.length === 0) return;
+        const details = [
+            missing.length > 0 ? `missing required output: ${missing.map((text) => JSON.stringify(text)).join(", ")}` : "",
+            forbidden.length > 0 ? `found forbidden output: ${forbidden.map((text) => JSON.stringify(text)).join(", ")}` : ""
+        ].filter(Boolean).join("; ");
+        const error = Object.assign(
+            new Error(`Command output assertion failed: ${details}\nObserved output:\n${output}`),
+            { code: "EOUTPUTASSERT", commandOutput: output }
+        );
+        throw error;
     }
 
     private runFiniteProcess(command: string, cwd: string, timeoutMs: number): Promise<string> {

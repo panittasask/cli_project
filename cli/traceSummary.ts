@@ -28,12 +28,14 @@ type TaskTraceSummary = {
 
 const toolActions = new Set([
     "list_files",
+    "search_project",
     "search_files",
     "read_file",
     "write_file",
     "edit_file",
     "delete_file",
     "run_command",
+    "refine_task",
     "mcp_list_tools",
     "mcp_call_tool"
 ]);

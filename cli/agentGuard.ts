@@ -122,7 +122,7 @@ class AgentGuard {
         if (action.action === "run_command" && typeof action.workdir !== "string") {
             canonicalAction.workdir = ".";
         }
-        if ((action.action === "list_files" || action.action === "search_files")
+        if ((action.action === "list_files" || action.action === "search_project" || action.action === "search_files")
             && typeof action.path !== "string") {
             canonicalAction.path = ".";
         }

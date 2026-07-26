@@ -110,12 +110,18 @@ function verificationRequirementWithHistory(
     return "none";
 }
 
-function commandSatisfiesVerification(command: string, requirement: VerificationRequirement): boolean {
+function commandSatisfiesVerification(
+    command: string,
+    requirement: VerificationRequirement,
+    options: { probe?: boolean } = {}
+): boolean {
     if (requirement === "none") return true;
     const clean = command.toLowerCase();
     if (requirement === "runtime") {
         return /invoke-webrequest|invoke-restmethod|\bcurl(?:\.exe)?\b|\bwget(?:\.exe)?\b|https?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)/i.test(clean)
-            || /\b(playwright|cypress|selenium|test:e2e|e2e:test)\b/i.test(clean);
+            || /\b(playwright|cypress|selenium|test:e2e|e2e:test)\b/i.test(clean)
+            || (options.probe === true
+                && /\b(?:npm(?:\.cmd)?\s+(?:start|run\s+(?:start|dev|serve))|pnpm\s+(?:start|dev|serve)|yarn\s+(?:start|dev|serve)|bun\s+(?:start|dev|serve)|go\s+run|cargo\s+run|dotnet\s+run)\b/i.test(clean));
     }
     return /\b(test|check|verify|lint|typecheck|tsc|build|compile|go\s+test|go\s+build|cargo\s+test|pytest|unittest|dotnet\s+test|mvn\s+test|gradle\s+test)\b/i.test(clean);
 }
@@ -161,12 +167,16 @@ function acceptanceContractWithHistory(
     return inherited;
 }
 
-function commandSatisfiesAcceptance(command: string, contract: AcceptanceContract): boolean {
+function commandSatisfiesAcceptance(
+    command: string,
+    contract: AcceptanceContract,
+    options: { probe?: boolean } = {}
+): boolean {
     if (contract.evidence === "source") return true;
     if (contract.evidence === "interaction") {
         return /\b(playwright|cypress|selenium|webdriver|test:e2e|e2e:test|e2e)\b/i.test(command);
     }
-    return commandSatisfiesVerification(command, contract.verification);
+    return commandSatisfiesVerification(command, contract.verification, options);
 }
 
 function workflowInstructions(kind: WorkflowKind): string {
@@ -195,7 +205,7 @@ function workflowInstructions(kind: WorkflowKind): string {
     return `Workflow: general agent request.
 - Decide from the current request and relevant session context whether local workspace tools are needed.
 - For ordinary conversation, return final without calling tools.
-- For workspace inspection or changes, use list_files, search_files, read_file, write_file, or run_command as needed.
+- For workspace inspection or changes, use search_project, list_files, search_files, read_file, write_file, or run_command as needed.
 - For external or current information, use a discovered web-search MCP tool and cite the returned source URLs.
 - Do not search local files for general knowledge or use them as a substitute for web research.`;
 }

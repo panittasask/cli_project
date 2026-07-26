@@ -1,5 +1,10 @@
 import fs = require("node:fs");
 import path = require("node:path");
+const { DEFAULT_LLM_MESSAGE_COLOR, isSupportedTerminalColor, normalizeTerminalColor } = require("./terminalStyle") as {
+    DEFAULT_LLM_MESSAGE_COLOR: string;
+    isSupportedTerminalColor: (value: unknown) => boolean;
+    normalizeTerminalColor: (value: unknown) => string | undefined;
+};
 
 type SamplingSettings = {
     temperature: number;
@@ -23,6 +28,9 @@ type CliSettings = {
     hardwareProfile?: "auto" | "intel-arc" | "rtx-4070-super" | "default";
     debug?: boolean;
     historyMessages?: number;
+    terminal?: {
+        llmMessageColor?: string | number;
+    };
     agent?: {
         profile?: AgentBudgetProfile;
         maxTurns?: number;
@@ -120,7 +128,7 @@ const defaults: Record<SamplingKind, SamplingSettings> = {
         top_p: 0.9,
         top_k: 20,
         repeat_penalty: 1.05,
-        max_tokens: 2048
+        max_tokens: 4096
     }
 };
 
@@ -197,6 +205,15 @@ function validateCliSettings(input: unknown): string[] {
     if (settings.hardwareProfile !== undefined && (typeof settings.hardwareProfile !== "string"
         || !["auto", "intel-arc", "rtx-4070-super", "default"].includes(settings.hardwareProfile))) {
         errors.push("hardwareProfile must be auto, intel-arc, rtx-4070-super, or default");
+    }
+
+    if (settings.terminal !== undefined && (!settings.terminal || typeof settings.terminal !== "object" || Array.isArray(settings.terminal))) {
+        errors.push("terminal must be an object");
+    } else if (settings.terminal) {
+        const terminal = settings.terminal as Record<string, unknown>;
+        if (terminal.llmMessageColor !== undefined && !isSupportedTerminalColor(terminal.llmMessageColor)) {
+            errors.push("terminal.llmMessageColor must be a supported color name or ANSI foreground code (30-37, 39, or 90-97)");
+        }
     }
 
     if (settings.agent !== undefined && (!settings.agent || typeof settings.agent !== "object" || Array.isArray(settings.agent))) {
@@ -363,9 +380,16 @@ function getProjectCheckProviders(settings: CliSettings): ProjectCheckProvider[]
     });
 }
 
+function getTerminalSettings(settings: CliSettings): { llmMessageColor: string } {
+    return {
+        llmMessageColor: normalizeTerminalColor(settings.terminal?.llmMessageColor) ?? DEFAULT_LLM_MESSAGE_COLOR
+    };
+}
+
 module.exports = {
     getClarificationSettings,
     getProjectCheckProviders,
+    getTerminalSettings,
     initializeCliSettings,
     validateCliSettings,
     validateCliSettingsFile,

@@ -4,7 +4,7 @@ import http = require("node:http");
 import net = require("node:net");
 import os = require("node:os");
 import path = require("node:path");
-const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, initializeCliSettings, validateCliSettings, validateCliSettingsFile } = require("../cli/config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, getTerminalSettings, initializeCliSettings, validateCliSettings, validateCliSettingsFile } = require("../cli/config") as {
     loadCliSettings: (root?: string) => Record<string, unknown>;
     getSamplingSettings: (settings: Record<string, unknown>, kind: "action") => Record<string, number>;
     getAgentGuardSettings: (settings: Record<string, unknown>) => {
@@ -17,17 +17,36 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarific
     };
     getClarificationSettings: (settings: Record<string, unknown>) => { maxClarifications: number; requireInspection: boolean; secondRequiresBlocker: boolean };
     getProjectCheckProviders: (settings: Record<string, unknown>) => Array<Record<string, unknown>>;
+    getTerminalSettings: (settings: Record<string, unknown>) => { llmMessageColor: string };
     initializeCliSettings: (root?: string) => { created: boolean; path: string; message: string };
     validateCliSettings: (settings: unknown) => string[];
     validateCliSettingsFile: (root?: string) => { ok: boolean; source: string; errors: string[] };
 };
-const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number) => {
-    parseAction: (content: string) => { action?: string; reason?: string; path?: string; old_text?: string; new_text?: string; workdir?: string } | undefined;
+const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number, inferenceApiUrl?: string) => {
+    parseAction: (content: string) => {
+        action?: string;
+        reason?: string;
+        path?: string;
+        old_text?: string;
+        new_text?: string;
+        workdir?: string;
+        mode?: "normal" | "probe";
+        timeout_ms?: number;
+        expect?: { exit_code?: 0; output_includes?: string[]; output_excludes?: string[] };
+        task?: Record<string, unknown>;
+        evidence?: string[];
+    } | undefined;
     explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
-    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean }>;
+    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean; assertionPassed?: boolean; failureKind?: string }>;
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     close: () => Promise<void>;
+} };
+const { ProjectIndex } = require("../cli/projectIndex") as { ProjectIndex: new (workspace: string) => {
+    markDirty: () => void;
+    refresh: (force?: boolean) => void;
+    summary: () => string;
+    search: (query: string, limit?: number, path?: string) => string;
 } };
 const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settings: { maxTurns: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number }) => {
     checkBudget: (step: number) => string | undefined;
@@ -40,10 +59,33 @@ const { buildStatusBarFrame, formatStatusBar } = require("../cli/statusBar") as 
     buildStatusBarFrame: (state: { model: string; contextUsed: number; contextLimit: number; workspace: string }, columns: number, rows: number) => string;
     formatStatusBar: (state: { model: string; contextUsed: number; contextLimit: number; workspace: string }, columns: number) => string;
 };
-const { formatCompletionLine, formatElapsedTime, formatSpinnerLine } = require("../cli/spinner") as {
+const { formatCompletionLine, formatElapsedTime, formatSpinnerLine, formatSpinnerLog } = require("../cli/spinner") as {
     formatCompletionLine: (milliseconds: number, completed?: boolean) => string;
     formatElapsedTime: (milliseconds: number) => string;
     formatSpinnerLine: (frame: string, message: string, stepMilliseconds: number, totalMilliseconds: number, columns?: number) => string;
+    formatSpinnerLog: (message: string) => string;
+};
+const { formatAiResponse } = require("../cli/terminalStyle") as {
+    formatAiResponse: (answer: string, colors?: boolean, messageColor?: string | number) => string;
+};
+const {
+    MAX_REASONING_ONLY_RETRIES,
+    REASONING_ONLY_PARSE_ERROR,
+    formatReasoningOnlyRecoveryPrompt,
+    isReasoningOnlyTruncation,
+    reasoningOnlyRetryMaxTokens
+} = require("../cli/modelResponseRecovery") as {
+    MAX_REASONING_ONLY_RETRIES: number;
+    REASONING_ONLY_PARSE_ERROR: string;
+    formatReasoningOnlyRecoveryPrompt: (attempt: number) => string;
+    isReasoningOnlyTruncation: (response: { content: unknown; reasoningContent: unknown; finishReason: unknown }) => boolean;
+    reasoningOnlyRetryMaxTokens: (configuredMaxTokens: number) => number;
+};
+const { formatThinkingDetails } = require("../cli/logViewerPresentation") as {
+    formatThinkingDetails: (response: { reasoningContent?: unknown; finishReason?: unknown }) => string;
+};
+const { generateLogViewer } = require("./generate-log-viewer") as {
+    generateLogViewer: (root?: string) => string;
 };
 const { formatSessionHistory } = require("../cli/sessionHistory") as {
     formatSessionHistory: (messages: Array<{ role: "user" | "assistant"; content: string }>, maxMessages?: number) => string;
@@ -323,7 +365,8 @@ async function main(): Promise<void> {
             requireInspection: true,
             secondRequiresBlocker: true
         });
-        assert.equal(getSamplingSettings(prototypeSettings, "action").max_tokens, 2048);
+        assert.equal(getSamplingSettings(prototypeSettings, "action").max_tokens, 4096);
+        assert.deepEqual(getTerminalSettings(prototypeSettings), { llmMessageColor: "blue" });
         assert.deepEqual(validateCliSettings(prototypeSettings), []);
         assert.equal(validateCliSettingsFile(settingsInitRoot).source, "settings.example.json");
         const initialized = initializeCliSettings(settingsInitRoot);
@@ -333,13 +376,14 @@ async function main(): Promise<void> {
         const repeated = initializeCliSettings(settingsInitRoot);
         assert.equal(repeated.created, false);
         assert.deepEqual(loadCliSettings(settingsInitRoot), { preserved: true });
-        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, hardwareProfile: "unknown", agent: { maxSegments: -1 }, sampling: { action: { top_p: 3 } } }), "utf8");
+        fs.writeFileSync(initialized.path, JSON.stringify({ contextLength: 12, hardwareProfile: "unknown", terminal: { llmMessageColor: "\u001b[31m" }, agent: { maxSegments: -1 }, sampling: { action: { top_p: 3 } } }), "utf8");
         const invalidSettings = validateCliSettingsFile(settingsInitRoot);
         assert.equal(invalidSettings.ok, false);
         assert.match(invalidSettings.errors.join("\n"), /contextLength/);
         assert.match(invalidSettings.errors.join("\n"), /agent\.maxSegments/);
         assert.match(invalidSettings.errors.join("\n"), /sampling\.action\.top_p/);
         assert.match(invalidSettings.errors.join("\n"), /hardwareProfile/);
+        assert.match(invalidSettings.errors.join("\n"), /terminal\.llmMessageColor/);
     } finally {
         fs.rmSync(settingsInitRoot, { recursive: true, force: true });
     }
@@ -430,6 +474,91 @@ async function main(): Promise<void> {
         affectedFiles: []
     }]);
     assert.deepEqual(getProjectCheckProviders({ projectChecks: [{ manifest: "../outside.json", command: "bad\ncommand" }] }), []);
+    assert.deepEqual(getTerminalSettings({}), { llmMessageColor: "blue" });
+    assert.deepEqual(getTerminalSettings({ terminal: { llmMessageColor: "bright_blue" } }), { llmMessageColor: "bright-blue" });
+    assert.deepEqual(getTerminalSettings({ terminal: { llmMessageColor: 94 } }), { llmMessageColor: "94" });
+    assert.deepEqual(validateCliSettings({ terminal: { llmMessageColor: "green" } }), []);
+    assert.deepEqual(validateCliSettings({ terminal: { llmMessageColor: "94" } }), []);
+    assert.match(validateCliSettings({ terminal: { llmMessageColor: 38 } }).join("\n"), /terminal\.llmMessageColor/);
+    assert.equal(isReasoningOnlyTruncation({
+        content: "",
+        reasoningContent: "unfinished reasoning",
+        finishReason: "length"
+    }), true);
+    assert.equal(isReasoningOnlyTruncation({
+        content: "{\"action\":\"read_file\"}",
+        reasoningContent: "reasoning",
+        finishReason: "length"
+    }), false);
+    assert.equal(isReasoningOnlyTruncation({
+        content: "",
+        reasoningContent: "",
+        finishReason: "length"
+    }), false);
+    assert.equal(isReasoningOnlyTruncation({
+        content: "",
+        reasoningContent: "reasoning",
+        finishReason: "stop"
+    }), false);
+    assert.equal(reasoningOnlyRetryMaxTokens(2048), 4096);
+    assert.equal(reasoningOnlyRetryMaxTokens(4096), 8192);
+    assert.equal(reasoningOnlyRetryMaxTokens(10_000), 10_000);
+    assert.equal(MAX_REASONING_ONLY_RETRIES, 2);
+    assert.match(REASONING_ONLY_PARSE_ERROR, /reasoning-only/);
+    assert.match(formatReasoningOnlyRecoveryPrompt(1), /exactly one compact JSON action immediately/);
+    const fullThinkingText = `Inspect <source> & preserve the complete response.\n${"reasoning ".repeat(800)}`;
+    const completeThinkingDetails = formatThinkingDetails({
+        reasoningContent: fullThinkingText,
+        finishReason: "stop"
+    });
+    assert.match(completeThinkingDetails, /^<details class="thinking">/);
+    assert.doesNotMatch(completeThinkingDetails, /<details[^>]*\sopen/);
+    assert.match(completeThinkingDetails, /complete response/);
+    assert.doesNotMatch(completeThinkingDetails, /truncated by model limit/);
+    assert.ok(completeThinkingDetails.includes("Inspect &lt;source&gt; &amp; preserve"));
+    assert.ok(completeThinkingDetails.includes("reasoning ".repeat(800)));
+    const truncatedThinkingDetails = formatThinkingDetails({
+        reasoningContent: "unfinished reasoning",
+        finishReason: "length"
+    });
+    assert.match(truncatedThinkingDetails, /truncated by model limit/);
+    assert.equal(formatThinkingDetails({ reasoningContent: "", finishReason: "stop" }), "");
+    const logViewerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cli-log-viewer-"));
+    try {
+        const agentLogDirectory = path.join(logViewerRoot, ".cli", "logs", "agent");
+        fs.mkdirSync(agentLogDirectory, { recursive: true });
+        fs.writeFileSync(path.join(agentLogDirectory, "agent-trace-2026-07-27.jsonl"), `${JSON.stringify({
+            taskId: "task_log_option",
+            turn: 1,
+            status: "ok",
+            action: "read_file",
+            observation: "viewer evidence",
+            timestamp: "2026-07-27T00:00:00.000Z"
+        })}\n`, "utf8");
+        fs.writeFileSync(path.join(agentLogDirectory, "agent-model-responses-2026-07-27.jsonl"), `${JSON.stringify({
+            taskId: "task_log_option",
+            turn: 1,
+            parsedAction: "read_file",
+            rawContent: "{\"action\":\"read_file\"}",
+            reasoningContent: "full saved thinking",
+            finishReason: "stop",
+            timestamp: "2026-07-27T00:00:01.000Z"
+        })}\n`, "utf8");
+        fs.writeFileSync(path.join(logViewerRoot, ".cli-sessions.json"), JSON.stringify({
+            sessions: [{ id: "session_log_option", title: "Log option session", messages: [] }]
+        }), "utf8");
+        const viewerPath = generateLogViewer(logViewerRoot);
+        assert.equal(viewerPath, path.join(logViewerRoot, ".cli", "log-viewer.html"));
+        const viewerHtml = fs.readFileSync(viewerPath, "utf8");
+        assert.match(viewerHtml, /task_log_option/);
+        assert.match(viewerHtml, /Log option session/);
+        assert.match(viewerHtml, /full saved thinking/);
+        assert.match(viewerHtml, /details class=\\"thinking\\"/);
+        assert.match(viewerHtml, /prettyJson\(observation\)/);
+        assert.match(viewerHtml, /prettyJson\(r\.rawContent\)/);
+    } finally {
+        fs.rmSync(logViewerRoot, { recursive: true, force: true });
+    }
 
     const agent = new AgentTool();
     const action = agent.parseAction(JSON.stringify({
@@ -439,6 +568,13 @@ async function main(): Promise<void> {
     }));
     assert.equal(action?.action, "read_file");
     assert.equal(action?.reason, "Inspect the project documentation.");
+    const projectSearchAction = agent.parseAction(JSON.stringify({
+        action: "search_project",
+        query: "TypeScript configuration",
+        limit: 8,
+        reason: "Find the project configuration before reading it."
+    }));
+    assert.equal(projectSearchAction?.action, "search_project");
     assert.equal(agent.parseAction([
         "I will inspect the project.",
         JSON.stringify({ note: "not an action" }),
@@ -475,9 +611,85 @@ async function main(): Promise<void> {
     }));
     assert.equal(commandAction?.action, "run_command");
     assert.equal(commandAction?.workdir, "go");
+    const probeAction = agent.parseAction(JSON.stringify({
+        action: "run_command",
+        command: "npm start",
+        mode: "probe",
+        timeout_ms: 5000,
+        expect: {
+            exit_code: 0,
+            output_includes: ["runtime ready"],
+            output_excludes: ["runtime failed"]
+        },
+        reason: "Run a bounded runtime verification."
+    }));
+    assert.equal(probeAction?.mode, "probe");
+    assert.equal(probeAction?.timeout_ms, 5000);
+    assert.deepEqual(probeAction?.expect?.output_includes, ["runtime ready"]);
+    const refinedAction = agent.parseAction(JSON.stringify({
+        action: "refine_task",
+        task: {
+            intent: "Verify a console network program",
+            task_type: "coding",
+            continuation: false,
+            requires_workspace_changes: true,
+            verification: "runtime",
+            evidence_requirements: ["source", "runtime"],
+            success_criteria: ["The finite runtime command completes without its error output"]
+        },
+        evidence: ["evidence_2_read_file"],
+        reason: "Inspected source proves there is no rendered visual outcome."
+    }));
+    assert.equal(refinedAction?.action, "refine_task");
+    assert.deepEqual(refinedAction?.evidence, ["evidence_2_read_file"]);
     assert.equal(agent.parseAction('{"action":"unknown_action"}'), undefined);
     assert.equal(agent.explainParseFailure("plain text summary"), "no valid JSON object found in model content");
     assert.equal(agent.explainParseFailure('{"action":"unknown_action"}'), "unsupported action: unknown_action");
+
+    const indexWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-project-index-"));
+    try {
+        fs.mkdirSync(path.join(indexWorkspace, "src"), { recursive: true });
+        fs.writeFileSync(path.join(indexWorkspace, "package.json"), JSON.stringify({
+            name: "indexed-project",
+            scripts: { test: "tsc --noEmit" }
+        }), "utf8");
+        fs.writeFileSync(path.join(indexWorkspace, "tsconfig.json"), JSON.stringify({
+            compilerOptions: { strict: true }
+        }), "utf8");
+        fs.writeFileSync(path.join(indexWorkspace, "tsconfig.ts"), "", "utf8");
+        fs.writeFileSync(path.join(indexWorkspace, "src", "index.ts"), [
+            "import axios from \"axios\";",
+            "export async function loadRecord() {",
+            "  try { return await axios.get('/record'); }",
+            "  catch (error: unknown) {",
+            "    if (error instanceof Error) console.error(error.message);",
+            "  }",
+            "}"
+        ].join("\n"), "utf8");
+        const projectIndex = new ProjectIndex(indexWorkspace);
+        const summary = projectIndex.summary();
+        assert.match(summary, /Indexed project: 4 files/);
+        assert.match(summary, /tsconfig\.json/);
+        const configSearch = JSON.parse(projectIndex.search("tsconfig", 5)) as {
+            results: Array<{ path: string; kind: string }>;
+        };
+        assert.equal(configSearch.results[0]?.path, "tsconfig.json");
+        assert.equal(configSearch.results[0]?.kind, "config");
+        const sourceSearch = JSON.parse(projectIndex.search("axios error handling", 5)) as {
+            results: Array<{ path: string; symbols: string[] }>;
+        };
+        assert.equal(sourceSearch.results[0]?.path, "src/index.ts");
+        assert.ok(sourceSearch.results[0]?.symbols.includes("loadRecord"));
+        fs.writeFileSync(path.join(indexWorkspace, "src", "worker.ts"), "export function refreshProjectCache() { return true; }\n", "utf8");
+        projectIndex.markDirty();
+        const updatedSearch = JSON.parse(projectIndex.search("refreshProjectCache", 5)) as {
+            results: Array<{ path: string }>;
+        };
+        assert.equal(updatedSearch.results[0]?.path, "src/worker.ts");
+        assert.equal(fs.existsSync(path.join(indexWorkspace, ".cli", "cache", "project-index-v1.json")), true);
+    } finally {
+        fs.rmSync(indexWorkspace, { recursive: true, force: true });
+    }
     assert.equal(formatStatusBar({
         model: "model.gguf",
         contextUsed: 1200,
@@ -505,6 +717,12 @@ async function main(): Promise<void> {
     assert.equal(formatElapsedTime(3_661_000), "01:01:01");
     assert.equal(formatCompletionLine(434_000), "Completed in 07:14");
     assert.equal(formatCompletionLine(65_000, false), "Stopped after 01:05");
+    assert.equal(formatAiResponse("hello", false), "\nAI:\n\nhello\n");
+    assert.match(formatAiResponse("hello", true), /\x1b\[34mAI:/);
+    assert.match(formatAiResponse("hello", true), /\x1b\[34mhello/);
+    assert.match(formatAiResponse("hello", true, "bright-blue"), /\x1b\[94mhello/);
+    assert.match(formatAiResponse("hello", true, 32), /\x1b\[32mhello/);
+    assert.match(formatAiResponse("hello", true, "not-a-color"), /\x1b\[34mhello/);
     const localLogDate = new Date(2026, 6, 16, 12, 0, 0);
     assert.equal(formatLocalDate(localLogDate), "2026-07-16");
     assert.equal(
@@ -514,6 +732,8 @@ async function main(): Promise<void> {
     const spinnerLine = formatSpinnerLine("⠹", "Reviewing results and planning (9/12)...", 98_000, 434_000, 80);
     assert.ok(spinnerLine.includes("step 01:38 | total 07:14"));
     assert.ok(spinnerLine.length <= 79);
+    assert.equal(formatSpinnerLog("[step 5/25] Searching files: src"), "[step 5/25] Searching files: src\n\n");
+    assert.equal(formatSpinnerLog("Task understood as workspace_edit"), "Task understood as workspace_edit\n");
     const renderedHistory = formatSessionHistory(Array.from({ length: 8 }, (_, index) => ({
         role: index % 2 === 0 ? "user" as const : "assistant" as const,
         content: `message ${index + 1}${index === 7 ? "\nsecond line" : ""}`
@@ -556,6 +776,27 @@ async function main(): Promise<void> {
     const interactiveServer = await agent.execute({ action: "run_command", command: "ng serve --open" });
     assert.equal(interactiveServer.ok, false);
     assert.match(interactiveServer.output, /Blocked interactive command/);
+    const assertionPassed = await agent.execute({
+        action: "run_command",
+        command: "node -e \"console.log('runtime-ready')\"",
+        mode: "probe",
+        timeout_ms: 5000,
+        expect: { output_includes: ["runtime-ready"], output_excludes: ["runtime-failed"] }
+    });
+    assert.equal(assertionPassed.ok, true);
+    const assertionFailed = await agent.execute({
+        action: "run_command",
+        command: "node -e \"console.log('runtime-failed')\"",
+        mode: "probe",
+        timeout_ms: 5000,
+        expect: { output_includes: ["runtime-ready"], output_excludes: ["runtime-failed"] }
+    });
+    assert.equal(assertionFailed.ok, true);
+    assert.equal(assertionFailed.assertionPassed, false);
+    assert.match(assertionFailed.output, /exited with code 0/);
+    assert.match(assertionFailed.output, /Command output assertion failed/);
+    assert.match(assertionFailed.output, /missing required output/);
+    assert.match(assertionFailed.output, /found forbidden output/);
     if (process.platform === "win32") {
         const reservation = net.createServer();
         await new Promise<void>((resolve, reject) => {
@@ -780,6 +1021,7 @@ async function main(): Promise<void> {
             observation: JSON.stringify({
                 intent: "แก้พฤติกรรม modal",
                 task_type: "coding",
+                continuation: false,
                 requires_workspace_changes: true,
                 verification: "interaction",
                 evidence_requirements: ["interaction"],
