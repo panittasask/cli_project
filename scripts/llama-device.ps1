@@ -214,10 +214,19 @@ function New-LlamaRouterPreset {
         [string]$DefaultModelName,
 
         [Parameter(Mandatory = $true)]
+        [ValidateRange(512, [int]::MaxValue)]
+        [int]$ContextLength,
+
+        [Parameter(Mandatory = $true)]
         [string]$OutputPath
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("version = 1")
+    $lines.Add("")
+    $lines.Add("[*]")
+    $lines.Add("ctx-size = $ContextLength")
+    $lines.Add("")
     foreach ($model in $Models) {
         $modelId = [IO.Path]::GetFileNameWithoutExtension($model.Name)
         $speculative = Get-LlamaSpeculativeProfile -ServerExecutable $ServerExecutable -ModelPath $model.FullName

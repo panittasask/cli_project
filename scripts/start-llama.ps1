@@ -75,7 +75,7 @@ for ($index = 0; $index -lt $models.Count; $index += 1) {
 $selectedModel = $null
 $serverArguments = @("-c", $parsedContextLength.ToString(), "-b", $runtimeProfile.BatchSize.ToString(), "-ub", $runtimeProfile.UBatchSize.ToString(), "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString())
 if ($routerMode) {
-    $routerPreset = New-LlamaRouterPreset -ServerExecutable $launcher -Models $models -DefaultModelName $models[$defaultModelIndex].Name -OutputPath (Join-Path $appRoot ".cli\router-models.ini")
+    $routerPreset = New-LlamaRouterPreset -ServerExecutable $launcher -Models $models -DefaultModelName $models[$defaultModelIndex].Name -ContextLength $parsedContextLength -OutputPath (Join-Path $appRoot ".cli\router-models.ini")
     $serverArguments += @("--models-preset", $routerPreset, "--models-max", $parsedModelsMax.ToString())
     $speculativeProfile = [pscustomobject]@{ Arguments = @(); Description = "off (router mode; configure per-model presets for MTP)" }
 } else {

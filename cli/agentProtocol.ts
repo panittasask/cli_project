@@ -51,7 +51,7 @@ const variants: Record<string, Record<string, unknown>> = {
         properties: {
             action: { const: "final" },
             answer: stringProperty,
-            completion_status: { enum: ["completed", "already_satisfied", "no_change_needed"] },
+            completion_status: { enum: ["completed", "already_satisfied", "no_change_needed", "incomplete"] },
             evidence: { type: "array", maxItems: 8, items: stringProperty },
             reason: stringProperty
         },

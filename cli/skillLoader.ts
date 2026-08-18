@@ -1,18 +1,30 @@
 import fs = require("node:fs");
+import os = require("node:os");
 import path = require("node:path");
 
 type ProjectSkill = { name: string; description: string; body: string; filePath: string };
 
 class SkillLoader {
+    private readonly userSkillsRoot: string;
+
+    constructor(userSkillsRoot = path.join(os.homedir(), ".codex", "skills")) {
+        this.userSkillsRoot = userSkillsRoot;
+    }
+
     discover(workspace: string): ProjectSkill[] {
-        const root = path.join(workspace, ".cli", "skills");
-        if (!fs.existsSync(root)) return [];
-        return fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).flatMap((entry) => {
-            const filePath = path.join(root, entry.name, "SKILL.md");
-            if (!fs.existsSync(filePath)) return [];
-            const parsed = parseSkill(fs.readFileSync(filePath, "utf8"), filePath);
-            return parsed ? [parsed] : [];
-        }).sort((a, b) => a.name.localeCompare(b.name));
+        const skillsByName = new Map<string, ProjectSkill>();
+        const roots = [
+            this.userSkillsRoot,
+            path.join(workspace, ".cli", "skills")
+        ];
+
+        for (const root of uniquePaths(roots)) {
+            for (const skill of discoverRoot(root)) {
+                skillsByName.set(skill.name.toLowerCase(), skill);
+            }
+        }
+
+        return [...skillsByName.values()].sort((a, b) => a.name.localeCompare(b.name));
     }
 
     select(message: string, skills: ProjectSkill[], maxSkills = 2): ProjectSkill[] {
@@ -30,6 +42,27 @@ class SkillLoader {
         if (skills.length === 0) return "";
         return skills.map((skill) => `Project skill: ${skill.name}\n${skill.body.slice(0, 12000)}`).join("\n\n---\n\n");
     }
+}
+
+function discoverRoot(root: string): ProjectSkill[] {
+    if (!fs.existsSync(root)) return [];
+    return fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).flatMap((entry) => {
+        const filePath = path.join(root, entry.name, "SKILL.md");
+        if (!fs.existsSync(filePath)) return [];
+        const parsed = parseSkill(fs.readFileSync(filePath, "utf8"), filePath);
+        return parsed ? [parsed] : [];
+    });
+}
+
+function uniquePaths(paths: string[]): string[] {
+    const seen = new Set<string>();
+    return paths.filter((candidate) => {
+        const resolved = path.resolve(candidate);
+        const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 function parseSkill(content: string, filePath: string): ProjectSkill | undefined {

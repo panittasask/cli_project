@@ -33,12 +33,13 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (con
         mode?: "normal" | "probe";
         timeout_ms?: number;
         expect?: { exit_code?: 0; output_includes?: string[]; output_excludes?: string[] };
+        completion_status?: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
         task?: Record<string, unknown>;
         evidence?: string[];
     } | undefined;
     explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
-    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean; assertionPassed?: boolean; failureKind?: string }>;
+    execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean; assertionPassed?: boolean; probeTimedOut?: boolean; failureKind?: string }>;
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     close: () => Promise<void>;
 } };
@@ -67,6 +68,50 @@ const { formatCompletionLine, formatElapsedTime, formatSpinnerLine, formatSpinne
 };
 const { formatAiResponse } = require("../cli/terminalStyle") as {
     formatAiResponse: (answer: string, colors?: boolean, messageColor?: string | number) => string;
+};
+const {
+    acceptInputSuggestion,
+    applyInputSuggestion,
+    buildInputSuggestions,
+    moveSuggestionSelection
+} = require("../cli/inputSuggestions") as {
+    acceptInputSuggestion: (
+        line: string,
+        cursor: number,
+        suggestion: {
+            kind: "slash" | "skill" | "model";
+            value: string;
+            description: string;
+            replaceStart: number;
+            replaceEnd: number;
+            appendSpace: boolean;
+        },
+        keyName: "enter" | "return" | "tab"
+    ) => { line: string; cursor: number; submit: boolean };
+    applyInputSuggestion: (line: string, suggestion: {
+        kind: "slash" | "skill" | "model";
+        value: string;
+        description: string;
+        replaceStart: number;
+        replaceEnd: number;
+        appendSpace: boolean;
+    }) => { line: string; cursor: number };
+    buildInputSuggestions: (input: {
+        line: string;
+        cursor: number;
+        slashCommands: Array<{ value: string; description: string }>;
+        skills: Array<{ value: string; description: string }>;
+        models: Array<{ value: string; description: string }>;
+        limit?: number;
+    }) => Array<{
+        kind: "slash" | "skill" | "model";
+        value: string;
+        description: string;
+        replaceStart: number;
+        replaceEnd: number;
+        appendSpace: boolean;
+    }>;
+    moveSuggestionSelection: (current: number, count: number, direction: -1 | 1) => number;
 };
 const {
     MAX_REASONING_ONLY_RETRIES,
@@ -312,6 +357,104 @@ async function main(): Promise<void> {
     await testConnectionResetRetry();
     await testRequestCancellation();
     await testModelRouterSwitch();
+
+    const skillCompletionLine = "ช่วยตรวจ $fi";
+    const skillCompletions = buildInputSuggestions({
+        line: skillCompletionLine,
+        cursor: skillCompletionLine.length,
+        slashCommands: [],
+        skills: [
+            { value: "fix-ui-alignment", description: "Fix layout alignment" },
+            { value: "release-helper", description: "Validate releases" }
+        ],
+        models: []
+    });
+    assert.deepEqual(skillCompletions.map((item) => item.value), ["$fix-ui-alignment"]);
+    assert.deepEqual(applyInputSuggestion(skillCompletionLine, skillCompletions[0]!), {
+        line: "ช่วยตรวจ $fix-ui-alignment ",
+        cursor: "ช่วยตรวจ $fix-ui-alignment ".length
+    });
+    const midTokenLine = "ใช้ $fix-ui งานนี้";
+    const midTokenCursor = "ใช้ $fi".length;
+    const midTokenCompletion = buildInputSuggestions({
+        line: midTokenLine,
+        cursor: midTokenCursor,
+        slashCommands: [],
+        skills: [{ value: "fix-ui-alignment", description: "Fix layout alignment" }],
+        models: []
+    })[0]!;
+    assert.deepEqual(applyInputSuggestion(midTokenLine, midTokenCompletion), {
+        line: "ใช้ $fix-ui-alignment งานนี้",
+        cursor: "ใช้ $fix-ui-alignment".length
+    });
+    const modelCompletionLine = "/model qwy";
+    const modelCompletions = buildInputSuggestions({
+        line: modelCompletionLine,
+        cursor: modelCompletionLine.length,
+        slashCommands: [],
+        skills: [],
+        models: [
+            { value: "Qwythos-9B.gguf", description: "loaded" },
+            { value: "Qwen-Coder.gguf", description: "unloaded" }
+        ]
+    });
+    assert.deepEqual(modelCompletions.map((item) => item.value), ["Qwythos-9B.gguf"]);
+    assert.equal(applyInputSuggestion(modelCompletionLine, modelCompletions[0]!).line, "/model Qwythos-9B.gguf ");
+    const exactModelCompletions = buildInputSuggestions({
+        line: "/model",
+        cursor: "/model".length,
+        slashCommands: [{ value: "/model", description: "switch model" }],
+        skills: [],
+        models: [{ value: "Qwythos-9B.gguf", description: "loaded" }]
+    });
+    assert.deepEqual(exactModelCompletions.map((item) => item.value), ["/model Qwythos-9B.gguf"]);
+    assert.equal(applyInputSuggestion("/model", exactModelCompletions[0]!).line, "/model Qwythos-9B.gguf ");
+    const slashCompletions = buildInputSuggestions({
+        line: "/mo",
+        cursor: 3,
+        slashCommands: [
+            { value: "/model", description: "switch model" },
+            { value: "/mode", description: "switch mode" }
+        ],
+        skills: [],
+        models: []
+    });
+    assert.deepEqual(slashCompletions.map((item) => item.value), ["/model", "/mode"]);
+    const exitSuggestion = buildInputSuggestions({
+        line: "/",
+        cursor: 1,
+        slashCommands: [
+            { value: "/exit", description: "exit the app" },
+            { value: "/model", description: "switch model" }
+        ],
+        skills: [],
+        models: []
+    }).find((item) => item.value === "/exit")!;
+    assert.deepEqual(acceptInputSuggestion("/", 1, exitSuggestion, "enter"), {
+        line: "/exit",
+        cursor: "/exit".length,
+        submit: true
+    });
+    assert.equal(acceptInputSuggestion("/", 1, exitSuggestion, "tab").submit, false);
+    const exactExitSuggestion = buildInputSuggestions({
+        line: "/exit",
+        cursor: "/exit".length,
+        slashCommands: [{ value: "/exit", description: "exit the app" }],
+        skills: [],
+        models: []
+    })[0]!;
+    assert.equal(acceptInputSuggestion("/exit", "/exit".length, exactExitSuggestion, "enter").submit, true);
+    assert.equal(acceptInputSuggestion(skillCompletionLine, skillCompletionLine.length, skillCompletions[0]!, "enter").submit, false);
+    assert.equal(acceptInputSuggestion(modelCompletionLine, modelCompletionLine.length, modelCompletions[0]!, "enter").submit, false);
+    assert.equal(moveSuggestionSelection(0, 2, -1), 1);
+    assert.equal(moveSuggestionSelection(1, 2, 1), 0);
+    assert.deepEqual(buildInputSuggestions({
+        line: "แก้ src/app.ts ให้หน่อย",
+        cursor: "แก้ src/app.ts ให้หน่อย".length,
+        slashCommands: [{ value: "/model", description: "switch model" }],
+        skills: [{ value: "fix-ui-alignment", description: "Fix layout alignment" }],
+        models: [{ value: "model.gguf", description: "loaded" }]
+    }), []);
 
     const traceEvents = parseTraceJsonl([
         JSON.stringify({ taskId: "one", turn: 1, timestamp: "2026-07-20T00:00:00.000Z", status: "ok", action: "read_file" }),
@@ -626,6 +769,14 @@ async function main(): Promise<void> {
     assert.equal(probeAction?.mode, "probe");
     assert.equal(probeAction?.timeout_ms, 5000);
     assert.deepEqual(probeAction?.expect?.output_includes, ["runtime ready"]);
+    const incompleteAction = agent.parseAction(JSON.stringify({
+        action: "final",
+        answer: "Implementation is preserved, but interaction verification is unavailable.",
+        completion_status: "incomplete",
+        evidence: ["evidence_2_read_file"],
+        reason: "The required verifier is unavailable."
+    }));
+    assert.equal(incompleteAction?.completion_status, "incomplete");
     const refinedAction = agent.parseAction(JSON.stringify({
         action: "refine_task",
         task: {
@@ -821,6 +972,27 @@ async function main(): Promise<void> {
                 probe.listen(port, "127.0.0.1", resolve);
             });
             await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+            const assertedProbe = await timeoutAgent.execute({
+                action: "run_command",
+                command: `node -e "console.log('probe-ready');require('node:net').createServer().listen(${port});setInterval(function(){},1000)"`,
+                mode: "probe",
+                expect: { output_includes: ["probe-ready"] }
+            });
+            assert.equal(assertedProbe.ok, true);
+            assert.equal(assertedProbe.probeTimedOut, true);
+            assert.equal(assertedProbe.assertionPassed, true);
+            assert.match(assertedProbe.output, /grounded output assertion passed/i);
+
+            const inconclusiveProbe = await timeoutAgent.execute({
+                action: "run_command",
+                command: `node -e "console.log('server-started');require('node:net').createServer().listen(${port});setInterval(function(){},1000)"`,
+                mode: "probe"
+            });
+            assert.equal(inconclusiveProbe.ok, true);
+            assert.equal(inconclusiveProbe.probeTimedOut, true);
+            assert.equal(inconclusiveProbe.assertionPassed, false);
+            assert.match(inconclusiveProbe.output, /inconclusive/i);
         } finally {
             await timeoutAgent.close();
         }
@@ -847,6 +1019,17 @@ async function main(): Promise<void> {
         const destructiveCheck = await agent.execute({ action: "run_command", command: "Remove-Item stale.exe" });
         assert.equal(destructiveCheck.ok, false);
         assert.match(destructiveCheck.output, /Blocked unsafe command/);
+        const processTermination = await agent.execute({
+            action: "run_command",
+            command: "Get-Process | Where-Object {$_.ProcessName -eq 'node'} | Stop-Process -Force"
+        });
+        assert.equal(processTermination.ok, false);
+        assert.match(processTermination.output, /Blocked unsafe command/);
+        const processInspection = await agent.execute({
+            action: "run_command",
+            command: "Get-Process | Select-Object -First 1 Id, ProcessName"
+        });
+        assert.equal(processInspection.ok, true);
     }
     const editDirectory = fs.mkdtempSync(path.join(process.cwd(), ".agent-edit-test-"));
     try {

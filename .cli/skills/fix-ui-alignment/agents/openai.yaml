@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI Alignment Reviewer"
+  short_description: "Fix UI alignment, spacing, and responsive layout"
+  default_prompt: "Use $fix-ui-alignment to audit and correct alignment, spacing, and responsive layout in this interface."

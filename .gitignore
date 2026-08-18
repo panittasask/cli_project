@@ -8,6 +8,7 @@ node_modules/
 .cli/settings.json
 .cli/router-models.ini
 .cli/cache/
+.cli/runtime/
 
 # Environment and local secrets
 .env

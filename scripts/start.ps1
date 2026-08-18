@@ -128,7 +128,7 @@ if ($portInUse) {
         "-np", "1", "-fa", "auto", "--host", $serverHost, "--port", $parsedServerPort.ToString()
     )
     if ($routerMode) {
-        $routerPreset = New-LlamaRouterPreset -ServerExecutable $serverExecutable -Models $models -DefaultModelName $models[$defaultModelIndex].Name -OutputPath (Join-Path $appRoot ".cli\router-models.ini")
+        $routerPreset = New-LlamaRouterPreset -ServerExecutable $serverExecutable -Models $models -DefaultModelName $models[$defaultModelIndex].Name -ContextLength $parsedContextLength -OutputPath (Join-Path $appRoot ".cli\router-models.ini")
         $serverArguments += @("--models-preset", ('"{0}"' -f $routerPreset), "--models-max", $parsedModelsMax.ToString())
     } else {
         $serverArguments = @("-m", ('"{0}"' -f $selectedModel.FullName)) + $serverArguments

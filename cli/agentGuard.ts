@@ -57,10 +57,9 @@ class AgentGuard {
         if (!this.seenEvidencePairs.has(evidencePair)) {
             // Any genuinely new observation, including a new failure, gives the
             // model new evidence to reason from and releases current
-            // quarantines. Keep the global seen set so alternating old A/B
-            // observations cannot masquerade as perpetual progress.
+            // quarantines. Retain counts for older evidence pairs so alternating
+            // old A/B observations cannot masquerade as perpetual progress.
             this.seenEvidencePairs.add(evidencePair);
-            this.repeatedEvidenceCounts.clear();
             this.quarantinedActions.clear();
             this.quarantineViolationCounts.clear();
             this.repeatedEvidenceCounts.set(evidencePair, 1);

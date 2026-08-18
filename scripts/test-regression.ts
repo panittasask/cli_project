@@ -22,12 +22,29 @@ const { isContinuationRequest, selectTaskContext } = require("../cli/taskContext
 const { searchReturnedNoResults } = require("../cli/webResearch") as {
     searchReturnedNoResults: (output: string) => boolean;
 };
-const { deriveTaskEvidencePolicy, isVisualPresentationMutation } = require("../cli/taskEvidence") as {
+const { deriveTaskEvidencePolicy, isVisualPresentationMutation, taskContractsEquivalent } = require("../cli/taskEvidence") as {
     deriveTaskEvidencePolicy: (
         requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">,
         verification: "none" | "command" | "runtime" | "interaction"
     ) => { evidence: string; verification: string; visualPresentation: boolean };
     isVisualPresentationMutation: (filePath: string, replacementText?: string) => boolean;
+    taskContractsEquivalent: (left: {
+        intent: string;
+        task_type: string;
+        continuation: boolean;
+        requires_workspace_changes: boolean;
+        verification: string;
+        evidence_requirements: string[];
+        success_criteria: string[];
+    }, right: {
+        intent: string;
+        task_type: string;
+        continuation: boolean;
+        requires_workspace_changes: boolean;
+        verification: string;
+        evidence_requirements: string[];
+        success_criteria: string[];
+    }) => boolean;
 };
 const { WriteValidator } = require("../cli/writeValidator") as { WriteValidator: new (workspace: string) => {
     validate: (file: string) => { ok: boolean; validator: string; output: string };
@@ -105,10 +122,7 @@ const { AgentGuard } = require("../cli/agentGuard") as { AgentGuard: new (settin
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
-    CompletionBlockerTracker: new (limit: number) => {
-        record: (summary: string) => { count: number; shouldStop: boolean };
-    };
+const { continuationNoWriteCompletionAllowed, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("../cli/completionPolicy") as {
     continuationNoWriteCompletionAllowed: (input: {
         continuation: boolean;
         evidence: string[];
@@ -119,11 +133,11 @@ const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiv
         hasUnresolvedFailures: boolean;
     }) => boolean;
     effectiveCompletionStatus: (
-        status: "completed" | "already_satisfied" | "no_change_needed",
+        status: "completed" | "already_satisfied" | "no_change_needed" | "incomplete",
         successfulWorkspaceChanges: number
-    ) => "completed" | "already_satisfied" | "no_change_needed";
+    ) => "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
     noChangeCompletionBlockReason: (input: {
-        status: "completed" | "already_satisfied" | "no_change_needed";
+        status: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
         evidence: string[];
         successfulEvidenceRefs: Set<string>;
         successfulWorkspaceEvidenceRefs: Set<string>;
@@ -132,6 +146,15 @@ const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiv
         verificationSatisfied: boolean;
         hasUnresolvedFailures: boolean;
     }) => string | undefined;
+};
+const { FailedCommandRegistry } = require("../cli/failedCommandRegistry") as {
+    FailedCommandRegistry: new (workspace: string) => {
+        has: (command: string, workdir?: string) => boolean;
+        record: (command: string, workdir?: string, errorOutput?: string) => void;
+        failureFor: (command: string, workdir?: string) => string | undefined;
+        recordBlockedAttempt: (command: string, workdir?: string) => number;
+        clear: () => void;
+    };
 };
 const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } = require("../cli/verificationRecovery") as {
     shouldActivateVerificationRecovery: (input: {
@@ -150,9 +173,9 @@ const { FileCheckpointStore, formatDiffPreview } = require("../cli/fileCheckpoin
     };
     formatDiffPreview: (before: string, after: string, label: string, maxLines?: number, colors?: boolean) => string;
 };
-const { SkillLoader } = require("../cli/skillLoader") as { SkillLoader: new () => {
+const { SkillLoader } = require("../cli/skillLoader") as { SkillLoader: new (userSkillsRoot?: string) => {
     discover: (workspace: string) => Array<{ name: string; description: string; body: string }>;
-    select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string }>;
+    select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string; description: string; body: string }>;
     formatPrompt: (skills: Array<{ name: string; description: string; body: string }>) => string;
 } };
 const { buildCompactedAgentMessages } = require("../cli/agentCompaction") as {
@@ -272,6 +295,35 @@ async function main(): Promise<void> {
         verification: "command",
         visualPresentation: false
     });
+    const contradictorySourcePolicy = deriveTaskEvidencePolicy(["source"], "runtime");
+    assert.deepEqual(contradictorySourcePolicy, {
+        evidence: "source",
+        verification: "none",
+        visualPresentation: false
+    });
+    const genuineRuntimePolicy = deriveTaskEvidencePolicy(["source", "runtime"], "runtime");
+    assert.deepEqual(genuineRuntimePolicy, {
+        evidence: "runtime",
+        verification: "runtime",
+        visualPresentation: false
+    });
+    const currentContract = {
+        intent: "Repair observable behavior",
+        task_type: "coding",
+        continuation: false,
+        requires_workspace_changes: true,
+        verification: "interaction",
+        evidence_requirements: ["source", "runtime"],
+        success_criteria: ["Observable result"]
+    };
+    assert.equal(taskContractsEquivalent(currentContract, {
+        ...currentContract,
+        evidence_requirements: ["runtime", "source"]
+    }), true);
+    assert.equal(taskContractsEquivalent(currentContract, {
+        ...currentContract,
+        verification: "runtime"
+    }), false);
     assert.equal(isVisualPresentationMutation("src/app/table.component.scss", ".table { display: grid; }"), true);
     assert.equal(isVisualPresentationMutation("src/app/table.component.ts", "export const rows = [];"), false);
     assert.equal(isVisualPresentationMutation("src/app/table.component.tsx", "return <main style={{display: 'grid'}} />"), true);
@@ -289,6 +341,8 @@ async function main(): Promise<void> {
     assert.match(startScript, /"--models-max"/);
     assert.match(standaloneStartScript, /"--models-preset"/);
     assert.match(standaloneStartScript, /"--models-max"/);
+    assert.match(startScript, /-ContextLength \$parsedContextLength/);
+    assert.match(standaloneStartScript, /-ContextLength \$parsedContextLength/);
     assert.match(terminalScript, /Current model: unavailable \(configured fallback:/);
     assert.match(terminalScript, /model: serverModelSynced \? model : "server unavailable"/);
     assert.match(terminalScript, /\{ command: "\/log", description: "refresh the HTML log viewer" \}/);
@@ -716,6 +770,8 @@ async function main(): Promise<void> {
     assert.ok(!localWebActions.includes("mcp_list_tools"));
     const generalActions = getAgentResponseFormat("general").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(generalActions, ["search_project", "read_file", "edit_file", "write_file", "delete_file", "run_command", "search_files", "list_files", "refine_task", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
+    const finalSchema = getAgentResponseFormat("general").schema.oneOf.find((variant) => variant.properties.action.const === "final");
+    assert.ok(finalSchema?.properties.completion_status.enum.includes("incomplete"));
     const codingActions = getAgentResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(codingActions, generalActions);
     const readOnlyActions = getAgentReadOnlyResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
@@ -950,7 +1006,7 @@ async function main(): Promise<void> {
     const actionB = { action: "read_file", path: "b.ts" };
     assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A" }).status, "allow");
     assert.equal(alternatingGuard.recordObservation(actionB, { ok: false, output: "B missing" }).status, "allow");
-    assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A" }).status, "allow");
+    assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A" }).status, "replan");
     assert.equal(alternatingGuard.recordObservation(actionB, { ok: false, output: "B missing" }).status, "replan");
     assert.equal(alternatingGuard.registerAction(actionB).status, "replan");
     assert.equal(alternatingGuard.recordObservation(actionA, { ok: true, output: "A changed" }).status, "allow");
@@ -973,6 +1029,7 @@ async function main(): Promise<void> {
     const workspaceRefs = new Set(["evidence_2_read_file"]);
     assert.equal(effectiveCompletionStatus("already_satisfied", 2), "completed");
     assert.equal(effectiveCompletionStatus("no_change_needed", 1), "completed");
+    assert.equal(effectiveCompletionStatus("incomplete", 1), "incomplete");
     assert.equal(effectiveCompletionStatus("already_satisfied", 0), "already_satisfied");
     assert.equal(continuationNoWriteCompletionAllowed({
         continuation: true,
@@ -1001,11 +1058,20 @@ async function main(): Promise<void> {
         verificationSatisfied: false,
         hasUnresolvedFailures: false
     }), false);
-    const blockerTracker = new CompletionBlockerTracker(3);
-    assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, false);
-    assert.equal(blockerTracker.record("latest command failed").shouldStop, false);
-    assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, false);
-    assert.equal(blockerTracker.record("workspace evidence missing").shouldStop, true);
+    const failedCommands = new FailedCommandRegistry(path.resolve("workspace"));
+    failedCommands.record("npm run build", ".", "TypeScript compilation failed.");
+    assert.equal(failedCommands.has("npm   run   build", "."), true);
+    assert.equal(failedCommands.failureFor("npm   run   build", "."), "TypeScript compilation failed.");
+    failedCommands.record("npm run build", ".", "A later failure must not replace the first one.");
+    assert.equal(failedCommands.failureFor("npm run build", "."), "TypeScript compilation failed.");
+    assert.equal(failedCommands.recordBlockedAttempt("npm run build", "."), 1);
+    assert.equal(failedCommands.recordBlockedAttempt("npm   run   build", "."), 2);
+    assert.equal(failedCommands.has("npm run build", "web"), false);
+    assert.equal(failedCommands.has("npm run test", "."), false);
+    failedCommands.clear();
+    assert.equal(failedCommands.has("npm run build", "."), false);
+    assert.equal(failedCommands.failureFor("npm run build", "."), undefined);
+    assert.equal(failedCommands.recordBlockedAttempt("npm run build", "."), 1);
     assert.equal(noChangeCompletionBlockReason({
         status: "already_satisfied",
         evidence: ["evidence_2_read_file"],
@@ -1225,14 +1291,26 @@ async function main(): Promise<void> {
         assert.match(coloredDiff, /\x1b\[31m- old\x1b\[0m/);
         assert.match(coloredDiff, /\x1b\[32m\+ new\x1b\[0m/);
 
+        const userSkillsRoot = path.join(temp, "user-skills");
+        const userSkillDirectory = path.join(userSkillsRoot, "shared-helper");
+        fs.mkdirSync(userSkillDirectory, { recursive: true });
+        fs.writeFileSync(path.join(userSkillDirectory, "SKILL.md"), "---\nname: shared-helper\ndescription: Review shared interface layout\n---\n\nUse the shared layout review.", "utf8");
+
         const skillDirectory = path.join(temp, ".cli", "skills", "test-helper");
         fs.mkdirSync(skillDirectory, { recursive: true });
         fs.writeFileSync(path.join(skillDirectory, "SKILL.md"), "---\nname: test-helper\ndescription: Validate release files and packaging\n---\n\nAlways run the release validator.", "utf8");
-        const loader = new SkillLoader();
+
+        const userOverrideDirectory = path.join(userSkillsRoot, "test-helper");
+        fs.mkdirSync(userOverrideDirectory, { recursive: true });
+        fs.writeFileSync(path.join(userOverrideDirectory, "SKILL.md"), "---\nname: test-helper\ndescription: Shared release instructions\n---\n\nUse the shared release instructions.", "utf8");
+
+        const loader = new SkillLoader(userSkillsRoot);
         const skills = loader.discover(temp);
-        assert.equal(skills.length, 1);
-        assert.equal(loader.select("Use $test-helper now", skills)[0]?.name, "test-helper");
-        assert.match(loader.formatPrompt(skills), /Always run the release validator/);
+        assert.deepEqual(skills.map((skill) => skill.name), ["shared-helper", "test-helper"]);
+        const selectedProjectSkill = loader.select("Use $test-helper now", skills);
+        assert.equal(selectedProjectSkill[0]?.name, "test-helper");
+        assert.match(loader.formatPrompt(selectedProjectSkill), /Always run the release validator/);
+        assert.doesNotMatch(loader.formatPrompt(selectedProjectSkill), /shared release instructions/i);
     } finally {
         fs.rmSync(temp, { recursive: true, force: true });
     }

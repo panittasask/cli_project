@@ -47,8 +47,9 @@ try {
     $alpha = New-Item -ItemType File -Path (Join-Path $presetTestDirectory "alpha.gguf")
     $beta = New-Item -ItemType File -Path (Join-Path $presetTestDirectory "beta.gguf")
     $presetPath = Join-Path $presetTestDirectory "models.ini"
-    New-LlamaRouterPreset -ServerExecutable "unused.exe" -Models @($alpha, $beta) -DefaultModelName "beta.gguf" -OutputPath $presetPath | Out-Null
+    New-LlamaRouterPreset -ServerExecutable "unused.exe" -Models @($alpha, $beta) -DefaultModelName "beta.gguf" -ContextLength 65024 -OutputPath $presetPath | Out-Null
     $preset = Get-Content -LiteralPath $presetPath -Raw
+    if ($preset -notmatch '(?s)version = 1.*\[\*\].*ctx-size = 65024') { throw "Router preset did not propagate the configured context length." }
     if ($preset -notmatch '(?s)\[alpha\].*load-on-startup = false') { throw "Router preset did not keep alpha unloaded." }
     if ($preset -notmatch '(?s)\[beta\].*load-on-startup = true') { throw "Router preset did not mark beta for startup." }
 } finally {

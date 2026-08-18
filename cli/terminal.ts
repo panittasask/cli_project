@@ -78,10 +78,7 @@ const { AgentGuard } = require("./agentGuard") as { AgentGuard: new (settings: A
     resume: () => void;
     formatRemaining: () => string;
 } };
-const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("./completionPolicy") as {
-    CompletionBlockerTracker: new (limit: number) => {
-        record: (summary: string) => { count: number; shouldStop: boolean };
-    };
+const { continuationNoWriteCompletionAllowed, effectiveCompletionStatus, noChangeCompletionBlockReason } = require("./completionPolicy") as {
     continuationNoWriteCompletionAllowed: (input: {
         continuation: boolean;
         evidence: string[];
@@ -92,11 +89,11 @@ const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiv
         hasUnresolvedFailures: boolean;
     }) => boolean;
     effectiveCompletionStatus: (
-        status: "completed" | "already_satisfied" | "no_change_needed",
+        status: "completed" | "already_satisfied" | "no_change_needed" | "incomplete",
         successfulWorkspaceChanges: number
-    ) => "completed" | "already_satisfied" | "no_change_needed";
+    ) => "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
     noChangeCompletionBlockReason: (input: {
-        status: "completed" | "already_satisfied" | "no_change_needed";
+        status: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
         evidence: string[];
         successfulEvidenceRefs: Set<string>;
         successfulWorkspaceEvidenceRefs: Set<string>;
@@ -105,6 +102,15 @@ const { CompletionBlockerTracker, continuationNoWriteCompletionAllowed, effectiv
         verificationSatisfied: boolean;
         hasUnresolvedFailures: boolean;
     }) => string | undefined;
+};
+const { FailedCommandRegistry } = require("./failedCommandRegistry") as {
+    FailedCommandRegistry: new (workspace: string) => {
+        has: (command: string, workdir?: string) => boolean;
+        record: (command: string, workdir?: string, errorOutput?: string) => void;
+        failureFor: (command: string, workdir?: string) => string | undefined;
+        recordBlockedAttempt: (command: string, workdir?: string) => number;
+        clear: () => void;
+    };
 };
 const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } = require("./verificationRecovery") as {
     shouldActivateVerificationRecovery: (input: {
@@ -133,11 +139,44 @@ const { FileCheckpointStore } = require("./fileCheckpoints") as { FileCheckpoint
     checkpoint: (workspace: string, inputPath: string, nextContent: string) => { id: string; preview: string };
     undoLatest: (workspace: string, checkpointId?: string) => { ok: boolean; message: string };
 } };
-const { SkillLoader } = require("./skillLoader") as { SkillLoader: new () => {
+const { SkillLoader } = require("./skillLoader") as { SkillLoader: new (userSkillsRoot?: string) => {
     discover: (workspace: string) => Array<{ name: string; description: string; body: string }>;
     select: (message: string, skills: Array<{ name: string; description: string; body: string }>) => Array<{ name: string; description: string; body: string }>;
     formatPrompt: (skills: Array<{ name: string; description: string; body: string }>) => string;
 } };
+type InputSuggestion = {
+    kind: "slash" | "skill" | "model";
+    value: string;
+    description: string;
+    replaceStart: number;
+    replaceEnd: number;
+    appendSpace: boolean;
+};
+const {
+    acceptInputSuggestion,
+    applyInputSuggestion,
+    buildInputSuggestions,
+    moveSuggestionSelection,
+    suggestionStateKey
+} = require("./inputSuggestions") as {
+    acceptInputSuggestion: (
+        line: string,
+        cursor: number,
+        suggestion: InputSuggestion,
+        keyName: "enter" | "return" | "tab"
+    ) => { line: string; cursor: number; submit: boolean };
+    applyInputSuggestion: (line: string, suggestion: InputSuggestion) => { line: string; cursor: number };
+    buildInputSuggestions: (input: {
+        line: string;
+        cursor: number;
+        slashCommands: Array<{ value: string; description: string }>;
+        skills: Array<{ value: string; description: string }>;
+        models: Array<{ value: string; description: string }>;
+        limit?: number;
+    }) => InputSuggestion[];
+    moveSuggestionSelection: (current: number, count: number, direction: -1 | 1) => number;
+    suggestionStateKey: (suggestions: InputSuggestion[]) => string;
+};
 const { AgentTrace } = require("./agentTrace") as { AgentTrace: new (logTarget?: string | { directory: string; basename: string }, taskId?: string, onEntry?: (entry: Record<string, unknown>) => void) => {
     add: (entry: {
         turn: number;
@@ -235,12 +274,32 @@ type ProjectCompletionRequirement = import("./projectTypes").ProjectCompletionRe
 const { commandSatisfiesAcceptance } = require("./workflowRouter") as {
     commandSatisfiesAcceptance: (command: string, contract: AcceptanceContract, options?: { probe?: boolean }) => boolean;
 };
-const { deriveTaskEvidencePolicy, isVisualPresentationMutation } = require("./taskEvidence") as {
+const { deriveTaskEvidencePolicy, isVisualPresentationMutation, taskContractsEquivalent } = require("./taskEvidence") as {
     deriveTaskEvidencePolicy: (
         requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">,
         verification: "none" | "command" | "runtime" | "interaction"
     ) => { evidence: AcceptanceContract["evidence"]; verification: VerificationRequirement; visualPresentation: boolean };
     isVisualPresentationMutation: (filePath: string, replacementText?: string) => boolean;
+    taskContractsEquivalent: (
+        left: {
+            intent: string;
+            task_type: string;
+            continuation: boolean;
+            requires_workspace_changes: boolean;
+            verification: string;
+            evidence_requirements: string[];
+            success_criteria: string[];
+        },
+        right: {
+            intent: string;
+            task_type: string;
+            continuation: boolean;
+            requires_workspace_changes: boolean;
+            verification: string;
+            evidence_requirements: string[];
+            success_criteria: string[];
+        }
+    ) => boolean;
 };
 const { searchReturnedNoResults } = require("./webResearch") as {
     searchReturnedNoResults: (output: string) => boolean;
@@ -335,6 +394,7 @@ const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRo
         output: string;
         changed?: boolean;
         assertionPassed?: boolean;
+        probeTimedOut?: boolean;
         failureKind?: "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
         recommendedCommand?: string;
         recommendedWorkdir?: string;
@@ -517,25 +577,25 @@ const slashCommandOptions: SlashCommandOption[] = [
     { command: "/debug off", description: "hide agent trace" },
     { command: "/exit", description: "exit the app" }
 ];
-const slashCommands = slashCommandOptions.map((item) => item.command);
-
-let slashMenuVisible = false;
-let slashKeypressListenerAttached = false;
-let renderedSlashSuggestionCount = 0;
+let inputSuggestionKeypressListenerAttached = false;
+let renderedInputSuggestionCount = 0;
+let inputSuggestions: InputSuggestion[] = [];
+let selectedInputSuggestion = 0;
+let activeInputSuggestionKey = "";
+let routerModelSuggestionCache: RouterModel[] = [];
+let routerModelSuggestionsLoading = false;
+let routerModelSuggestionError: string | undefined;
 let clarificationPromptActive = false;
 
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
     completer: (line: string): [string[], string] => {
-        const trimmed = line.trim();
-
-        if (!trimmed.startsWith("/")) {
-            return [[], line];
-        }
-
-        const hits = slashCommands.filter((cmd) => cmd.startsWith(trimmed));
-        return [hits.length > 0 ? hits : slashCommands, trimmed];
+        const suggestions = getInputSuggestions(line, line.length);
+        return [
+            suggestions.map((suggestion) => applyInputSuggestion(line, suggestion).line),
+            line
+        ];
     }
 });
 rl.on("SIGINT", () => {
@@ -794,6 +854,8 @@ async function printModelInfo(): Promise<void> {
     console.log(`llama.cpp API: ${apiUrl}`);
 
     if (routerModels) {
+        routerModelSuggestionCache = routerModels;
+        routerModelSuggestionError = undefined;
         console.log("Available server models:");
         routerModels.forEach((entry, index) => {
             const state = entry.failed ? "failed" : entry.status;
@@ -853,9 +915,10 @@ function printCommandHelp(currentMode: RunMode): void {
     console.log("/color <name-or-code>     Change and save the LLM message color");
     console.log("/clear                    Start a new task context; keep session history");
     console.log("/undo                     Restore the latest model file checkpoint");
-    console.log("/skills                   Show project-local skills");
+    console.log("/skills                   Show user-level and project-local skills");
     console.log("/debug [on|off]           Show status or toggle concise agent trace");
     console.log("/exit                     Exit the app");
+    console.log("Autocomplete: type /, $skill, or /model; use ↑↓, Enter to run/select, Tab to insert, and Esc");
     console.log();
     printModeHelp(currentMode);
 }
@@ -909,21 +972,45 @@ async function printCapabilities(currentMode: RunMode): Promise<void> {
     console.log(`Web search: ${currentMode !== "agent" ? "unavailable in this mode" : webTools.length > 0 ? `available via ${webTools.map((tool) => String(tool.name)).join(", ")}` : "unavailable (no discovered MCP search tool)"}`);
 }
 
-function getSlashSuggestions(line: string): SlashCommandOption[] {
-    const trimmedStart = line.trimStart();
-    const firstToken = trimmedStart.split(/\s+/, 1)[0] ?? "";
+function getInputSuggestions(line: string, cursor: number): InputSuggestion[] {
+    const skills = skillLoader.discover(activeWorkspace).map((skill) => ({
+        value: skill.name,
+        description: skill.description
+    }));
+    const models = routerModelSuggestionCache.map((entry) => ({
+        value: entry.id,
+        description: entry.failed ? "failed" : entry.status
+    }));
+    return buildInputSuggestions({
+        line,
+        cursor,
+        slashCommands: slashCommandOptions.map((item) => ({
+            value: item.command,
+            description: item.description
+        })),
+        skills,
+        models,
+        limit: maxVisibleSlashSuggestions
+    });
+}
 
-    if (!firstToken.startsWith("/")) {
-        return [];
+function isModelSuggestionInput(line: string, cursor: number): boolean {
+    return /^\s*\/model(?:\s+[^\s]*)?$/i.test(line.slice(0, cursor));
+}
+
+async function loadRouterModelSuggestions(force = false): Promise<void> {
+    if (routerModelSuggestionsLoading || (!force && routerModelSuggestionCache.length > 0)) return;
+    routerModelSuggestionsLoading = true;
+    routerModelSuggestionError = undefined;
+    updateInputSuggestions();
+    try {
+        routerModelSuggestionCache = await modelRouterClient.list();
+    } catch (error) {
+        routerModelSuggestionError = modelRouterClient.formatError(error);
+    } finally {
+        routerModelSuggestionsLoading = false;
+        updateInputSuggestions();
     }
-
-    if (trimmedStart === "/") {
-        return slashCommandOptions;
-    }
-
-    const hits = slashCommandOptions.filter((item) => item.command.startsWith(trimmedStart));
-    const suggestions = hits.length > 0 ? hits : slashCommandOptions;
-    return suggestions.slice(0, maxVisibleSlashSuggestions);
 }
 
 function getInputCursorColumn(): number {
@@ -939,12 +1026,12 @@ function restoreCursorToInput(linesAbove: number): void {
     process.stdout.write(`\x1b[${getInputCursorColumn() + 1}G`);
 }
 
-function clearSlashSuggestions(): void {
-    if (renderedSlashSuggestionCount === 0 || !process.stdout.isTTY) {
+function clearInputSuggestions(): void {
+    if (renderedInputSuggestionCount === 0 || !process.stdout.isTTY) {
         return;
     }
 
-    const count = renderedSlashSuggestionCount;
+    const count = renderedInputSuggestionCount;
 
     for (let index = 0; index < count; index += 1) {
         process.stdout.write("\n");
@@ -952,55 +1039,164 @@ function clearSlashSuggestions(): void {
     }
 
     restoreCursorToInput(count);
-    slashMenuVisible = false;
-    renderedSlashSuggestionCount = 0;
+    renderedInputSuggestionCount = 0;
 }
 
-function renderSlashSuggestions(line: string): void {
+function renderInputSuggestions(line: string): void {
     if (!process.stdout.isTTY) {
         return;
     }
 
-    const suggestions = getSlashSuggestions(line);
+    const suggestions = getInputSuggestions(line, rl.cursor);
+    const nextKey = suggestionStateKey(suggestions);
+    if (nextKey !== activeInputSuggestionKey) selectedInputSuggestion = 0;
+    activeInputSuggestionKey = nextKey;
+    inputSuggestions = suggestions;
     if (suggestions.length === 0) {
+        if (isModelSuggestionInput(line, rl.cursor) && (routerModelSuggestionsLoading || routerModelSuggestionError)) {
+            const notice = routerModelSuggestionsLoading
+                ? "… loading server models"
+                : `! model suggestions unavailable: ${routerModelSuggestionError}`;
+            process.stdout.write("\n");
+            readline.clearLine(process.stdout, 0);
+            process.stdout.write(`\x1b[2m${notice.slice(0, Math.max(20, (process.stdout.columns || 100) - 2))}\x1b[0m`);
+            restoreCursorToInput(1);
+            renderedInputSuggestionCount = 1;
+        }
         return;
     }
 
+    selectedInputSuggestion = Math.min(selectedInputSuggestion, suggestions.length - 1);
+    const labelWidth = Math.min(38, Math.max(...suggestions.map((item) => item.value.length)));
+    const availableColumns = Math.max(30, (process.stdout.columns || 100) - 1);
     const lines = suggestions.map((item, index) => {
-        const prefix = index === 0 ? ">" : " ";
-        return `${prefix} ${item.command.padEnd(10, " ")} ${item.description}`;
+        const selected = index === selectedInputSuggestion;
+        const prefix = selected ? "›" : " ";
+        const label = item.value.length > labelWidth
+            ? `${item.value.slice(0, Math.max(1, labelWidth - 1))}…`
+            : item.value.padEnd(labelWidth, " ");
+        const content = `${prefix} ${label}  ${item.description}`;
+        const fitted = content.length > availableColumns
+            ? `${content.slice(0, Math.max(1, availableColumns - 1))}…`
+            : content;
+        return `${selected ? "\x1b[36m" : "\x1b[2m"}${fitted}\x1b[0m`;
     });
+    const hint = "  ↑↓ select · Enter run/select · Tab insert · Esc close";
+    lines.push(`\x1b[2m${hint.slice(0, availableColumns)}\x1b[0m`);
 
     lines.forEach((lineContent) => {
         process.stdout.write("\n");
         readline.clearLine(process.stdout, 0);
-        process.stdout.write(`\x1b[2m${lineContent}\x1b[0m`);
+        process.stdout.write(lineContent);
     });
 
     restoreCursorToInput(lines.length);
-    slashMenuVisible = true;
-    renderedSlashSuggestionCount = lines.length;
+    renderedInputSuggestionCount = lines.length;
 }
 
-function updateSlashSuggestions(): void {
+function updateInputSuggestions(): void {
     if (!process.stdout.isTTY || clarificationPromptActive) {
         return;
     }
 
-    clearSlashSuggestions();
-    renderSlashSuggestions(rl.line);
+    clearInputSuggestions();
+    if (isModelSuggestionInput(rl.line, rl.cursor)
+        && routerModelSuggestionCache.length === 0
+        && !routerModelSuggestionsLoading
+        && !routerModelSuggestionError) {
+        void loadRouterModelSuggestions();
+    }
+    renderInputSuggestions(rl.line);
 }
 
-function clearSlashSuggestionsBelow(): void {
+function clearInputSuggestionsBelow(): void {
     // Called right after Enter: readline has already moved the cursor down to
     // the first panel line, so clearing from cursor to end of screen removes it.
-    if (renderedSlashSuggestionCount > 0 && process.stdout.isTTY) {
+    if (renderedInputSuggestionCount > 0 && process.stdout.isTTY) {
         readline.clearScreenDown(process.stdout);
         statusBar.render();
     }
 
-    slashMenuVisible = false;
-    renderedSlashSuggestionCount = 0;
+    inputSuggestions = [];
+    selectedInputSuggestion = 0;
+    activeInputSuggestionKey = "";
+    renderedInputSuggestionCount = 0;
+}
+
+function replaceReadlineInput(line: string, cursor: number): void {
+    const internal = rl as typeof rl & { line: string; cursor: number; _refreshLine?: () => void };
+    internal.line = line;
+    internal.cursor = cursor;
+    internal._refreshLine?.();
+}
+
+function handleInputSuggestionKey(key: readline.Key): boolean {
+    if (clarificationPromptActive || inputSuggestions.length === 0) {
+        if (key.name === "escape" && renderedInputSuggestionCount > 0) {
+            clearInputSuggestions();
+            inputSuggestions = [];
+            activeInputSuggestionKey = "";
+            return true;
+        }
+        return false;
+    }
+
+    if (key.name === "up" || key.name === "down") {
+        selectedInputSuggestion = moveSuggestionSelection(
+            selectedInputSuggestion,
+            inputSuggestions.length,
+            key.name === "up" ? -1 : 1
+        );
+        clearInputSuggestions();
+        renderInputSuggestions(rl.line);
+        return true;
+    }
+
+    if (key.name === "return" || key.name === "enter" || key.name === "tab") {
+        const selected = inputSuggestions[selectedInputSuggestion];
+        if (!selected) return false;
+        const applied = acceptInputSuggestion(
+            rl.line,
+            rl.cursor,
+            selected,
+            key.name as "enter" | "return" | "tab"
+        );
+        clearInputSuggestions();
+        inputSuggestions = [];
+        activeInputSuggestionKey = "";
+        replaceReadlineInput(applied.line, applied.cursor);
+        if (applied.submit) return false;
+        setImmediate(updateInputSuggestions);
+        return true;
+    }
+
+    if (key.name === "escape") {
+        clearInputSuggestions();
+        inputSuggestions = [];
+        activeInputSuggestionKey = "";
+        return true;
+    }
+
+    return false;
+}
+
+let inputSuggestionTtyWriteInstalled = false;
+
+function installInputSuggestionTtyWrite(): void {
+    if (inputSuggestionTtyWriteInstalled || !process.stdin.isTTY) return;
+    const internal = rl as typeof rl & {
+        _ttyWrite?: (input: string, key: readline.Key) => void;
+    };
+    const original = internal._ttyWrite;
+    if (!original) return;
+    inputSuggestionTtyWriteInstalled = true;
+    internal._ttyWrite = function suggestionAwareTtyWrite(input: string, key: readline.Key): void {
+        if (handleInputSuggestionKey(key)) return;
+        original.call(rl, input, key);
+        if (key.name !== "return" && key.name !== "enter") {
+            setImmediate(updateInputSuggestions);
+        }
+    };
 }
 
 function parseModelCommand(input: string): ModelCommandResult {
@@ -1532,6 +1728,9 @@ async function runAgentLoop(
     let pendingPackageScriptRecovery: { command: string; workdir: string; mode?: "probe" } | undefined;
     let unresolvedMissingCommandTarget = false;
     let lastFailedCommand: string | undefined;
+    let inconclusiveVerificationBlocker: string | undefined;
+    let unsatisfiedFinalAttempts = 0;
+    const failedCommands = new FailedCommandRegistry(activeWorkspace);
     let verificationSatisfied = verificationRequirement === "none";
     const successfulProjectChecks = new Set<string>();
     const pendingProjectChecks = new Set<string>();
@@ -1610,9 +1809,6 @@ async function runAgentLoop(
     );
     let segmentEvents: string[] = [];
     let contextCompactionCount = 0;
-    const finalBlockerLimit = Math.max(3, guard.settings.repeatLimit + 1);
-    const finalBlockers = new CompletionBlockerTracker(finalBlockerLimit);
-    let repeatedFinalBlocker: string | undefined;
     const stepStatus = (step: number): string => hasStepCadence
         ? `step ${step}/${verificationRecoveryActive ? recoveryMaxTurns : maxTurns}`
         : `step ${step}`;
@@ -1638,12 +1834,6 @@ async function runAgentLoop(
         }
         if (turn > maxTurns && (!verificationRecoveryActive || turn > recoveryMaxTurns)) break;
         lastExecutedTurn = turn;
-        if (repeatedFinalBlocker) {
-            const answer = `Agent stopped after the same completion blocker recurred ${finalBlockerLimit} times: ${repeatedFinalBlocker} Successful workspace changes remain in place and can be continued from the session journal.`;
-            trace.add({ turn, status: "error", action: "final_loop_stop", observation: answer });
-            trace.save();
-            return { answer, trace, clarifications: clarificationTranscript };
-        }
         const segmentTurn = hasStepCadence ? (turn - 1) % maxTurnsPerSegment + 1 : turn;
         const segment = hasStepCadence ? Math.floor((turn - 1) / maxTurnsPerSegment) + 1 : 1;
         const contextTokenThreshold = Math.floor(activeContextLength * 0.7);
@@ -1727,7 +1917,7 @@ async function runAgentLoop(
         const action = agentTool.parseAction(assistantContent) as {
             action?: string;
             answer?: string;
-            completion_status?: "completed" | "already_satisfied" | "no_change_needed";
+            completion_status?: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
             evidence?: string[];
             tool?: string;
             reason?: string;
@@ -1900,15 +2090,21 @@ async function runAgentLoop(
                 || refinedTask?.task_type !== taskContract.task_type
                 || refinedTask?.requires_workspace_changes !== taskContract.requires_workspace_changes
                 || refinedTask?.continuation !== taskContract.continuation;
-            if (!refinedTask || citedEvidence.length === 0 || invalidEvidence.length > 0 || scopeChanged) {
+            const unchangedContract = Boolean(
+                taskContract
+                && refinedTask
+                && taskContractsEquivalent(taskContract, refinedTask)
+            );
+            if (!refinedTask || citedEvidence.length === 0 || invalidEvidence.length > 0 || scopeChanged || unchangedContract) {
                 const reasons = [
                     !refinedTask ? "a complete refined task contract is required" : "",
                     citedEvidence.length === 0 ? "at least one successful workspace Evidence ID is required" : "",
                     invalidEvidence.length > 0 ? `unknown or non-workspace evidence: ${invalidEvidence.join(", ")}` : "",
-                    scopeChanged ? "task_type, continuation, and requires_workspace_changes cannot change during refinement" : ""
+                    scopeChanged ? "task_type, continuation, and requires_workspace_changes cannot change during refinement" : "",
+                    unchangedContract ? "the proposed contract is equivalent to the current contract and makes no refinement" : ""
                 ].filter(Boolean);
                 const observation = `Task contract refinement rejected: ${reasons.join("; ")}.`;
-                recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "run_command", "edit_file", "write_file", "final"]);
+                recoveryResponseFormat = recoveryFormat("refine_task");
                 spinner.log(`[${stepStatus(turn)}] ${observation}`);
                 trace.add({ turn, status: "error", action: "task_contract_refinement_blocked", reason: action.reason, observation });
                 trace.save();
@@ -2093,8 +2289,6 @@ async function runAgentLoop(
 
         if (action.action === "final") {
             const rejectFinal = (summary: string, feedback: string): void => {
-                const blocker = finalBlockers.record(summary);
-                if (blocker.shouldStop) repeatedFinalBlocker = summary;
                 recoveryResponseFormat = recoveryFormat("final");
                 spinner.log(`[${stepStatus(turn)}] Final blocked: ${summary}`);
                 trace.add({
@@ -2115,6 +2309,49 @@ async function runAgentLoop(
             );
             const noChangeOutcome = completionStatus === "already_satisfied"
                 || completionStatus === "no_change_needed";
+            const incompleteReason = unresolvedToolFailure?.output
+                || unresolvedVerificationFailure
+                || inconclusiveVerificationBlocker
+                || (validationFailures.size > 0
+                    ? `validation remains unresolved for ${Array.from(validationFailures).join(", ")}`
+                    : verificationRequirement !== "none" && !verificationSatisfied
+                        ? `required ${verificationRequirement} verification has not succeeded`
+                        : undefined);
+            const finishIncomplete = (reason: string, useProposedAnswer: boolean): {
+                answer: string;
+                trace: InstanceType<typeof AgentTrace>;
+                clarifications: string[];
+            } => {
+                const conciseReason = reason.replace(/\s+/g, " ").trim().slice(0, 1200);
+                const answer = useProposedAnswer
+                    ? `Status: incomplete.\n\n${proposedAnswer}\n\nUnverified requirement: ${conciseReason}`
+                    : `Status: incomplete.\n\nWorkspace changes remain in place, but the required verification could not be completed. ${conciseReason}\n\nThe CLI stopped recovery instead of continuing an unproductive verification loop.`;
+                trace.add({
+                    turn,
+                    status: "final",
+                    action: "final_incomplete",
+                    reason: action.reason,
+                    observation: conciseReason
+                });
+                trace.save();
+                return { answer, trace, clarifications: clarificationTranscript };
+            };
+            if (completionStatus === "incomplete") {
+                if (!incompleteReason) {
+                    rejectFinal(
+                        "incomplete status requires an actual unresolved implementation, tool, validation, or verification blocker",
+                        "Use completion_status incomplete only when a concrete blocker remains. Otherwise return the evidence-backed completed, already_satisfied, or no_change_needed outcome."
+                    );
+                    continue;
+                }
+                return finishIncomplete(incompleteReason, true);
+            }
+            if (incompleteReason && inconclusiveVerificationBlocker) {
+                if (unsatisfiedFinalAttempts >= 1) {
+                    return finishIncomplete(incompleteReason, false);
+                }
+                unsatisfiedFinalAttempts += 1;
+            }
             const continuationStateSatisfied = continuationNoWriteCompletionAllowed({
                 continuation: taskContract?.continuation === true,
                 evidence: action.evidence ?? [],
@@ -2153,7 +2390,7 @@ async function runAgentLoop(
             if (unresolvedToolFailure) {
                 rejectFinal(
                     `latest ${unresolvedToolFailure.action} action is still failing`,
-                    `You cannot return final while the latest tool failure is unresolved. Inspect the error and make a concrete correction or run a successful corrective command. A read-only inspection does not clear this failure. Failure evidence: ${unresolvedToolFailure.output.slice(0, 1400)}`
+                    `You cannot report completion while the latest tool failure is unresolved. Inspect the error and make a concrete correction or run a successful corrective command. A read-only inspection does not clear this failure. If the implementation progress is preserved but the required verifier is unavailable after this grounded attempt, return final with completion_status "incomplete" and describe the exact unverified criterion. Failure evidence: ${unresolvedToolFailure.output.slice(0, 1400)}`
                 );
                 continue;
             }
@@ -2165,7 +2402,7 @@ async function runAgentLoop(
                     : "run the relevant test, build, lint, or verification command";
                 rejectFinal(
                     `required ${verificationRequirement} verification has not succeeded for this continuation`,
-                    `You cannot return final yet. ${requiredCheck}. A successful build, typecheck, or file read alone does not prove runtime behavior. Continue the current contract; do not use refine_task merely to remove continuation or weaken its evidence requirement.`
+                    `You cannot report completion yet. ${requiredCheck}. A successful build, typecheck, or file read alone does not prove runtime behavior. Continue the current contract; do not use refine_task merely to remove continuation or weaken its evidence requirement. If no finite verifier is available after a grounded attempt, return final with completion_status "incomplete" instead of changing unrelated configuration or substituting another service.`
                 );
                 continue;
             }
@@ -2257,7 +2494,7 @@ async function runAgentLoop(
                     : "run the relevant test, build, lint, or verification command";
                 rejectFinal(
                     `required ${verificationRequirement} verification has not succeeded after the latest write`,
-                    `You cannot return final yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior.`
+                    `You cannot report completion yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior. If the required finite verifier is unavailable after a grounded attempt, return final with completion_status "incomplete" and state what remains unverified.`
                 );
                 continue;
             }
@@ -2300,6 +2537,41 @@ async function runAgentLoop(
             && unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure)
             && normalizeCommandSignature(action.command) !== normalizeCommandSignature(lastFailedCommand)) {
             guard.resetActionHistory();
+        }
+        if (action.action === "run_command" && action.command
+            && failedCommands.has(action.command, action.workdir ?? ".")) {
+            const blockedAttempt = failedCommands.recordBlockedAttempt(action.command, action.workdir ?? ".");
+            const originalFailure = failedCommands.failureFor(action.command, action.workdir ?? ".");
+            const output = [
+                "Blocked repeated failed command: this exact command already failed in the current workspace state. Do not run it again unchanged. Submit a corrected command with different arguments or a different workdir. After a successful workspace change, the original verification command may be tried again.",
+                originalFailure
+                    ? `Original failure from the first attempt:\n${originalFailure}`
+                    : "Original failure output was unavailable."
+            ].join("\n\n");
+            spinner.log(`[${stepStatus(turn)}] ${output}`);
+            trace.add({
+                turn,
+                status: "error",
+                action: "repeated_failed_command_blocked",
+                reason: action.reason,
+                arguments: action,
+                observation: output
+            });
+            trace.save();
+            if (blockedAttempt >= guard.settings.repeatLimit) {
+                const answer = `Status: incomplete.\n\nThe model repeatedly retried an exact command that was already known to fail in the unchanged workspace state. The command was blocked ${blockedAttempt} times after its original failure. Workspace changes remain in place; inspect the recorded command error and provide a corrected command or change the workspace before retrying.`;
+                trace.add({
+                    turn,
+                    status: "final",
+                    action: "repeated_failed_command_stop",
+                    observation: answer
+                });
+                trace.save();
+                return { answer, trace, clarifications: clarificationTranscript };
+            }
+            recoveryResponseFormat = recoveryFormat("refine_task");
+            messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
+            continue;
         }
         const guardDecision = guard.registerAction(action as Record<string, unknown>);
         if (guardDecision.status === "replan") {
@@ -2545,6 +2817,9 @@ async function runAgentLoop(
         }
         if (action.action === "run_command" && result.ok && commandMutatesWorkspaceFiles(action.command ?? "")) {
             guard.recordFileProgress();
+            failedCommands.clear();
+            inconclusiveVerificationBlocker = undefined;
+            unsatisfiedFinalAttempts = 0;
             writtenPaths.add(commandCreatesWorkspaceFiles(action.command ?? "")
                 ? "[project scaffold generated by command]"
                 : "[dependency metadata updated by command]");
@@ -2601,6 +2876,9 @@ async function runAgentLoop(
                 // authorize a later mutation against stale contents.
                 readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                 guard.recordFileProgress();
+                failedCommands.clear();
+                inconclusiveVerificationBlocker = undefined;
+                unsatisfiedFinalAttempts = 0;
                 writtenPaths.add(action.path);
                 if (isVisualPresentationMutation(
                     action.path,
@@ -2647,6 +2925,9 @@ async function runAgentLoop(
                 // A deleted file likewise invalidates any prior read evidence.
                 readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                 guard.recordFileProgress();
+                failedCommands.clear();
+                inconclusiveVerificationBlocker = undefined;
+                unsatisfiedFinalAttempts = 0;
                 validationFailures.delete(action.path);
                 writtenPaths.add(action.path);
                 projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
@@ -2664,8 +2945,19 @@ async function runAgentLoop(
         }
         if (action.action === "mcp_list_tools" && result.ok) successfulMcpDiscovery = true;
         if (action.action === "mcp_call_tool" && result.ok) successfulMcpCall = true;
+        if (action.action === "run_command"
+            && verificationRequirement !== "none"
+            && (
+                (result.ok && result.probeTimedOut && result.assertionPassed !== true)
+                || (!result.ok
+                    && action.mode === "probe"
+                    && ["runtime", "timeout", "inference_port_collision"].includes(result.failureKind ?? ""))
+            )) {
+            inconclusiveVerificationBlocker = result.output.slice(0, 2000);
+        }
         if (action.action === "run_command" && !result.ok) {
             lastFailedCommand = action.command;
+            failedCommands.record(action.command ?? "", action.workdir ?? ".", result.output);
             unresolvedMissingCommandTarget = missingCommandTargetError(result.output);
             const invocationFailure = commandInvocationError(result.output);
             const effectiveWorkdir = action.workdir
@@ -2709,6 +3001,8 @@ async function runAgentLoop(
                 verificationSatisfied = true;
                 unresolvedVerificationFailure = undefined;
                 unresolvedMissingCommandTarget = false;
+                inconclusiveVerificationBlocker = undefined;
+                unsatisfiedFinalAttempts = 0;
             } else if (satisfiesRequiredCheck && result.assertionPassed === false) {
                 unresolvedVerificationFailure = result.output.slice(0, 2000);
             }
@@ -2944,33 +3238,25 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
     statusBar.resume();
     const spinner = new Spinner("Thinking...");
 
-    if (!slashKeypressListenerAttached) {
-        slashKeypressListenerAttached = true;
+    if (!inputSuggestionKeypressListenerAttached) {
+        inputSuggestionKeypressListenerAttached = true;
         readline.emitKeypressEvents(process.stdin);
         if (process.stdin.isTTY) {
             process.stdin.setRawMode(true);
         }
+        installInputSuggestionTtyWrite();
 
         process.stdin.on("keypress", (_str: string, key: readline.Key) => {
             if (key?.ctrl && key.name === "c" && activeRequestController) {
                 activeRequestController.abort();
                 activeRequestSpinner?.log("Cancelling active request... completed file writes remain available through /undo.");
-                return;
             }
-            if (key && (key.name === "return" || key.name === "enter")) {
-                // Let the rl.question callback erase the panel via clearScreenDown
-                // once readline has emitted its newline.
-                return;
-            }
-
-            // defer so rl.line and rl.cursor reflect the just-typed key
-            setImmediate(updateSlashSuggestions);
         });
     }
 
     rl.question("You: ", async (message: string) => {
         const trimmed = message.trim();
-        clearSlashSuggestionsBelow();
+        clearInputSuggestionsBelow();
         const modeCommand = parseModeCommand(trimmed);
         const modelCommand = parseModelCommand(trimmed);
         const workspaceCommand = parseWorkspaceCommand(trimmed);
@@ -3044,8 +3330,8 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
 
         if (trimmed.toLowerCase() === "/skills") {
             const skills = skillLoader.discover(activeWorkspace);
-            console.log("Project-local skills:");
-            if (skills.length === 0) console.log("  None. Add .cli/skills/<name>/SKILL.md");
+            console.log("Available skills:");
+            if (skills.length === 0) console.log("  None. Add ~/.codex/skills/<name>/SKILL.md or .cli/skills/<name>/SKILL.md");
             else skills.forEach((skill) => console.log(`  $${skill.name} — ${skill.description}`));
             console.log();
             ask(activeSession, runMode);
@@ -3141,6 +3427,8 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
                 model = result.model.id;
                 plannerModel = result.model.id;
                 serverModelSynced = true;
+                routerModelSuggestionCache = [];
+                routerModelSuggestionError = undefined;
                 const serverContext = await getServerContextInfo(model);
                 activeContextLength = serverContext?.contextLength ?? configuredContextLength;
                 contextStartedAt = Date.now();
@@ -3587,7 +3875,7 @@ async function start(): Promise<void> {
     console.log(`Agent trace: ${debugEnabled ? "on" : "off"} (/debug on|off)`);
     console.log("New task context: /clear");
     console.log("Cancel active request: Ctrl+C | restore latest file change: /undo");
-    console.log("Project-local skills: /skills");
+    console.log("Skills: /skills");
     console.log(`Workspace: ${activeWorkspace}`);
     console.log(`llama.cpp API: ${apiUrl}`);
     console.log(`Configured context: ${configuredContextLength.toLocaleString()} tokens`);
@@ -3598,7 +3886,7 @@ async function start(): Promise<void> {
         ? `llama.cpp loaded model: ${model}`
         : "llama.cpp status: server is not running or still loading");
     console.log("Workspace option: --workspace <project-path>");
-    console.log("Tip: type / to see inline command suggestions");
+    console.log("Tip: type /, $skill, or /model for inline suggestions");
     console.log();
 
     const activeSession = requestedSessionId

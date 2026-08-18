@@ -146,6 +146,242 @@ async function main(): Promise<void> {
         fs.rmSync(repeatedReasoningOnly.root, { recursive: true, force: true });
     }
 
+    const repeatedFailedCommand = await runScenario([
+        {
+            action: "run_command",
+            command: "node -e \"console.error('ORIGINAL_FAILURE_E2E_7');process.exit(7)\"",
+            reason: "Run the first diagnostic command."
+        },
+        {
+            action: "run_command",
+            command: "node -e \"console.error('ORIGINAL_FAILURE_E2E_7');process.exit(7)\"",
+            reason: "Retry the unchanged failed command."
+        },
+        {
+            action: "run_command",
+            command: "node -e \"process.exit(0)\"",
+            reason: "Use a corrected command."
+        },
+        {
+            action: "final",
+            answer: "Recovered with a corrected command.",
+            reason: "The corrected command succeeded."
+        }
+    ], "ตรวจด้วย command แล้วแก้คำสั่งถ้ารันไม่ผ่าน", () => undefined);
+    try {
+        assert.match(repeatedFailedCommand.output, /Blocked repeated failed command: this exact command already failed/);
+        assert.match(repeatedFailedCommand.output, /Original failure from the first attempt:/);
+        assert.match(repeatedFailedCommand.output, /ORIGINAL_FAILURE_E2E_7/);
+        assert.doesNotMatch(repeatedFailedCommand.output, /Agent stopped/);
+        assert.match(repeatedFailedCommand.output, /AI:\s+Recovered with a corrected command/);
+    } finally {
+        fs.rmSync(repeatedFailedCommand.root, { recursive: true, force: true });
+    }
+
+    const alternatingFailedCommandLoop = await runScenario([
+        { action: "read_file", path: "README.md", reason: "Inspect the workspace before verification." },
+        {
+            action: "run_command",
+            command: "node -e \"process.exit(7)\"",
+            reason: "Run the initial verification."
+        },
+        {
+            action: "refine_task",
+            task: {
+                intent: "Verify the existing workspace",
+                task_type: "general",
+                continuation: false,
+                requires_workspace_changes: false,
+                verification: "command",
+                evidence_requirements: ["source", "command"],
+                success_criteria: ["The declared verification succeeds"]
+            },
+            evidence: ["evidence_1_read_file"],
+            reason: "Retry the unchanged task contract after the command failure."
+        },
+        {
+            action: "run_command",
+            command: "node -e \"process.exit(7)\"",
+            reason: "Retry the unchanged failed command."
+        },
+        {
+            action: "refine_task",
+            task: {
+                intent: "Verify the existing workspace",
+                task_type: "general",
+                continuation: false,
+                requires_workspace_changes: false,
+                verification: "command",
+                evidence_requirements: ["command", "source"],
+                success_criteria: ["The declared verification succeeds"]
+            },
+            evidence: ["evidence_1_read_file"],
+            reason: "Alternate back to the equivalent task contract."
+        },
+        {
+            action: "run_command",
+            command: "node -e \"process.exit(7)\"",
+            reason: "Retry the unchanged failed command again."
+        }
+    ], "ตรวจ workspace ด้วยคำสั่งที่กำหนด", (root) => {
+        fs.writeFileSync(path.join(root, "README.md"), "Verification fixture.\n", "utf8");
+    }, [], {
+        intent: "Verify the existing workspace",
+        task_type: "general",
+        continuation: false,
+        requires_workspace_changes: false,
+        verification: "command",
+        evidence_requirements: ["source", "command"],
+        success_criteria: ["The declared verification succeeds"]
+    });
+    try {
+        assert.match(alternatingFailedCommandLoop.output, /equivalent to the current contract and makes no refinement/);
+        assert.match(alternatingFailedCommandLoop.output, /AI:\s+Status: incomplete/);
+        assert.match(alternatingFailedCommandLoop.output, /repeatedly retried an exact command/i);
+        assert.doesNotMatch(alternatingFailedCommandLoop.output, /Unexpected extra turn/);
+    } finally {
+        fs.rmSync(alternatingFailedCommandLoop.root, { recursive: true, force: true });
+    }
+
+    const retryAfterWorkspaceChange = await runScenario([
+        { action: "read_file", path: "status.txt", reason: "Inspect the failing state." },
+        {
+            action: "run_command",
+            command: "node -e \"const fs=require('node:fs');process.exit(fs.readFileSync('status.txt','utf8')==='fixed'?0:1)\"",
+            reason: "Verify the current state."
+        },
+        {
+            action: "edit_file",
+            path: "status.txt",
+            old_text: "broken",
+            new_text: "fixed",
+            reason: "Correct the workspace state."
+        },
+        {
+            action: "run_command",
+            command: "node -e \"const fs=require('node:fs');process.exit(fs.readFileSync('status.txt','utf8')==='fixed'?0:1)\"",
+            reason: "Retry the same verification after the source correction."
+        },
+        {
+            action: "final",
+            answer: "The workspace correction passed the original verification.",
+            reason: "The corrected workspace now passes."
+        }
+    ], "แก้ status แล้วตรวจด้วยคำสั่งเดิมอีกครั้ง", (root) => {
+        fs.writeFileSync(path.join(root, "status.txt"), "broken", "utf8");
+    });
+    try {
+        assert.equal(fs.readFileSync(path.join(retryAfterWorkspaceChange.root, "status.txt"), "utf8"), "fixed");
+        assert.doesNotMatch(retryAfterWorkspaceChange.output, /Blocked repeated failed command/);
+        assert.match(retryAfterWorkspaceChange.output, /AI:\s+The workspace correction passed the original verification/);
+    } finally {
+        fs.rmSync(retryAfterWorkspaceChange.root, { recursive: true, force: true });
+    }
+
+    const repeatedFinalRecovery = await runScenario([
+        { action: "final", answer: "Not verified yet.", reason: "Attempt completion before verification." },
+        { action: "final", answer: "Still not verified.", reason: "Attempt completion again." },
+        { action: "final", answer: "Verification remains pending.", reason: "Attempt completion a third time." },
+        { action: "final", answer: "One more premature completion.", reason: "Attempt completion a fourth time." },
+        { action: "run_command", command: "npm test", reason: "Run the required finite verification." },
+        { action: "final", answer: "Verification now passes.", reason: "The required command succeeded." }
+    ], "รัน test ให้ผ่านก่อนสรุปผล", (root) => {
+        fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({
+            name: "final-recovery",
+            scripts: { test: "node -e \"process.exit(0)\"" }
+        }), "utf8");
+    }, [], {
+        intent: "Verify the existing workspace",
+        task_type: "general",
+        continuation: false,
+        requires_workspace_changes: false,
+        verification: "command",
+        evidence_requirements: ["command"],
+        success_criteria: ["The declared test command succeeds"]
+    });
+    try {
+        assert.doesNotMatch(repeatedFinalRecovery.output, /final_loop_stop|Agent stopped after the same completion blocker/);
+        assert.match(repeatedFinalRecovery.output, /AI:\s+Verification now passes/);
+    } finally {
+        fs.rmSync(repeatedFinalRecovery.root, { recursive: true, force: true });
+    }
+
+    const verificationImpasse = await runScenario([
+        { action: "read_file", path: "ui-state.txt", reason: "Inspect the current implementation state." },
+        {
+            action: "edit_file",
+            path: "ui-state.txt",
+            old_text: "state=old",
+            new_text: "state=updated",
+            reason: "Apply the requested implementation change."
+        },
+        {
+            action: "run_command",
+            command: "node -e \"process.exit(3)\"",
+            mode: "probe",
+            timeout_ms: 5000,
+            reason: "Attempt the available runtime verification."
+        },
+        {
+            action: "final",
+            answer: "The implementation is complete.",
+            completion_status: "completed",
+            reason: "Attempt to report completion despite the unresolved verifier."
+        },
+        { action: "list_files", reason: "Inspect the preserved workspace after the blocker." },
+        {
+            action: "final",
+            answer: "The implementation is complete.",
+            completion_status: "completed",
+            reason: "Repeat the unsupported completion claim."
+        }
+    ], "แก้ implementation แล้วตรวจ interaction ให้ยืนยันได้", (root) => {
+        fs.writeFileSync(path.join(root, "ui-state.txt"), "state=old", "utf8");
+    }, [], {
+        intent: "Change an implementation and verify its observable interaction",
+        task_type: "coding",
+        continuation: false,
+        requires_workspace_changes: true,
+        verification: "interaction",
+        evidence_requirements: ["source", "interaction"],
+        success_criteria: ["The observable interaction is verified"]
+    });
+    try {
+        assert.equal(fs.readFileSync(path.join(verificationImpasse.root, "ui-state.txt"), "utf8"), "state=updated");
+        assert.match(verificationImpasse.output, /completion_status.*incomplete/);
+        assert.match(verificationImpasse.output, /AI:\s+Status: incomplete/);
+        assert.match(verificationImpasse.output, /stopped recovery instead of continuing an unproductive verification loop/i);
+        assert.doesNotMatch(verificationImpasse.output, /Unexpected extra turn/);
+    } finally {
+        fs.rmSync(verificationImpasse.root, { recursive: true, force: true });
+    }
+
+    const sourceOnlyContractMismatch = await runScenario([
+        { action: "read_file", path: "README.md", reason: "Inspect the requested source evidence." },
+        {
+            action: "final",
+            answer: "The source inspection is complete.",
+            evidence: ["evidence_1_read_file"],
+            reason: "The explicit source evidence requirement is satisfied."
+        }
+    ], "ตรวจข้อมูลใน README แล้วสรุป", (root) => {
+        fs.writeFileSync(path.join(root, "README.md"), "Source-only evidence.\n", "utf8");
+    }, [], {
+        intent: "Inspect the documented workspace state",
+        task_type: "general",
+        continuation: false,
+        requires_workspace_changes: false,
+        verification: "runtime",
+        evidence_requirements: ["source"],
+        success_criteria: ["The answer is grounded in inspected source"]
+    });
+    try {
+        assert.doesNotMatch(sourceOnlyContractMismatch.output, /required runtime verification has not succeeded/);
+        assert.match(sourceOnlyContractMismatch.output, /AI:\s+The source inspection is complete/);
+    } finally {
+        fs.rmSync(sourceOnlyContractMismatch.root, { recursive: true, force: true });
+    }
+
     const mutation = await runScenario([
         { action: "list_files", path: ".", reason: "Inspect the workspace first." },
         { action: "write_file", path: "hello.txt", content: "hello e2e\n", reason: "Create the requested file." },

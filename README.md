@@ -7,16 +7,31 @@ This CLI uses the OpenAI-compatible API exposed by `llama-server`.
 
 ## One-terminal start
 
-Run:
+Run the cross-platform launcher:
 
 ```powershell
-npm run dev
+npm start
 ```
 
-This reads paths from `.cli/settings.json`, lists the GGUF files in the configured
-model path, asks which model to use, starts `llama-server` in the background,
-waits until it is ready, and opens the CLI in the same terminal at the normal
-session-selection screen. Exiting the CLI also stops that background server.
+If `LLAMA_API_URL` is explicitly set, or settings `apiUrl` points to a non-loopback
+host, the launcher verifies that endpoint and opens the CLI without starting or
+downloading llama.cpp. An unavailable explicit endpoint is reported as an error
+and never silently falls back to a local model.
+
+Without `LLAMA_API_URL`, the launcher reuses a healthy local server on the
+configured port. Otherwise it detects the graphics hardware, selects CUDA for
+NVIDIA on Windows, SYCL for supported Intel graphics, Vulkan for AMD, Metal for
+Apple silicon, or CPU as a fallback. It uses a valid `LLAMA_CPP_DIR` or
+`llamaCppPath` first; when neither contains `llama-server`, it downloads the
+matching asset from the latest official llama.cpp GitHub release, verifies its
+published SHA-256 digest, and caches it under `.cli/runtime/`.
+
+The launcher selects `LLAMA_MODEL`, the configured default model, or the first
+GGUF file in `LLAMA_MODEL_DIR`/`modelPath`, starts `llama-server`, waits until it
+is healthy, and opens the normal session-selection screen. Exiting the CLI stops
+only the server process started by this launcher. A server that was already
+running is left running.
+
 Logs are written beneath `.cli/logs/`, grouped by purpose: `agent/`, `server/`, `evaluation/`, `baseline/`, and `benchmark/`.
 
 At session selection, use `D` to delete one saved session or `C` to clear all
@@ -120,6 +135,9 @@ Optional overrides:
 ```powershell
 $env:LLAMA_CPP_DIR = "D:\path\to\llama.cpp"
 $env:LLAMA_MODEL_DIR = "D:\path\to\models"
+$env:LLAMA_RUNTIME_BACKEND = "sycl" # cuda, sycl, vulkan, metal, or cpu
+$env:LLAMA_AUTO_DOWNLOAD = "true"
+$env:LLAMA_GPU_NAME = "Intel Arc" # optional detection override
 $env:LLAMA_DEVICE = "CUDA0"
 $env:LLAMA_HARDWARE_PROFILE = "rtx-4070-super"
 $env:LLAMA_ARG_HOST = "0.0.0.0"
@@ -357,8 +375,11 @@ file read/search or an OS-compatible command succeeds.
 not pass when an explicit assertion fails. Normally interactive package
 lifecycle commands remain blocked. For a necessary bounded runtime check, the
 model can select `mode: "probe"` with a 1–30 second `timeout_ms`; the process
-tree is terminated at the deadline. Browser-opening flags and direct URL
-launchers remain blocked in probe mode.
+tree is terminated at the deadline and output observed before termination is
+retained. A grounded output assertion that passes may verify startup behavior.
+A long-running probe without such an assertion is recorded as inconclusive,
+not as a project failure and not as proof of an interaction. Browser-opening
+flags and direct URL launchers remain blocked in probe mode.
 
 Interactive output separates the colored `AI:` label from the response body for
 readability. Diff previews use red removed lines and green added lines when
@@ -392,12 +413,28 @@ spinner's total duration as a persistent `Completed in` or `Stopped after` line.
 If the tool-action limit is reached while any artifact, project check, runtime
 probe, or validation remains incomplete, the CLI now returns a deterministic
 incomplete status and never asks the model to summarize the task as completed.
+The agent protocol also supports `completion_status: "incomplete"` when
+implementation progress is preserved but a required verifier is unavailable.
+If the model repeatedly claims completion after an inconclusive verification
+blocker, the host converts the second unsupported final attempt into an honest
+incomplete result instead of opening another recovery loop.
+An equivalent `refine_task` contract is rejected as a no-op and does not reset
+loop history. If the model alternates no-op refinement with an exact command
+already known to fail, the second blocked retry ends with an incomplete result;
+a real workspace mutation clears that command quarantine so the original check
+can be run again against the new state.
 
-Project-local skills live at `.cli/skills/<name>/SKILL.md` with required `name`
-and `description` frontmatter. Run `/skills` to list them, invoke one explicitly
-as `$skill-name`, or let metadata relevance select it. Only selected skill
-bodies enter model context. The included `$local-cli-maintainer` skill captures
-this project's maintenance and verification workflow.
+User-level skills live at `~/.codex/skills/<name>/SKILL.md` and are available in
+every workspace. Project-local skills live at `.cli/skills/<name>/SKILL.md`; a
+project-local skill overrides a user-level skill with the same name. Both require
+`name` and `description` frontmatter. Run `/skills` to list all available skills,
+invoke one explicitly as `$skill-name`, or let metadata relevance select it. Only
+selected skill bodies enter model context. The included `$local-cli-maintainer`
+skill captures this project's maintenance and verification workflow. Type `$`
+followed by any part of a skill name to open inline suggestions. Use Up/Down to
+select, Enter to run a slash command, Tab to insert without running, and Escape
+to close the menu. Enter inserts skill and model values so they can be reviewed
+before submission.
 
 The CLI records token usage returned by llama.cpp for each successful request.
 It shows cumulative session tokens, request count, output tokens, and the latest
@@ -475,6 +512,19 @@ number shown by `/model` or the full model id:
 /model 2
 /model Qwen3-14B-Q4_K_M.gguf
 ```
+
+`LLAMA_API_URL` is the explicit switch to external-API mode. A non-loopback
+`apiUrl` in JSON settings also selects external mode. The prototype's loopback
+URL is treated as the local endpoint, so it does not prevent `npm start` from
+provisioning a local runtime.
+
+The legacy Windows-only launcher remains available as `npm run dev` when its
+interactive model picker, router mode, or Windows-specific hardware tuning is
+needed.
+
+Type `/model` to load inline model suggestions from the router. Use Up/Down to
+select, Enter or Tab to insert, then Enter again to switch. Press Escape before
+Enter when you want the status/list view without selecting a suggestion.
 
 The CLI unloads the previous model before loading the requested one, syncs the
 active model/context, and clears the active task context while preserving saved

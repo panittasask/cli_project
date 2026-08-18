@@ -61,7 +61,7 @@ type AgentAction = (
     | {
         action: "final";
         answer: string;
-        completion_status: "completed" | "already_satisfied" | "no_change_needed";
+        completion_status: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
         evidence: string[];
     }
     | {
@@ -131,6 +131,7 @@ type AgentToolResult = {
     output: string;
     changed?: boolean;
     assertionPassed?: boolean;
+    probeTimedOut?: boolean;
     failureKind?: "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
     recommendedCommand?: string;
     recommendedWorkdir?: string;
@@ -183,7 +184,7 @@ In Windows PowerShell, a bare curl command may resolve to Invoke-WebRequest; use
 Set run_command.workdir to a relative workspace directory instead of using Set-Location or cd.
 If workdir is omitted and exactly one nested package manifest matches the requested executable or package script, the runner selects that directory automatically.
 Dependency installation and project scaffolding may run for up to three minutes. After a real timeout, inspect files before retrying because the command may have created partial output.
-Never add automatic browser-opening flags such as --open to package scripts. Do not run dev servers, watch commands, or headed/manual browser sessions. Finite headless automated interaction tests are allowed.
+Never add automatic browser-opening flags such as --open to package scripts. Do not run unbounded dev servers, watch commands, or headed/manual browser sessions. A package lifecycle may be observed only through a bounded probe, and finite headless automated interaction tests are allowed.
 Do not wrap commands in another powershell.exe invocation. Do not use Bash separators such as && or a bare & to background a process.`
             : `Runtime platform: ${process.platform}. run_command executes the platform shell.`;
         const inferenceBoundary = (() => {
@@ -214,6 +215,7 @@ On the first response for a task, include "task" in the same JSON object as the 
 Classify the task semantically from the complete request and context. Choose the first evidence-producing action in that same response; there is no separate routing phase. For repository work, use the project index summary and request only relevant search results or file contents rather than asking for every file.
 Set continuation true only when the current request semantically asks to resume unfinished work from the session context. A continuation may already be satisfied by the current workspace state: inspect it, run every required verification, then return final citing both workspace and verification Evidence IDs without making a cosmetic file change.
 Choose every applicable evidence requirement from the requested outcome, not merely the cheapest check. Use interaction whenever success depends on a user action and its observable result. Use visual whenever success depends on rendered appearance, layout, or styling; visual work also requires interaction evidence. A build proves compilation only and must not be used as evidence that navigation, clicks, state transitions, or appearance work.
+Keep verification consistent with evidence_requirements: source-only evidence uses none, command evidence uses command, runtime evidence uses runtime, and interaction evidence uses interaction. Do not declare a stronger verification mode than the evidence requirements describe.
 
 Available actions:
 {"action":"list_files","path":"optional relative path","reason":"brief rationale"}
@@ -230,7 +232,7 @@ Available actions:
 {"action":"mcp_list_tools","server":"optional configured server name","reason":"brief rationale"}
 {"action":"mcp_call_tool","server":"configured server name","tool":"tool name","arguments":{},"reason":"brief rationale"}
 Call discovered MCP tools through mcp_call_tool using the exact configured server and tool names.
-{"action":"final","answer":"final answer to the user","completion_status":"completed|already_satisfied|no_change_needed","evidence":["brief reference to successful tool evidence, or empty for a conversational answer"]}
+{"action":"final","answer":"final answer to the user","completion_status":"completed|already_satisfied|no_change_needed|incomplete","evidence":["brief reference to successful tool evidence, or empty for a conversational answer"]}
 
 Rules:
 - Be precise about your own capabilities. Never claim to have a tool, internet access, search results, or an executed action unless it appears in Available actions or Discovered MCP tools and you successfully used it.
@@ -240,6 +242,7 @@ Rules:
 - Prefer reading relevant files before editing.
 - Treat the current project index and successful tool observations as authoritative over prior assistant claims or an interrupted journal. Session history may mention files that were later moved or deleted. If a path is absent from the current index or read_file reports it missing, do not retry or assume it is still required solely from history; use the visible manifest/source evidence to continue.
 - If inspection proves the requested state already exists, return final with completion_status "already_satisfied". If evidence proves that changing files would be unnecessary or incorrect, use "no_change_needed". Copy the exact host-issued Evidence ID values from successful observations into evidence; do not invent IDs or perform a cosmetic mutation merely to create file progress. Required command/runtime/interaction verification still applies to no-change outcomes.
+- If implementation progress is preserved but a required verifier is unavailable or an environment/tool blocker remains after a grounded attempt, return final with completion_status "incomplete" and describe the exact unverified criterion. Do not claim completion, change unrelated runtime configuration, create a substitute service, or call an unrelated tool merely to manufacture evidence.
 - Resolve uncertainty from accessible conversation, files, manifests, configuration, and tool observations first. Uncertainty by itself is not a blocker. Use ask_user only when required information is absent after inspection and choosing incorrectly would materially change scope, compatibility, cost, data, or an irreversible effect.
 - Use ask_user instead of final for a blocking clarification. Offer 2-6 concrete, mutually distinct choices grounded in observed facts. Do not add an "Other" option; the CLI always accepts free-text answers outside the choices.
 - Classify every clarification by its actual decision type. Use preference only for naming, styling, layout, or minor implementation details; preference questions are rejected because they are safely inferable and reversible. Never mislabel a preference as scope or target.
@@ -258,6 +261,7 @@ Rules:
 - Use search_project first when the relevant path, symbol, import, manifest, or configuration is unknown. Use search_files for an exact text search and read_file for authoritative contents before editing.
 - If workspace inspection disproves an initial evidence requirement, use refine_task with successful workspace Evidence IDs. Do not keep an impossible visual or interaction gate after evidence shows the task has no such outcome. Refinement cannot change read-only/write scope or task type.
 - For runtime verification, prefer one finite command with expect.output_includes/output_excludes. Use mode probe only when a normally long-running package lifecycle must be exercised under a hard timeout. A zero exit code does not satisfy an explicit output assertion that failed.
+- A long-running server probe without a grounded output assertion is an inconclusive startup observation, not proof of runtime behavior or interaction. Do not retry it with arbitrary ports or replace the project runtime with an auxiliary server. Use a finite automated verifier when available; otherwise report the remaining verification as incomplete.
 - Add output_includes/output_excludes only for exact observable text grounded in inspected source, tests, or documentation. Omit output text assertions for silent build/typecheck/test scripts; their zero exit code is the command evidence. Never invent generic success text.
 - When package.json exposes the lifecycle needed for a project-local executable, invoke that package script. Do not bypass it by calling the executable directly, constructing node_modules/.bin paths, or passing a binary path to npx. Run start/dev/serve/watch lifecycle scripts with mode "probe" and a finite timeout.
 - Verify file contents with read_file or search_files instead of shell pipelines whenever possible.
@@ -301,7 +305,9 @@ ${mcpSection}`;
         const common = { reason, ...(task ? { task } : {}) };
 
         if (action === "final") {
-            const completionStatus = data.completion_status === "already_satisfied" || data.completion_status === "no_change_needed"
+            const completionStatus = data.completion_status === "already_satisfied"
+                || data.completion_status === "no_change_needed"
+                || data.completion_status === "incomplete"
                 ? data.completion_status
                 : "completed";
             const evidence = Array.isArray(data.evidence)
@@ -684,6 +690,34 @@ ${mcpSection}`;
                         ok: true,
                         assertionPassed: false,
                         output: `Command exited with code 0, but its explicit output assertion did not match. Treat the exit code as command/build evidence only; it does not prove the asserted runtime behavior. Do not repeat the same command with invented output text. Run the distinct verification required by the task or use an exact observable string grounded in inspected project evidence.\n${message}`
+                    };
+                }
+                if (commandError.code === "ETIMEDOUT" && action.mode === "probe") {
+                    const observedOutput = commandError.commandOutput?.trim() || "[No output was observed before timeout]";
+                    if (action.expect) {
+                        try {
+                            this.assertCommandOutput(observedOutput, action.expect);
+                            return {
+                                ok: true,
+                                assertionPassed: true,
+                                probeTimedOut: true,
+                                output: `Probe observation window ended and the process tree was terminated. The grounded output assertion passed before timeout.\n${observedOutput}`
+                            };
+                        } catch (assertionError) {
+                            const assertionMessage = assertionError instanceof Error ? assertionError.message : String(assertionError);
+                            return {
+                                ok: true,
+                                assertionPassed: false,
+                                probeTimedOut: true,
+                                output: `Probe observation window ended and the process tree was terminated. The command did not prove the requested behavior.\n${assertionMessage}`
+                            };
+                        }
+                    }
+                    return {
+                        ok: true,
+                        assertionPassed: false,
+                        probeTimedOut: true,
+                        output: `Probe observation window ended and the process tree was terminated. Startup without a grounded output assertion is inconclusive and is not runtime or interaction verification.\n${observedOutput}`
                     };
                 }
                 // A timed-out or failed scaffold/install may still leave files.
@@ -1145,7 +1179,11 @@ ${mcpSection}`;
             child.once("error", (error) => finish(() => reject(error)));
             child.once("close", (code, signal) => finish(() => {
                 if (timedOut) {
-                    const error = Object.assign(new Error(`Command timed out after ${Math.ceil(timeoutMs / 1000)} seconds; the spawned process tree was terminated.`), { code: "ETIMEDOUT" });
+                    const combinedOutput = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+                    const error = Object.assign(
+                        new Error(`Command timed out after ${Math.ceil(timeoutMs / 1000)} seconds; the spawned process tree was terminated.${combinedOutput ? `\n${combinedOutput}` : ""}`),
+                        { code: "ETIMEDOUT", commandOutput: combinedOutput }
+                    );
                     reject(error);
                     return;
                 }
@@ -1190,6 +1228,11 @@ ${mcpSection}`;
             /\berase\b/,
             /\bformat\b/,
             /\bshutdown\b/,
+            /\bstop-process\b/,
+            /\btaskkill\b/,
+            /\bpkill\b/,
+            /\bkillall\b/,
+            /(?:^|[;&|]\s*)kill\s+(?:-\S+\s+)*(?:\d+|%?\w+)/,
             /\bmove\b/,
             /\bmv\b/,
             /\bcopy\b/,
