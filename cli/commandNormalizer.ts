@@ -713,12 +713,10 @@ function packageMutationRisk(workspace: string, userMessage: string, command: st
         return `package.json in '${resolved.workdir}' is invalid; inspect and repair it before changing dependencies`;
     }
     for (const dependency of mutation.packages) {
-        const escapedName = dependency.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const explicitlyNamed = new RegExp(`(^|[^\\w@./-])${escapedName}(?=$|[^\\w./-])`, "i").test(userMessage);
-        const alreadyDeclared = Object.keys(declared).some((name) => name.toLowerCase() === dependency.name);
-        if (mutation.operation === "add" && !explicitlyNamed && !alreadyDeclared) {
-            return `package '${dependency.name}' was not explicitly named by the user and is not already declared; inspect requirements or ask a target/scope clarification before installing it`;
-        }
+        // Dependency selection is part of an in-scope build/fix task. Do not
+        // require the user to guess and name every package the implementation
+        // may need; keep this preflight focused on the package root, lockfile,
+        // package manager, and any model-invented version instead.
         if (mutation.operation === "add" && dependency.version) {
             const requestedSpec = `${dependency.name}@${dependency.version}`.toLowerCase();
             const userRequestedVersion = userMessage.toLowerCase().includes(requestedSpec);

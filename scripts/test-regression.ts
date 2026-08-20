@@ -747,7 +747,7 @@ async function main(): Promise<void> {
         fs.writeFileSync(path.join(packagePreflightWorkspace, "web", "package.json"), JSON.stringify({ name: "web", dependencies: { react: "^19.0.0" } }), "utf8");
         fs.writeFileSync(path.join(packagePreflightWorkspace, "web", "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
         assert.equal(packageMutationRisk(packagePreflightWorkspace, "install zod ให้หน่อย", "pnpm add zod", "web"), undefined);
-        assert.match(packageMutationRisk(packagePreflightWorkspace, "install package ของ react ให้หน่อย", "pnpm add react-router-dom", "web") ?? "", /not explicitly named/);
+        assert.equal(packageMutationRisk(packagePreflightWorkspace, "สร้าง routing ให้แอป react ใช้งานได้", "pnpm add react-router-dom", "web"), undefined);
         assert.match(packageMutationRisk(packagePreflightWorkspace, "install zod ให้หน่อย", "npm install zod", "web") ?? "", /does not match/);
         assert.match(packageMutationRisk(packagePreflightWorkspace, "install zod ให้หน่อย", "pnpm add zod@4", "web") ?? "", /was not requested/);
         assert.equal(packageMutationRisk(packagePreflightWorkspace, "install zod@4 ให้หน่อย", "pnpm add zod@4", "web"), undefined);
