@@ -96,8 +96,9 @@ const {
     relevantClarificationInspections: (input: { decision: string; question: string; inspections: Array<Record<string, unknown>> }) => Array<Record<string, unknown>>;
     resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
 };
-const { buildInitialAgentMessages, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat, withoutMcpActions } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentActionJsonSchema, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat, withoutMcpActions } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
+    getAgentActionJsonSchema: () => { oneOf: Array<{ properties?: Record<string, unknown>; required?: string[] }> };
     getAgentResponseFormat: (workflow: string) => {
         schema: {
             oneOf: Array<{ properties: { action: { const: string }; [key: string]: any } }>;
@@ -1136,7 +1137,15 @@ async function main(): Promise<void> {
         success_criteria: ["Explain the inspected files"]
     }).success, true);
     assert.equal(AgentActionSchema.safeParse({ action: "read_file", path: "package.json" }).success, true);
+    assert.equal(AgentActionSchema.safeParse({ action: "read_file" }).success, false);
+    assert.equal(AgentActionSchema.safeParse({ action: "run_command", command: "npm test", timeout_ms: 999 }).success, false);
     assert.equal(AgentActionSchema.safeParse({ action: "unknown" }).success, false);
+    const generatedReadSchema = getAgentActionJsonSchema().oneOf.find((variant) => (
+        (variant.properties?.action as { const?: string } | undefined)?.const === "read_file"
+    ));
+    assert.ok(generatedReadSchema);
+    assert.ok((generatedReadSchema?.required ?? []).includes("path"));
+    assert.equal((generatedReadSchema?.required ?? []).includes("reason"), false);
     const registry = new ToolRegistry();
     registry.register({
         name: "echo",

@@ -1,5 +1,9 @@
 import fs = require("node:fs");
 import path = require("node:path");
+import type { AgentRunnerDependencies } from "./agentRunnerDependencies";
+import type { AgentContext } from "./agentContext";
+import type { AgentAction } from "./schema/agentAction.schema";
+const { createAgentContext } = require("./agentContext") as { createAgentContext: (workspaceRoot: string) => AgentContext };
 
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 type AcceptanceContract = {
@@ -10,43 +14,57 @@ type AcceptanceContract = {
 type ClarificationRequest = import("../clarificationTypes").ClarificationRequest;
 type ClarificationAnswer = import("../clarificationTypes").ClarificationAnswer;
 type ProjectCompletionRequirement = import("../projectTypes").ProjectCompletionRequirement;
+type ProjectCheck = import("../projectTypes").ProjectCheck;
 type RequestBudgetControl = { pause: () => void; resume: () => void; clear: () => void };
 
 type AgentRunnerResult = {
     answer: string;
-    trace: any;
+    trace: AgentTraceLike;
     clarifications: string[];
 };
 
-type RunnerSpinner = {
-    update: (message: string) => void;
-    log: (message: string) => void;
-    suspend: () => void;
-    resume: () => void;
+type AgentTraceLike = {
+    add: (entry: {
+        turn: number;
+        status: "action" | "ok" | "error" | "parse_error" | "final";
+        action?: string;
+        reason?: string;
+        arguments?: unknown;
+        observation?: string;
+    }) => void;
+    save: () => void;
+    print: () => void;
 };
 
 type AgentRunRequest = {
     userMessage: string;
     historyForModel: Array<{ role: "user" | "assistant"; content: string }>;
     historyForTask: Array<{ role: "user" | "assistant"; content: string }>;
-    spinner: RunnerSpinner;
     sessionId: string;
     taskId: string;
     signal: AbortSignal;
     requestBudget: RequestBudgetControl;
 };
 
-type AgentRunnerServices = Record<string, any>;
+type LegacyRunnerServiceMap = { [serviceName: string]: any };
 
 class DefaultAgentRunner {
-    constructor(private readonly services: AgentRunnerServices) {}
+    constructor(private readonly dependencies: AgentRunnerDependencies) {}
 
     async run(request: AgentRunRequest): Promise<AgentRunnerResult> {
+        const { llm, tools, task, verification, completion, state, events } = this.dependencies;
+        const services = {
+            ...llm,
+            ...tools,
+            ...task,
+            ...verification,
+            ...completion,
+            ...state
+        } as unknown as LegacyRunnerServiceMap;
         const {
             userMessage,
             historyForModel,
             historyForTask,
-            spinner,
             sessionId,
             taskId,
             signal,
@@ -77,6 +95,7 @@ class DefaultAgentRunner {
             AgentResponseLog,
             resolveJsonlLogPath,
             agentTool,
+            actionCoordinator,
             formatProjectChecksPrompt,
             formatProjectCompletionPrompt,
             buildInitialAgentMessages,
@@ -101,6 +120,7 @@ class DefaultAgentRunner {
             discoverProjectRoots,
             deriveTaskEvidencePolicy,
             taskContractsEquivalent,
+            taskCoordinator,
             getAgentMutationResponseFormat,
             getAgentFinalResponseFormat,
             continuationNoWriteCompletionAllowed,
@@ -111,6 +131,7 @@ class DefaultAgentRunner {
             requiredProjectChecks,
             answerDefersRequiredWork,
             protectedProjectDeletionReason,
+            completionCoordinator,
             commandInvocationError,
             normalizeCommandSignature,
             packageScriptCommandsEquivalent,
@@ -121,6 +142,7 @@ class DefaultAgentRunner {
             projectChecksAffectedByPath,
             projectChecksForCommand,
             commandSatisfiesAcceptance,
+            verificationCoordinator,
             commandAddsTooling,
             unownedProjectMutationReason,
             countCompilerDiagnostics,
@@ -133,7 +155,16 @@ class DefaultAgentRunner {
             searchReturnedNoResults,
             checkpointStore,
             clarificationSettings
-        } = this.services;
+        } = services;
+
+        const progress = {
+            update: (message: string) => events.emit({ type: "status", message }),
+            log: (message: string) => events.emit({ type: "log", message }),
+            suspend: () => events.emit({ type: "input_suspended" }),
+            resume: () => events.emit({ type: "input_resumed" })
+        };
+        const context = createAgentContext(activeWorkspace);
+        events.emit({ type: "task_started", task: userMessage });
 
             const guard = new AgentGuard(agentGuardSettings);
             const maxTurnsPerSegment = guard.settings.maxTurns;
@@ -276,7 +307,7 @@ class DefaultAgentRunner {
                 ? `step ${step}/${verificationRecoveryActive ? recoveryMaxTurns : maxTurns}`
                 : `step ${step}`;
 
-            if (selectedSkills.length > 0) spinner.log(`Skills: ${selectedSkills.map((skill: any) => skill.name).join(", ")}`);
+            if (selectedSkills.length > 0) progress.log(`Skills: ${selectedSkills.map((skill: { name: string }) => skill.name).join(", ")}`);
 
             let lastExecutedTurn = 0;
             for (let turn = 1; ; turn += 1) {
@@ -290,13 +321,14 @@ class DefaultAgentRunner {
                     });
                     if (verificationRecoveryActive) {
                         const observation = `Verification failed at the normal step limit. Continuing for up to ${recoveryTurnAllowance} recovery steps so the agent can inspect the error, correct the project, and rerun verification.`;
-                        spinner.log(`[recovery] ${observation}`);
+                        events.emit({ type: "recovery_started", message: observation });
                         trace.add({ turn, status: "action", action: "verification_recovery_started", observation });
                         trace.save();
                     }
                 }
                 if (turn > maxTurns && (!verificationRecoveryActive || turn > recoveryMaxTurns)) break;
                 lastExecutedTurn = turn;
+                context.turn = turn;
                 const segmentTurn = hasStepCadence ? (turn - 1) % maxTurnsPerSegment + 1 : turn;
                 const segment = hasStepCadence ? Math.floor((turn - 1) / maxTurnsPerSegment) + 1 : 1;
                 const contextTokenThreshold = Math.floor(activeContextLength * 0.7);
@@ -331,7 +363,7 @@ class DefaultAgentRunner {
                     const segmentLabel = verificationRecoveryActive && compactedSegment > maxSegments
                         ? `${maxSegmentsLabel} + recovery`
                         : maxSegmentsLabel;
-                    spinner.log(`Compacted agent context ${trigger}; continuing segment ${compactedSegment}/${segmentLabel}.`);
+                    progress.log(`Compacted agent context ${trigger}; continuing segment ${compactedSegment}/${segmentLabel}.`);
                     trace.add({ turn, status: "action", action: "context_compaction", observation: `Continuing segment ${compactedSegment}/${segmentLabel} ${trigger}` });
                     trace.save();
                 }
@@ -348,7 +380,7 @@ class DefaultAgentRunner {
                     ? withoutMcpActions(selectedResponseFormat)
                     : selectedResponseFormat;
                 recoveryResponseFormat = undefined;
-                spinner.update(turn === 1
+                progress.update(turn === 1
                     ? `Planning next step (step ${turn}, ${guard.formatRemaining()})...`
                     : `Reviewing results (step ${turn}, ${guard.formatRemaining()})...`);
 
@@ -365,7 +397,7 @@ class DefaultAgentRunner {
                     sampling: samplingForRequest,
                     signal,
                     onRetry: (_attempt: number, errorCode: string) => {
-                    spinner.update(`llama.cpp connection ${errorCode}; retrying...`);
+                        events.emit({ type: "retrying", message: `llama.cpp connection ${errorCode}; retrying...` });
                     }
                 });
                 const responseUsage = recordResponseUsage(sessionId, response.data);
@@ -379,7 +411,7 @@ class DefaultAgentRunner {
                     reasoningContent: choice.message.reasoning_content,
                     finishReason: choice.finish_reason
                 });
-                const action = agentTool.parseAction(assistantContent) as {
+                const action = actionCoordinator.parse(assistantContent) as {
                     action?: string;
                     answer?: string;
                     completion_status?: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
@@ -419,7 +451,7 @@ class DefaultAgentRunner {
                     ? undefined
                     : reasoningOnlyTruncation
                         ? REASONING_ONLY_PARSE_ERROR
-                        : agentTool.explainParseFailure(assistantContent);
+                        : actionCoordinator.explainParseFailure(assistantContent);
                 debugLog("LLM response", {
                     turn,
                     rawContent: rawAssistantContent,
@@ -454,7 +486,7 @@ class DefaultAgentRunner {
                 if (!action) {
                     if (!reasoningOnlyTruncation) consecutiveReasoningOnlyTruncations = 0;
                     segmentEvents.push(`Step ${segmentTurn}: invalid model action (${parseError ?? "unknown parse error"})`);
-                    spinner.log(`[${stepStatus(turn)}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
+                    progress.log(`[${stepStatus(turn)}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
                     trace.add({
                         turn,
                         status: "parse_error",
@@ -496,11 +528,15 @@ class DefaultAgentRunner {
                     continue;
                 }
                 consecutiveReasoningOnlyTruncations = 0;
+                context.actions.push({
+                    turn,
+                    action: action.action as AgentAction["action"]
+                });
 
                 if (!taskContract && !action.task) {
                     recoveryResponseFormat = initialAgentResponseFormat;
                     const output = "The first action is missing the required model-owned task contract.";
-                    spinner.log(`[${stepStatus(turn)}] ${output}`);
+                    progress.log(`[${stepStatus(turn)}] ${output}`);
                     trace.add({ turn, status: "parse_error", action: "missing_task_contract", observation: output });
                     trace.save();
                     messages.push({
@@ -516,20 +552,18 @@ class DefaultAgentRunner {
                         kind: taskContract.task_type,
                         reason: `Classified semantically by the agent: ${taskContract.intent}`
                     };
-                    readOnlyRequest = !taskContract.requires_workspace_changes;
-                    mustWrite = taskContract.requires_workspace_changes;
-                    const evidencePolicy = deriveTaskEvidencePolicy(
-                        taskContract.evidence_requirements,
-                        taskContract.verification
-                    );
-                    verificationRequirement = evidencePolicy.verification;
-                    acceptance = {
-                        evidence: evidencePolicy.evidence,
-                        verification: verificationRequirement,
-                        reason: `Defined by the model from the user goal: ${taskContract.success_criteria.join("; ")}`
+                    const preparedTask = taskCoordinator.prepare(taskContract);
+                    context.task = taskContract;
+                    context.verification = {
+                        requirement: preparedTask.acceptance.verification,
+                        satisfied: preparedTask.verificationSatisfied
                     };
-                    readOnlyAllowsCommands = verificationRequirement !== "none";
-                    verificationSatisfied = verificationRequirement === "none";
+                    readOnlyRequest = preparedTask.readOnly;
+                    mustWrite = preparedTask.mustWrite;
+                    verificationRequirement = preparedTask.acceptance.verification;
+                    acceptance = preparedTask.acceptance;
+                    readOnlyAllowsCommands = preparedTask.readOnlyAllowsCommands;
+                    verificationSatisfied = preparedTask.verificationSatisfied;
                     agentResponseFormat = readOnlyRequest
                         ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands)
                         : getAgentResponseFormat(workflow.kind);
@@ -544,33 +578,22 @@ class DefaultAgentRunner {
                     });
                     trace.save();
                     segmentEvents.push(`Task contract: ${taskContract.intent}`);
-                    spinner.log(`Task understood as ${workflow.kind}: ${taskContract.intent}`);
+                    progress.log(`Task understood as ${workflow.kind}: ${taskContract.intent}`);
                 }
 
                 if (action.action === "refine_task") {
                     const refinedTask = action.task;
                     const citedEvidence = action.evidence ?? [];
-                    const invalidEvidence = citedEvidence.filter((evidenceId) => !successfulWorkspaceEvidenceRefs.has(evidenceId));
-                    const scopeChanged = !taskContract
-                        || refinedTask?.task_type !== taskContract.task_type
-                        || refinedTask?.requires_workspace_changes !== taskContract.requires_workspace_changes
-                        || refinedTask?.continuation !== taskContract.continuation;
-                    const unchangedContract = Boolean(
-                        taskContract
-                        && refinedTask
-                        && taskContractsEquivalent(taskContract, refinedTask)
+                    const refinementCheck = taskCoordinator.validateRefinement(
+                        taskContract,
+                        refinedTask,
+                        citedEvidence,
+                        successfulWorkspaceEvidenceRefs
                     );
-                    if (!refinedTask || citedEvidence.length === 0 || invalidEvidence.length > 0 || scopeChanged || unchangedContract) {
-                        const reasons = [
-                            !refinedTask ? "a complete refined task contract is required" : "",
-                            citedEvidence.length === 0 ? "at least one successful workspace Evidence ID is required" : "",
-                            invalidEvidence.length > 0 ? `unknown or non-workspace evidence: ${invalidEvidence.join(", ")}` : "",
-                            scopeChanged ? "task_type, continuation, and requires_workspace_changes cannot change during refinement" : "",
-                            unchangedContract ? "the proposed contract is equivalent to the current contract and makes no refinement" : ""
-                        ].filter(Boolean);
-                        const observation = `Task contract refinement rejected: ${reasons.join("; ")}.`;
+                    if (!refinementCheck.accepted) {
+                        const observation = refinementCheck.reason;
                         recoveryResponseFormat = recoveryFormat("refine_task");
-                        spinner.log(`[${stepStatus(turn)}] ${observation}`);
+                        progress.log(`[${stepStatus(turn)}] ${observation}`);
                         trace.add({ turn, status: "error", action: "task_contract_refinement_blocked", reason: action.reason, observation });
                         trace.save();
                         messages.push({
@@ -580,20 +603,22 @@ class DefaultAgentRunner {
                         continue;
                     }
 
+                    if (!refinedTask) continue;
                     const previousTaskContract = taskContract;
                     taskContract = refinedTask;
-                    const evidencePolicy = deriveTaskEvidencePolicy(
-                        taskContract.evidence_requirements,
-                        taskContract.verification
+                    const preparedTask = taskCoordinator.prepare(
+                        taskContract,
+                        `Refined by the model from workspace evidence ${citedEvidence.join(", ")}`
                     );
-                    verificationRequirement = evidencePolicy.verification;
-                    acceptance = {
-                        evidence: evidencePolicy.evidence,
-                        verification: verificationRequirement,
-                        reason: `Refined by the model from workspace evidence ${citedEvidence.join(", ")}: ${taskContract.success_criteria.join("; ")}`
+                    context.task = taskContract;
+                    context.verification = {
+                        requirement: preparedTask.acceptance.verification,
+                        satisfied: preparedTask.verificationSatisfied
                     };
-                    readOnlyAllowsCommands = verificationRequirement !== "none";
-                    verificationSatisfied = verificationRequirement === "none";
+                    verificationRequirement = preparedTask.acceptance.verification;
+                    acceptance = preparedTask.acceptance;
+                    readOnlyAllowsCommands = preparedTask.readOnlyAllowsCommands;
+                    verificationSatisfied = preparedTask.verificationSatisfied;
                     recoveryResponseFormat = undefined;
                     agentResponseFormat = readOnlyRequest
                         ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands)
@@ -615,8 +640,8 @@ class DefaultAgentRunner {
                         observation
                     });
                     trace.save();
-                    segmentEvents.push(`Task contract refined from workspace evidence: ${taskContract.intent}`);
-                    spinner.log(`[${stepStatus(turn)}] Task contract refined: ${taskContract.intent}`);
+                    segmentEvents.push(`Task contract refined from workspace evidence: ${refinedTask.intent}`);
+                    progress.log(`[${stepStatus(turn)}] Task contract refined: ${refinedTask.intent}`);
                     messages.push({
                         role: "user",
                         content: `Task contract refinement accepted: ${observation}\nContinue using the refined verification and evidence requirements.`
@@ -692,7 +717,7 @@ class DefaultAgentRunner {
                     });
                     if (clarificationBlocked) {
                         recoveryResponseFormat = recoveryFormat("ask_user");
-                        spinner.log(`[${stepStatus(turn)}] Clarification blocked: ${clarificationBlocked}`);
+                        progress.log(`[${stepStatus(turn)}] Clarification blocked: ${clarificationBlocked}`);
                         trace.add({
                             turn,
                             status: "error",
@@ -707,7 +732,7 @@ class DefaultAgentRunner {
                         });
                         continue;
                     }
-                    spinner.suspend();
+                    progress.suspend();
                     requestBudget.pause();
                     guard.pause();
                     let answer: ClarificationAnswer;
@@ -716,7 +741,7 @@ class DefaultAgentRunner {
                     } finally {
                         guard.resume();
                         requestBudget.resume();
-                        spinner.resume();
+                        progress.resume();
                     }
                     const observation = clarificationObservation(request, answer);
                     clarificationTranscript.push(clarificationTranscriptLine(request, answer));
@@ -755,7 +780,7 @@ class DefaultAgentRunner {
                 if (action.action === "final") {
                     const rejectFinal = (summary: string, feedback: string): void => {
                         recoveryResponseFormat = recoveryFormat("final");
-                        spinner.log(`[${stepStatus(turn)}] Final blocked: ${summary}`);
+                        progress.log(`[${stepStatus(turn)}] Final blocked: ${summary}`);
                         trace.add({
                             turn,
                             status: "error",
@@ -784,7 +809,7 @@ class DefaultAgentRunner {
                                 : undefined);
                     const finishIncomplete = (reason: string, useProposedAnswer: boolean): {
                         answer: string;
-                        trace: any;
+                        trace: AgentTraceLike;
                         clarifications: string[];
                     } => {
                         const conciseReason = reason.replace(/\s+/g, " ").trim().slice(0, 1200);
@@ -910,9 +935,9 @@ class DefaultAgentRunner {
                             continue;
                         }
                         const missingChecks = requiredProjectChecks(projectRequirement, projectChecks)
-                            .filter((check: any) => !successfulProjectChecks.has(check.id));
+                            .filter((check: ProjectCheck) => !successfulProjectChecks.has(check.id));
                         if (missingChecks.length > 0) {
-                            const descriptions = missingChecks.map((check: any) => `${check.command} (workdir ${check.workdir})`);
+                            const descriptions = missingChecks.map((check: ProjectCheck) => `${check.command} (workdir ${check.workdir})`);
                             rejectFinal(
                                 `required project checks have not succeeded: ${descriptions.join(", ")}`,
                                 `You cannot return final yet. Run successful verification for: ${descriptions.join(", ")}. Use run_command.workdir exactly as discovered from each project manifest.`
@@ -920,11 +945,11 @@ class DefaultAgentRunner {
                             continue;
                         }
                     }
-                        const pendingChecks = projectChecks.filter((check: any) => (
+                        const pendingChecks = projectChecks.filter((check: ProjectCheck) => (
                         pendingProjectChecks.has(check.id) && !successfulProjectChecks.has(check.id)
                     ));
                     if (pendingChecks.length > 0) {
-                            const descriptions = pendingChecks.map((check: any) => `${check.command} (workdir ${check.workdir})`);
+                            const descriptions = pendingChecks.map((check: ProjectCheck) => `${check.command} (workdir ${check.workdir})`);
                         rejectFinal(
                             `checks affected by the latest changes have not succeeded: ${descriptions.join(", ")}`,
                             `You cannot return final yet. The latest file changes invalidated these manifest-discovered checks: ${descriptions.join(", ")}. Run each command in its discovered workdir; do not substitute an unrelated verification command.`
@@ -987,7 +1012,7 @@ class DefaultAgentRunner {
                         );
                         continue;
                     }
-                    spinner.update("Preparing final answer...");
+                    progress.update("Preparing final answer...");
                     const answer = proposedAnswer;
                     const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
                     const finalAnswer = missingSources.length === 0
@@ -1013,7 +1038,7 @@ class DefaultAgentRunner {
                             ? `Original failure from the first attempt:\n${originalFailure}`
                             : "Original failure output was unavailable."
                     ].join("\n\n");
-                    spinner.log(`[${stepStatus(turn)}] ${output}`);
+                    progress.log(`[${stepStatus(turn)}] ${output}`);
                     trace.add({
                         turn,
                         status: "error",
@@ -1041,7 +1066,7 @@ class DefaultAgentRunner {
                 const guardDecision = guard.registerAction(action as Record<string, unknown>);
                 if (guardDecision.status === "replan") {
                     const repeatObservation = guardDecision.message ?? "This exact action is quarantined.";
-                    spinner.log(`[${stepStatus(turn)}] ${guardDecision.message}`);
+                    progress.log(`[${stepStatus(turn)}] ${guardDecision.message}`);
                     trace.add({ turn, status: "error", action: "repeat_quarantine", arguments: action, observation: repeatObservation });
                     trace.save();
                     const completedWrites = writtenPaths.size > 0
@@ -1069,7 +1094,7 @@ class DefaultAgentRunner {
                         ? "Blocked protocol misuse: MCP is disabled for this task because no configured server is available. Do not invoke agent action names through the shell."
                         : "Blocked protocol misuse: mcp_call_tool and mcp_list_tools are agent actions, not shell commands. Return the corresponding MCP action JSON instead.";
                     recoveryResponseFormat = recoveryFormat(["run_command", "final"]);
-                    spinner.log(`[${stepStatus(turn)}] ${output}`);
+                    progress.log(`[${stepStatus(turn)}] ${output}`);
                     trace.add({ turn, status: "error", action: "shell_tool_call_blocked", reason: action.reason, arguments: action, observation: output });
                     trace.save();
                     messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1081,7 +1106,7 @@ class DefaultAgentRunner {
                     && commandAddsTooling(action.command)
                     && !/(?:\blint(?:er|ing)?\b|\btooling\b|\bplugin\b|ติดตั้ง|เพิ่ม.*(?:เครื่องมือ|ปลั๊กอิน))/i.test(userMessage)) {
                     const output = "Blocked scope expansion: a missing optional command target does not authorize installing new tooling. Use a finite verification command already declared by the project, or inspect the manifest to find one.";
-                    spinner.log(`[${stepStatus(turn)}] ${output}`);
+                    progress.log(`[${stepStatus(turn)}] ${output}`);
                     trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
                     trace.save();
                     messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1094,7 +1119,7 @@ class DefaultAgentRunner {
                 if (attemptsReadOnlyMutation) {
                     const output = "Blocked by the model-owned read-only task contract: workspace changes are outside this task. Inspect with read/list/search or return a factual final answer without mutating files.";
                     recoveryResponseFormat = getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands);
-                    spinner.log(`[${stepStatus(turn)}] ${output}`);
+                    progress.log(`[${stepStatus(turn)}] ${output}`);
                     trace.add({ turn, status: "error", action: "read_only_mutation_blocked", reason: action.reason, arguments: action, observation: output });
                     trace.save();
                     messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1106,7 +1131,7 @@ class DefaultAgentRunner {
                     if (normalizedMutationPath === ".cli/mcp.json" && workflow.kind !== "mcp_creation") {
                         const output = "Blocked MCP config mutation: .cli/mcp.json is only changed for an explicit MCP-server creation task. Keep the existing configuration while working on this project.";
                         recoveryResponseFormat = recoveryFormat(["read_file", "final"]);
-                        spinner.log(`[${stepStatus(turn)}] ${output}`);
+                        progress.log(`[${stepStatus(turn)}] ${output}`);
                         trace.add({ turn, status: "error", action: "mcp_config_mutation_blocked", reason: action.reason, arguments: action, observation: output });
                         trace.save();
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1117,7 +1142,7 @@ class DefaultAgentRunner {
                     if (scopeFailure) {
                         const output = `Blocked unscoped project mutation: ${scopeFailure}`;
                         recoveryResponseFormat = recoveryFormat([action.action ?? "write_file", "final"]);
-                        spinner.log(`[${stepStatus(turn)}] ${output}`);
+                        progress.log(`[${stepStatus(turn)}] ${output}`);
                         trace.add({ turn, status: "error", action: "project_scope_blocked", reason: action.reason, arguments: action, observation: output });
                         trace.save();
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1129,7 +1154,7 @@ class DefaultAgentRunner {
                     if (pendingRuntimePortCorrection) {
                         const output = `Blocked repeated runtime probe: ${pendingRuntimePortCorrection} Inspect and edit the real workspace server/client port configuration before running another command. Do not create or validate an auxiliary substitute server.`;
                         recoveryResponseFormat = recoveryFormat(["run_command", "write_file", "delete_file", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
-                        spinner.log(`[${stepStatus(turn)}] ${output}`);
+                        progress.log(`[${stepStatus(turn)}] ${output}`);
                         trace.add({ turn, status: "error", action: "runtime_probe_blocked_pending_correction", reason: action.reason, arguments: action, observation: output });
                         trace.save();
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1147,7 +1172,7 @@ class DefaultAgentRunner {
                                 : "";
                             const output = `Blocked repeated local-executable workaround: the project manifest already provides the authoritative lifecycle command. Run {"action":"run_command","command":${JSON.stringify(pendingPackageScriptRecovery.command)},"workdir":${JSON.stringify(pendingPackageScriptRecovery.workdir)}${modeHint}} before trying another command. File inspection and source corrections remain available.`;
                             recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "edit_file", "write_file", "delete_file", "run_command", "final"]);
-                            spinner.log(`[${stepStatus(turn)}] ${output}`);
+                            progress.log(`[${stepStatus(turn)}] ${output}`);
                             trace.add({ turn, status: "error", action: "local_executable_workaround_blocked", reason: action.reason, arguments: action, observation: output });
                             trace.save();
                             messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1158,7 +1183,7 @@ class DefaultAgentRunner {
                     if (packageRisk) {
                         const output = `Blocked package mutation: ${packageRisk}. Inspect the selected manifest and lockfile, then use an exact user-authorized package and compatible package manager.`;
                         recoveryResponseFormat = recoveryFormat("final");
-                        spinner.log(`[${stepStatus(turn)}] ${output}`);
+                        progress.log(`[${stepStatus(turn)}] ${output}`);
                         trace.add({ turn, status: "error", action: "package_preflight_blocked", reason: action.reason, arguments: action, observation: output });
                         trace.save();
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1171,7 +1196,7 @@ class DefaultAgentRunner {
                     if (protectedDeletion) {
                         const output = `Blocked deletion: ${protectedDeletion}. Inspect the co-located project files and make a different correction.`;
                         recoveryResponseFormat = recoveryFormat(["delete_file", "final"]);
-                        spinner.log(`[${stepStatus(turn)}] ${output}`);
+                        progress.log(`[${stepStatus(turn)}] ${output}`);
                         trace.add({ turn, status: "error", action: action.action, reason: action.reason, arguments: action, observation: output });
                         trace.save();
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
@@ -1198,8 +1223,8 @@ class DefaultAgentRunner {
                     if (!alreadyMatches) {
                         const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, action.content);
                         mutationCheckpointId = checkpoint.id;
-                        spinner.log(checkpoint.preview);
-                        spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+                        progress.log(checkpoint.preview);
+                        progress.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
                     }
                 }
                 if (action.action === "edit_file" && action.path && typeof action.old_text === "string" && typeof action.new_text === "string") {
@@ -1207,15 +1232,15 @@ class DefaultAgentRunner {
                     if (prepared.ok && prepared.content !== undefined && prepared.changed !== false) {
                         const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, prepared.content);
                         mutationCheckpointId = checkpoint.id;
-                        spinner.log(checkpoint.preview);
-                        spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+                        progress.log(checkpoint.preview);
+                        progress.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
                     }
                 }
                 if (action.action === "delete_file" && action.path && writeValidator.exists(action.path)) {
                     const checkpoint = checkpointStore.checkpoint(activeWorkspace, action.path, "");
                     mutationCheckpointId = checkpoint.id;
-                    spinner.log(checkpoint.preview);
-                    spinner.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
+                    progress.log(checkpoint.preview);
+                    progress.log(`Checkpoint: ${checkpoint.id} (use /undo to restore)`);
                 }
                 // Persist the selected action before execution. If the process exits
                 // inside a command, filesystem operation, or external tool call, the
@@ -1227,10 +1252,17 @@ class DefaultAgentRunner {
                     ...(action.reason ? { reason: action.reason } : {}),
                     arguments: action
                 });
-                spinner.log(agentTool.formatActionStatus(action, segmentTurn, maxTurnsPerSegment));
-                spinner.update(`Executing ${action.action}...`);
+                progress.log(actionCoordinator.formatStatus(action, segmentTurn, maxTurnsPerSegment));
+                events.emit({ type: "tool_started", tool: action.action ?? "unknown_action" });
                 debugLog("Tool request", { turn, action });
-                let result = await agentTool.execute(action);
+                let result = await actionCoordinator.execute(action);
+                verificationCoordinator.observe(action, result, context);
+                context.actions[context.actions.length - 1] = {
+                    turn,
+                    action: action.action as AgentAction["action"],
+                    success: result.ok,
+                    observation: result.output.slice(0, 500)
+                };
                 if (action.action === "run_command" && !result.ok && result.recommendedCommand) {
                     pendingPackageScriptRecovery = {
                         command: result.recommendedCommand,
@@ -1492,6 +1524,7 @@ class DefaultAgentRunner {
                 )) {
                     const evidenceRef = `evidence_${turn}_${action.action}`;
                     successfulEvidenceRefs.add(evidenceRef);
+                    context.evidence.push(evidenceRef);
                     if (
                         ["list_files", "search_project", "search_files", "read_file"].includes(action.action ?? "")
                         || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
@@ -1517,9 +1550,7 @@ class DefaultAgentRunner {
                         output: `${result.output}\nLoop guard: ${quarantineMessage}`
                     };
                 }
-                spinner.update(result.ok
-                    ? `Completed ${action.action}; reviewing result...`
-                    : `${action.action} failed; planning recovery...`);
+                events.emit({ type: "tool_completed", tool: action.action ?? "unknown_action", success: result.ok });
                 trace.add({
                     turn,
                     status: result.ok ? "ok" : "error",
@@ -1550,7 +1581,12 @@ class DefaultAgentRunner {
                         consecutiveEmptyWebSearches = 0;
                     }
                 }
-                const observation = agentTool.formatObservation(action, result);
+                const observation = actionCoordinator.formatObservation(action, result);
+                context.verification = {
+                    requirement: verificationRequirement,
+                    satisfied: verificationSatisfied,
+                    ...(unresolvedVerificationFailure ? { failure: unresolvedVerificationFailure } : {})
+                };
                 debugLog("Tool observation -> LLM", { turn, action: action.action, observation });
                 messages.push({
                     role: "user",
@@ -1583,16 +1619,16 @@ class DefaultAgentRunner {
                 const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
                 if (missingArtifacts.length > 0) toolLimitBlockers.push(`missing project artifacts: ${missingArtifacts.join(", ")}`);
                 const missingChecks = requiredProjectChecks(projectRequirement, projectChecks)
-                    .filter((check: any) => !successfulProjectChecks.has(check.id));
+                    .filter((check: ProjectCheck) => !successfulProjectChecks.has(check.id));
                 if (missingChecks.length > 0) {
-                    toolLimitBlockers.push(`project checks not passed: ${missingChecks.map((check: any) => `${check.command} in ${check.workdir}`).join(", ")}`);
+                    toolLimitBlockers.push(`project checks not passed: ${missingChecks.map((check: ProjectCheck) => `${check.command} in ${check.workdir}`).join(", ")}`);
                 }
             }
-                const pendingChecks = projectChecks.filter((check: any) => (
+                const pendingChecks = projectChecks.filter((check: ProjectCheck) => (
                 pendingProjectChecks.has(check.id) && !successfulProjectChecks.has(check.id)
             ));
             if (pendingChecks.length > 0) {
-                    toolLimitBlockers.push(`checks invalidated by file changes: ${pendingChecks.map((check: any) => `${check.command} in ${check.workdir}`).join(", ")}`);
+                    toolLimitBlockers.push(`checks invalidated by file changes: ${pendingChecks.map((check: ProjectCheck) => `${check.command} in ${check.workdir}`).join(", ")}`);
             }
             if (!verificationSatisfied) toolLimitBlockers.push(`${verificationRequirement} verification not satisfied`);
             if (workflow.kind === "web_research" && !mcpCallsDisabled && !webResearchExhausted && sourceUrls.size < 2) {
@@ -1601,10 +1637,15 @@ class DefaultAgentRunner {
             if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
                 toolLimitBlockers.push("MCP discovery and a successful tool call were not completed");
             }
-            if (toolLimitBlockers.length > 0) {
+            context.completion = {
+                status: toolLimitBlockers.length > 0 ? "blocked" : "continue",
+                blockers: [...toolLimitBlockers]
+            };
+            const completionDecision = completionCoordinator.evaluate(context);
+            if (toolLimitBlockers.length > 0 || completionDecision.status === "blocked") {
                 const answer = formatIncompleteTaskAnswer(toolLimitBlockers, Array.from(writtenPaths));
                 const executedTurnLimit = verificationRecoveryActive ? recoveryMaxTurns : maxTurns;
-                spinner.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached; task remains incomplete`);
+                progress.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached; task remains incomplete`);
                 trace.add({
                     turn: lastExecutedTurn + 1,
                     status: "error",
@@ -1616,8 +1657,8 @@ class DefaultAgentRunner {
             }
 
             const executedTurnLimit = verificationRecoveryActive ? recoveryMaxTurns : maxTurns;
-            spinner.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached after all completion gates passed; preparing a final summary`);
-            spinner.update("Summarizing completed work...");
+            progress.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached after all completion gates passed; preparing a final summary`);
+            progress.update("Summarizing completed work...");
             messages.push({
                 role: "user",
                 content: `No more tool actions are available for this task. Return one final JSON object now:
@@ -1635,7 +1676,7 @@ class DefaultAgentRunner {
                     sampling: actionSampling,
                     signal,
                     onRetry: (_attempt: number, errorCode: string) => {
-                    spinner.update(`llama.cpp connection ${errorCode}; retrying final summary...`);
+                        events.emit({ type: "retrying", message: `llama.cpp connection ${errorCode}; retrying final summary...` });
                     }
                 });
                 const responseUsage = recordResponseUsage(sessionId, response.data);
@@ -1643,7 +1684,7 @@ class DefaultAgentRunner {
                 const choice = response.data.choices[0];
                 const rawAssistantContent = choice.message.content;
                 const assistantContent = typeof rawAssistantContent === "string" ? rawAssistantContent.trim() : "";
-                const finalAction = agentTool.parseAction(assistantContent) as {
+                const finalAction = actionCoordinator.parse(assistantContent) as {
                     action?: string;
                     answer?: string;
                     reason?: string;
@@ -1664,7 +1705,7 @@ class DefaultAgentRunner {
                     reasoningContent: choice.message.reasoning_content,
                     finishReason: choice.finish_reason,
                     parsedAction: finalAction?.action,
-                    parseError: finalAction ? undefined : agentTool.explainParseFailure(assistantContent),
+                    parseError: finalAction ? undefined : actionCoordinator.explainParseFailure(assistantContent),
                     durationMs: Date.now() - modelStartedAt,
                     usage: response.data.usage,
                     timings: response.data.timings

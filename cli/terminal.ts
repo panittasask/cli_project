@@ -2,6 +2,12 @@ import axios = require("axios");
 import readline = require("node:readline");
 import fs = require("node:fs");
 import path = require("node:path");
+import type { AgentEventSink } from "./agent/agentEvents";
+import type { ActionCoordinator } from "./agent/action/actionCoordinator";
+import type { TaskCoordinator } from "./agent/task/taskCoordinator";
+import type { VerificationCoordinator } from "./agent/verification/verificationCoordinator";
+import type { CompletionCoordinator } from "./agent/completion/completionCoordinator";
+import type { AgentRunnerDependencies } from "./agent/agentRunnerDependencies";
 const { generateLogViewer } = require("../scripts/generate-log-viewer") as {
     generateLogViewer: (root?: string) => string;
 };
@@ -51,18 +57,40 @@ const { LlamaCppProvider } = require("./model/llamaCppProvider") as { LlamaCppPr
     formatError: (error: unknown) => string;
     close: () => void;
 } };
-const { DefaultAgentRunner } = require("./agent/agentRunner") as { DefaultAgentRunner: new (services: Record<string, unknown>) => {
+const { DefaultAgentRunner } = require("./agent/agentRunner") as { DefaultAgentRunner: new (dependencies: AgentRunnerDependencies) => {
     run: (request: {
         userMessage: string;
         historyForModel: Array<{ role: "user" | "assistant"; content: string }>;
         historyForTask: Array<{ role: "user" | "assistant"; content: string }>;
-        spinner: { update: (message: string) => void; log: (message: string) => void; suspend: () => void; resume: () => void };
         sessionId: string;
         taskId: string;
         signal: AbortSignal;
         requestBudget: { pause: () => void; resume: () => void; clear: () => void };
     }) => Promise<{ answer: string; trace: InstanceType<typeof AgentTrace>; clarifications: string[] }>;
 } };
+const { TerminalAgentEventSink } = require("./terminalAgentEventSink") as {
+    TerminalAgentEventSink: new (getSpinner: () => {
+        update: (message: string) => void;
+        log: (message: string) => void;
+        suspend: () => void;
+        resume: () => void;
+    } | undefined) => AgentEventSink;
+};
+const { DefaultActionCoordinator } = require("./agent/action/actionCoordinator") as {
+    DefaultActionCoordinator: new (tools: InstanceType<typeof AgentTool>) => ActionCoordinator;
+};
+const { DefaultTaskCoordinator } = require("./agent/task/taskCoordinator") as {
+    DefaultTaskCoordinator: new (policy: {
+        deriveTaskEvidencePolicy: typeof deriveTaskEvidencePolicy;
+        taskContractsEquivalent: typeof taskContractsEquivalent;
+    }) => TaskCoordinator;
+};
+const { DefaultVerificationCoordinator } = require("./agent/verification/verificationCoordinator") as {
+    DefaultVerificationCoordinator: new (events: AgentEventSink) => VerificationCoordinator;
+};
+const { DefaultCompletionCoordinator } = require("./agent/completion/completionCoordinator") as {
+    DefaultCompletionCoordinator: new () => CompletionCoordinator;
+};
 const { ModelRouterClient } = require("./modelRouter") as { ModelRouterClient: new (apiUrl: string, loadTimeoutMs?: number) => {
     list: () => Promise<RouterModel[]>;
     switch: (selection: string) => Promise<{ model: RouterModel; unloaded: string[] }>;
@@ -737,10 +765,15 @@ const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
 const toolRouter = new ToolRouter();
 const agentTool = new AgentTool(appRoot, undefined, apiUrl);
+const actionCoordinator = new DefaultActionCoordinator(agentTool);
+const taskCoordinator = new DefaultTaskCoordinator({ deriveTaskEvidencePolicy, taskContractsEquivalent });
 const checkpointStore = new FileCheckpointStore(appRoot);
 const skillLoader = new SkillLoader();
 let activeRequestController: AbortController | undefined;
 let activeRequestSpinner: InstanceType<typeof Spinner> | undefined;
+const terminalEventSink = new TerminalAgentEventSink(() => activeRequestSpinner);
+const verificationCoordinator = new DefaultVerificationCoordinator(terminalEventSink);
+const completionCoordinator = new DefaultCompletionCoordinator();
 let statusSessionId: string | undefined;
 const statusBar = new StatusBar(() => ({
     model: serverModelSynced ? model : "server unavailable",
@@ -750,86 +783,103 @@ const statusBar = new StatusBar(() => ({
 }));
 
 const agentRunner = new DefaultAgentRunner({
-    AgentGuard,
-    agentGuardSettings,
-    verificationRecoveryTurnAllowance,
-    shouldActivateVerificationRecovery,
-    discoverProjectChecks,
-    get activeWorkspace() { return activeWorkspace; },
-    projectCheckProviders,
-    getAgentReadOnlyResponseFormat,
-    getAgentResponseFormat,
-    getInitialAgentResponseFormat,
-    selectTaskContext,
-    historyMessageLimit,
-    summarizeTaskContext,
-    WriteValidator,
-    skillLoader,
-    FailedCommandRegistry,
-    appRoot,
-    AgentTrace,
-    debugLog,
-    sessionTool,
-    AgentResponseLog,
-    resolveJsonlLogPath,
-    agentTool,
-    formatProjectChecksPrompt,
-    formatProjectCompletionPrompt,
-    buildInitialAgentMessages,
-    getAgentRecoveryResponseFormat,
-    buildCompactedAgentMessages,
-    withoutMcpActions,
-    actionSampling,
-    get model() { return model; },
-    get activeContextLength() { return activeContextLength; },
-    llmProvider: llamaClient,
-    recordResponseUsage,
-    isReasoningOnlyTruncation,
-    reasoningOnlyRetryMaxTokens,
-    MAX_REASONING_ONLY_RETRIES,
-    REASONING_ONLY_PARSE_ERROR,
-    formatReasoningOnlyRecoveryPrompt,
-    answerLooksLikeBlockingClarification,
-    clarificationBlockReason,
-    clarificationObservation,
-    clarificationTranscriptLine,
-    relevantClarificationInspections,
-    promptForClarification,
-    discoverProjectRoots,
-    deriveTaskEvidencePolicy,
-    taskContractsEquivalent,
-    getAgentMutationResponseFormat,
-    getAgentFinalResponseFormat,
-    continuationNoWriteCompletionAllowed,
-    effectiveCompletionStatus,
-    noChangeCompletionBlockReason,
-    formatIncompleteTaskAnswer,
-    evaluateProjectCompletion,
-    requiredProjectChecks,
-    answerDefersRequiredWork,
-    protectedProjectDeletionReason,
-    commandInvocationError,
-    normalizeCommandSignature,
-    packageScriptCommandsEquivalent,
-    packageMutationRisk,
-    commandMutatesWorkspaceFiles,
-    commandCreatesWorkspaceFiles,
-    projectChecksAffectedByWorkdir,
-    projectChecksAffectedByPath,
-    projectChecksForCommand,
-    commandSatisfiesAcceptance,
-    commandAddsTooling,
-    packageLifecycleRoleChanges,
-    diagnosticRecoveryGuidance,
-    missingCommandTargetError,
-    commandInvokesAgentTool,
-    unownedProjectMutationReason,
-    isVisualPresentationMutation,
-    searchReturnedNoResults,
-    countCompilerDiagnostics,
-    compilerDiagnosticFingerprint,
-    checkpointStore,
-    clarificationSettings
+    llm: {
+        getAgentReadOnlyResponseFormat,
+        getAgentResponseFormat,
+        getInitialAgentResponseFormat,
+        buildInitialAgentMessages,
+        getAgentRecoveryResponseFormat,
+        buildCompactedAgentMessages,
+        withoutMcpActions,
+        actionSampling,
+        get model() { return model; },
+        get activeContextLength() { return activeContextLength; },
+        llmProvider: llamaClient,
+        recordResponseUsage,
+        isReasoningOnlyTruncation,
+        reasoningOnlyRetryMaxTokens,
+        MAX_REASONING_ONLY_RETRIES,
+        REASONING_ONLY_PARSE_ERROR,
+        formatReasoningOnlyRecoveryPrompt,
+        getAgentMutationResponseFormat,
+        getAgentFinalResponseFormat
+    },
+    tools: {
+        discoverProjectChecks,
+        get activeWorkspace() { return activeWorkspace; },
+        projectCheckProviders,
+        appRoot,
+        agentTool,
+        actionCoordinator,
+        formatProjectChecksPrompt,
+        formatProjectCompletionPrompt,
+        commandInvocationError,
+        normalizeCommandSignature,
+        packageScriptCommandsEquivalent,
+        packageMutationRisk,
+        commandMutatesWorkspaceFiles,
+        commandCreatesWorkspaceFiles,
+        projectChecksAffectedByWorkdir,
+        projectChecksAffectedByPath,
+        projectChecksForCommand,
+        commandAddsTooling,
+        packageLifecycleRoleChanges,
+        diagnosticRecoveryGuidance,
+        missingCommandTargetError,
+        commandInvokesAgentTool,
+        unownedProjectMutationReason,
+        isVisualPresentationMutation,
+        searchReturnedNoResults,
+        checkpointStore
+    },
+    task: {
+        selectTaskContext,
+        historyMessageLimit,
+        summarizeTaskContext,
+        skillLoader,
+        answerLooksLikeBlockingClarification,
+        clarificationBlockReason,
+        clarificationObservation,
+        clarificationTranscriptLine,
+        relevantClarificationInspections,
+        promptForClarification,
+        discoverProjectRoots,
+        deriveTaskEvidencePolicy,
+        taskContractsEquivalent,
+        taskCoordinator
+    },
+    verification: {
+        AgentGuard,
+        agentGuardSettings,
+        verificationRecoveryTurnAllowance,
+        shouldActivateVerificationRecovery,
+        WriteValidator,
+        FailedCommandRegistry,
+        commandSatisfiesAcceptance,
+        countCompilerDiagnostics,
+        compilerDiagnosticFingerprint,
+        verificationCoordinator
+    },
+    completion: {
+        continuationNoWriteCompletionAllowed,
+        effectiveCompletionStatus,
+        noChangeCompletionBlockReason,
+        formatIncompleteTaskAnswer,
+        evaluateProjectCompletion,
+        requiredProjectChecks,
+        answerDefersRequiredWork,
+        protectedProjectDeletionReason,
+        completionCoordinator
+    },
+    state: {
+        AgentTrace,
+        debugLog,
+        sessionTool,
+        AgentResponseLog,
+        resolveJsonlLogPath,
+        clarificationSettings
+    },
+    events: terminalEventSink
 });
 
 function extractApiUsage(data: any): ApiUsage | undefined {
@@ -2081,7 +2131,6 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
                     userMessage: trimmed,
                     historyForModel,
                     historyForTask,
-                    spinner,
                     sessionId: activeSession.id,
                     taskId: journalTaskId,
                     signal: requestController.signal,
