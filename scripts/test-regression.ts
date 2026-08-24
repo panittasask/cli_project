@@ -57,6 +57,17 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new () =
     parseAction: (content: string) => any;
     close: () => Promise<void>;
 } };
+const { AgentActionSchema, AgentTaskContractSchema } = require("../cli/agent/agentSchema") as {
+    AgentActionSchema: { safeParse: (value: unknown) => { success: boolean } };
+    AgentTaskContractSchema: { safeParse: (value: unknown) => { success: boolean } };
+};
+const { ToolRegistry } = require("../cli/tools/toolRegistry") as { ToolRegistry: new () => {
+    register: (tool: { name: string; execute: (input: unknown, context: { workspacePath: string }) => Promise<{ success: boolean; data?: unknown }> }) => void;
+    execute: (name: string, input: unknown, context: { workspacePath: string }) => Promise<{ success: boolean; data?: unknown; error?: string }>;
+} };
+const { WorkspaceGuard } = require("../cli/tools/workspaceGuard") as { WorkspaceGuard: new () => {
+    resolveSafePath: (workspacePath: string, requestedPath: string) => string;
+} };
 const {
     answerLooksLikeBlockingClarification,
     clarificationBlockReason,
@@ -1115,6 +1126,30 @@ async function main(): Promise<void> {
     assert.equal(commandInvokesAgentTool('mcp_call_tool server=angular-cli tool=serve arguments:{}'), true);
     assert.equal(commandInvokesAgentTool("  MCP_LIST_TOOLS server=web"), true);
     assert.equal(commandInvokesAgentTool("npm run build"), false);
+    assert.equal(AgentTaskContractSchema.safeParse({
+        intent: "Read the project",
+        task_type: "coding",
+        continuation: false,
+        requires_workspace_changes: false,
+        verification: "none",
+        evidence_requirements: ["source"],
+        success_criteria: ["Explain the inspected files"]
+    }).success, true);
+    assert.equal(AgentActionSchema.safeParse({ action: "read_file", path: "package.json" }).success, true);
+    assert.equal(AgentActionSchema.safeParse({ action: "unknown" }).success, false);
+    const registry = new ToolRegistry();
+    registry.register({
+        name: "echo",
+        execute: async (input, context) => ({ success: true, data: { input, workspacePath: context.workspacePath } })
+    });
+    assert.deepEqual(await registry.execute("echo", "value", { workspacePath: process.cwd() }), {
+        success: true,
+        data: { input: "value", workspacePath: process.cwd() }
+    });
+    assert.equal((await registry.execute("missing", {}, { workspacePath: process.cwd() })).success, false);
+    const workspaceGuard = new WorkspaceGuard();
+    assert.equal(workspaceGuard.resolveSafePath(process.cwd(), "cli/agent/agentSchema.ts"), path.resolve(process.cwd(), "cli/agent/agentSchema.ts"));
+    assert.throws(() => workspaceGuard.resolveSafePath(process.cwd(), "../outside-workspace.txt"), /outside workspace/);
     const finalParser = new AgentTool();
     assert.deepEqual(finalParser.parseAction('{"action":"final","answer":"hello"}'), {
         action: "final",

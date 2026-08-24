@@ -1,27 +1,7 @@
-import childProcess = require("node:child_process");
 import fs = require("node:fs");
 import path = require("node:path");
-const { normalizeClarificationRequest } = require("../clarification") as {
-    normalizeClarificationRequest: (
-        question: unknown,
-        options: unknown,
-        decision: unknown,
-        reason?: string
-    ) => import("../clarificationTypes").ClarificationRequest | undefined;
-};
-const { commandFailureGuidance, commandFailureKind, commandInteractiveRisk, commandTimeoutMs, packageContentAddsBrowserAutoOpen, packageScriptRecovery, resolveCommandWorkdir, unwrapWindowsPowerShellCommand } = require("../commandNormalizer") as {
-    commandFailureGuidance: (workspace: string, command: string, errorOutput: string, inferenceApiUrl?: string, requestedWorkdir?: string) => string;
-    commandFailureKind: (command: string, errorOutput: string, inferenceApiUrl?: string) => "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
-    commandInteractiveRisk: (command: string, workspace: string, workdir?: string, options?: { probe?: boolean }) => string | undefined;
-    commandTimeoutMs: (command: string) => number;
-    packageContentAddsBrowserAutoOpen: (filePath: string, content: string) => boolean;
-    packageScriptRecovery: (workspace: string, command: string, errorOutput: string, requestedWorkdir?: string) => {
-        command: string;
-        workdir: string;
-        mode?: "probe";
-    } | undefined;
+const { resolveCommandWorkdir } = require("../commandNormalizer") as {
     resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean };
-    unwrapWindowsPowerShellCommand: (command: string) => string;
 };
 const { McpTool } = require("./mcpTool") as { McpTool: new (configRoot?: string) => {
     buildPromptSection: () => Promise<string>;
@@ -40,120 +20,61 @@ const { ProjectIndex } = require("../projectIndex") as { ProjectIndex: new (work
     summary: () => string;
     search: (query: string, limit?: number, path?: string) => string;
 } };
-
-type AgentTaskContract = {
-    intent: string;
-    task_type: "general" | "web_research" | "coding" | "mcp_creation";
-    continuation: boolean;
-    requires_workspace_changes: boolean;
-    verification: "none" | "command" | "runtime" | "interaction";
-    evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
-    success_criteria: string[];
-};
-
-type CommandExpectation = {
-    exit_code?: 0;
-    output_includes?: string[];
-    output_excludes?: string[];
-};
-
-type AgentAction = (
-    | {
-        action: "final";
-        answer: string;
-        completion_status: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
-        evidence: string[];
-    }
-    | {
-        action: "list_files";
-        path?: string;
-    }
-    | {
-        action: "search_files";
-        query: string;
-        path?: string;
-    }
-    | {
-        action: "search_project";
-        query: string;
-        path?: string;
-        limit?: number;
-    }
-    | {
-        action: "read_file";
-        path: string;
-    }
-    | {
-        action: "write_file";
-        path: string;
-        content: string;
-    }
-    | {
-        action: "edit_file";
-        path: string;
-        old_text: string;
-        new_text: string;
-    }
-    | {
-        action: "delete_file";
-        path: string;
-    }
-    | {
-        action: "run_command";
-        command: string;
-        workdir?: string;
-        mode?: "normal" | "probe";
-        timeout_ms?: number;
-        expect?: CommandExpectation;
-    }
-    | {
-        action: "refine_task";
-        task: AgentTaskContract;
-        evidence: string[];
-    }
-    | ({ action: "ask_user" } & import("../clarificationTypes").ClarificationRequest)
-    | {
-        action: "mcp_list_tools";
-        server?: string;
-    }
-    | {
-        action: "mcp_call_tool";
-        server: string;
-        tool: string;
-        arguments: Record<string, unknown>;
-    }) & {
-        reason?: string | undefined;
-        task?: AgentTaskContract | undefined;
-    };
-
-type AgentToolResult = {
-    ok: boolean;
-    output: string;
-    changed?: boolean;
-    assertionPassed?: boolean;
-    probeTimedOut?: boolean;
-    failureKind?: "inference_port_collision" | "invocation" | "timeout" | "unsafe" | "runtime";
-    recommendedCommand?: string;
-    recommendedWorkdir?: string;
-    recommendedMode?: "probe";
-};
+const { ToolRegistry } = require("./toolRegistry") as { ToolRegistry: new () => {
+    register: (tool: { name: string; execute: (input: unknown, context: { workspacePath: string; sessionId?: string }) => Promise<{ success: boolean; data?: unknown; error?: string }> }) => void;
+    execute: (name: string, input: unknown, context: { workspacePath: string; sessionId?: string }) => Promise<{ success: boolean; data?: unknown; error?: string }>;
+} };
+const { WorkspaceGuard } = require("./workspaceGuard") as { WorkspaceGuard: new () => {
+    resolveSafePath: (workspacePath: string, requestedPath: string) => string;
+} };
+const { WorkspaceFileTools } = require("./workspaceFileTools") as { WorkspaceFileTools: new (
+    workspaceGuard: InstanceType<typeof WorkspaceGuard>,
+    resolveCommandWorkdir: (workspace: string, command: string, requestedWorkdir?: string) => { workdir: string; autoSelected: boolean }
+) => {
+    prepareEdit: (inputPath: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
+    diagnosticSourceContext: (errorOutput: string, command?: string, requestedWorkdir?: string) => string | undefined;
+    listFiles: (inputPath?: string) => string;
+    searchFiles: (query: string, inputPath?: string) => string;
+    readFile: (inputPath: string) => string;
+    writeFile: (inputPath: string, content: string) => void;
+    mcpConfigWriteError: (inputPath: string, content: string) => string | undefined;
+    missingFileMessage: (inputPath: string) => string;
+    resolveInsideWorkspace: (inputPath: string) => string;
+    truncate: (content: string, maxChars: number) => string;
+} };
+const { CommandTool } = require("./commandTool") as { CommandTool: new (
+    resolveInsideWorkspace: (inputPath: string) => string,
+    commandTimeoutOverrideMs?: number,
+    inferenceApiUrl?: string
+) => {
+    runCommand: (command: string, workdir?: string, mode?: "normal" | "probe", requestedTimeoutMs?: number, expectation?: CommandExpectation) => Promise<string>;
+    assertCommandOutput: (output: string, expectation?: CommandExpectation) => void;
+} };
+const { AgentActionExecutor } = require("./agentActionExecutor") as { AgentActionExecutor: new (
+    fileTools: InstanceType<typeof WorkspaceFileTools>,
+    commandTool: InstanceType<typeof CommandTool>,
+    mcpTool: InstanceType<typeof McpTool>,
+    getProjectIndex: () => InstanceType<typeof ProjectIndex>,
+    inferenceApiUrl?: string
+) => {
+    execute: (action: AgentAction) => Promise<AgentToolResult>;
+} };
+type CommandExpectation = import("../agent/agentSchema").CommandExpectation;
+type AgentAction = import("../agent/agentSchema").AgentAction;
+type AgentToolResult = import("../agent/agentSchema").AgentToolResult;
+const { AgentActionParser } = require("../agent/agentActionParser") as { AgentActionParser: new (mcpTool: InstanceType<typeof McpTool>) => {
+    parseAction: (content: string | undefined | null) => AgentAction | undefined;
+    explainParseFailure: (content: string | undefined | null) => string;
+} };
 
 class AgentTool {
-    private readonly maxFileChars = 6000;
     private readonly maxObservationChars = 12000;
-    private readonly maxListedFiles = 180;
-    private readonly ignoredDirectories = new Set([
-        "node_modules",
-        ".git",
-        "dist",
-        "build",
-        ".next",
-        "coverage",
-        "$recycle.bin",
-        "system volume information",
-        "recovery"
-    ]);
     private readonly mcpTool: InstanceType<typeof McpTool>;
+    private readonly actionParser: InstanceType<typeof AgentActionParser>;
+    private readonly toolRegistry: InstanceType<typeof ToolRegistry>;
+    private readonly fileTools: InstanceType<typeof WorkspaceFileTools>;
+    private readonly commandTool: InstanceType<typeof CommandTool>;
+    private readonly actionExecutor: InstanceType<typeof AgentActionExecutor>;
     private projectIndex: InstanceType<typeof ProjectIndex> | undefined;
     private indexedWorkspace: string | undefined;
 
@@ -163,6 +84,23 @@ class AgentTool {
         private readonly inferenceApiUrl?: string
     ) {
         this.mcpTool = new McpTool(configRoot);
+        this.actionParser = new AgentActionParser(this.mcpTool);
+        this.toolRegistry = new ToolRegistry();
+        const workspaceGuard = new WorkspaceGuard();
+        this.fileTools = new WorkspaceFileTools(workspaceGuard, resolveCommandWorkdir);
+        this.commandTool = new CommandTool(
+            (inputPath) => this.fileTools.resolveInsideWorkspace(inputPath),
+            commandTimeoutOverrideMs,
+            inferenceApiUrl
+        );
+        this.actionExecutor = new AgentActionExecutor(
+            this.fileTools,
+            this.commandTool,
+            this.mcpTool,
+            () => this.currentProjectIndex(),
+            inferenceApiUrl
+        );
+        this.registerActionTools();
     }
 
     async inspectCapabilities(): Promise<{ servers: Array<Record<string, unknown>> }> {
@@ -281,462 +219,46 @@ ${mcpSection}`;
     }
 
     parseAction(content: string | undefined | null): AgentAction | undefined {
-        if (!content) {
-            return undefined;
-        }
-
-        const raw = content.trim();
-        // Local models sometimes wrap an action in prose or emit more than one
-        // object. Parse balanced objects independently so one extra object does
-        // not make the whole response invalid.
-        const parsed = this.extractJsonObjects(raw).find((candidate) => {
-            const action = typeof candidate.action === "string" ? candidate.action : "";
-            return this.isSupportedAction(action, candidate);
-        });
-
-        if (!parsed) {
-            return undefined;
-        }
-
-        const data = parsed;
-        const action = typeof data.action === "string" ? data.action : "";
-        const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
-        const task = this.normalizeTaskContract(data.task);
-        const common = { reason, ...(task ? { task } : {}) };
-
-        if (action === "final") {
-            const completionStatus = data.completion_status === "already_satisfied"
-                || data.completion_status === "no_change_needed"
-                || data.completion_status === "incomplete"
-                ? data.completion_status
-                : "completed";
-            const evidence = Array.isArray(data.evidence)
-                ? data.evidence.filter((item): item is string => typeof item === "string").slice(0, 8)
-                : [];
-            return {
-                action,
-                answer: typeof data.answer === "string" ? data.answer : "",
-                completion_status: completionStatus,
-                evidence,
-                ...common
-            };
-        }
-
-        if (action === "ask_user") {
-            const request = normalizeClarificationRequest(data.question, data.options, data.decision, reason);
-            return request ? { action, ...request, ...(task ? { task } : {}) } : undefined;
-        }
-
-        if (action === "list_files") {
-            const pathValue = typeof data.path === "string" ? data.path : undefined;
-            return pathValue ? { action, path: pathValue, ...common } : { action, ...common };
-        }
-
-        if (action === "search_files") {
-            const query = typeof data.query === "string" ? data.query : "";
-            const pathValue = typeof data.path === "string" ? data.path : undefined;
-            return pathValue ? { action, query, path: pathValue, ...common } : { action, query, ...common };
-        }
-
-        if (action === "search_project") {
-            const query = typeof data.query === "string" ? data.query : "";
-            const pathValue = typeof data.path === "string" ? data.path : undefined;
-            const limit = typeof data.limit === "number" && Number.isFinite(data.limit)
-                ? Math.max(1, Math.min(30, Math.floor(data.limit)))
-                : undefined;
-            return {
-                action,
-                query,
-                ...(pathValue ? { path: pathValue } : {}),
-                ...(limit ? { limit } : {}),
-                ...common
-            };
-        }
-
-        if (action === "read_file") {
-            return {
-                action,
-                path: typeof data.path === "string" ? data.path : "",
-                ...common
-            };
-        }
-
-        if (action === "write_file") {
-            return {
-                action,
-                path: typeof data.path === "string" ? data.path : "",
-                content: typeof data.content === "string" ? data.content : "",
-                ...common
-            };
-        }
-
-        if (action === "edit_file") {
-            return {
-                action,
-                path: typeof data.path === "string" ? data.path : "",
-                old_text: typeof data.old_text === "string" ? data.old_text : "",
-                new_text: typeof data.new_text === "string" ? data.new_text : "",
-                ...common
-            };
-        }
-
-        if (action === "delete_file") {
-            return {
-                action,
-                path: typeof data.path === "string" ? data.path : "",
-                ...common
-            };
-        }
-
-        if (action === "run_command") {
-            const workdir = typeof data.workdir === "string" ? data.workdir : undefined;
-            const mode = data.mode === "probe" ? "probe" : data.mode === "normal" ? "normal" : undefined;
-            const timeoutMs = typeof data.timeout_ms === "number" && Number.isFinite(data.timeout_ms)
-                ? Math.max(1000, Math.min(30000, Math.floor(data.timeout_ms)))
-                : undefined;
-            const rawExpectation = data.expect && typeof data.expect === "object" && !Array.isArray(data.expect)
-                ? data.expect as Record<string, unknown>
-                : undefined;
-            const includes = Array.isArray(rawExpectation?.output_includes)
-                ? rawExpectation.output_includes.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
-                : undefined;
-            const excludes = Array.isArray(rawExpectation?.output_excludes)
-                ? rawExpectation.output_excludes.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
-                : undefined;
-            const expect = rawExpectation ? {
-                ...(rawExpectation.exit_code === 0 ? { exit_code: 0 as const } : {}),
-                ...(includes && includes.length > 0 ? { output_includes: includes } : {}),
-                ...(excludes && excludes.length > 0 ? { output_excludes: excludes } : {})
-            } : undefined;
-            return {
-                action,
-                command: typeof data.command === "string" ? data.command : "",
-                ...(workdir ? { workdir } : {}),
-                ...(mode ? { mode } : {}),
-                ...(timeoutMs ? { timeout_ms: timeoutMs } : {}),
-                ...(expect && Object.keys(expect).length > 0 ? { expect } : {}),
-                ...common
-            };
-        }
-
-        if (action === "refine_task") {
-            const refinedTask = this.normalizeTaskContract(data.task);
-            const evidence = Array.isArray(data.evidence)
-                ? data.evidence.filter((item): item is string => typeof item === "string").slice(0, 8)
-                : [];
-            return refinedTask && evidence.length > 0
-                ? { action, task: refinedTask, evidence, ...common }
-                : undefined;
-        }
-
-        if (action === "mcp_list_tools") {
-            const server = typeof data.server === "string" ? data.server : undefined;
-            return server ? { action, server, ...common } : { action, ...common };
-        }
-
-        if (action === "mcp_call_tool") {
-            return {
-                action,
-                server: typeof data.server === "string" ? data.server : "",
-                tool: typeof data.tool === "string" ? data.tool : "",
-                arguments: data.arguments && typeof data.arguments === "object" && !Array.isArray(data.arguments)
-                    ? data.arguments as Record<string, unknown>
-                    : {},
-                ...common
-            };
-        }
-
-        const directMcpCall = this.mcpTool.resolveDirectCall(action, data);
-        if (directMcpCall) {
-            return {
-                action: "mcp_call_tool",
-                server: directMcpCall.server,
-                tool: directMcpCall.tool,
-                arguments: directMcpCall.arguments,
-                ...common
-            };
-        }
-
-        return undefined;
+        return this.actionParser.parseAction(content);
     }
 
     explainParseFailure(content: string | undefined | null): string {
-        if (!content?.trim()) {
-            return "empty model content";
-        }
-
-        const objects = this.extractJsonObjects(content.trim());
-        if (objects.length === 0) {
-            return "no valid JSON object found in model content";
-        }
-
-        const actions = objects
-            .map((candidate) => typeof candidate.action === "string" ? candidate.action : "")
-            .filter(Boolean);
-        if (actions.length === 0) {
-            return "valid JSON object is missing a string action field";
-        }
-
-        const unsupportedActions = actions.filter((action, index) => (
-            actions.indexOf(action) === index
-            && !objects.some((candidate) => candidate.action === action && this.isSupportedAction(action, candidate))
-        ));
-
-        return unsupportedActions.length > 0
-            ? `unsupported action: ${unsupportedActions.join(", ")}`
-            : "model content did not produce one supported action";
+        return this.actionParser.explainParseFailure(content);
     }
 
-    private extractJsonObjects(raw: string): Array<Record<string, unknown>> {
-        const objects: Array<Record<string, unknown>> = [];
-
-        for (let start = raw.indexOf("{"); start !== -1; start = raw.indexOf("{", start + 1)) {
-            let depth = 0;
-            let inString = false;
-            let escaped = false;
-
-            for (let index = start; index < raw.length; index += 1) {
-                const character = raw[index];
-
-                if (inString) {
-                    if (escaped) {
-                        escaped = false;
-                    } else if (character === "\\") {
-                        escaped = true;
-                    } else if (character === '"') {
-                        inString = false;
-                    }
-                    continue;
-                }
-
-                if (character === '"') {
-                    inString = true;
-                } else if (character === "{") {
-                    depth += 1;
-                } else if (character === "}") {
-                    depth -= 1;
-                    if (depth === 0) {
-                        try {
-                            const parsed = JSON.parse(raw.slice(start, index + 1)) as unknown;
-                            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                                objects.push(parsed as Record<string, unknown>);
-                            }
-                        } catch {
-                            // Try the next opening brace; a later object may be valid.
-                        }
-                        break;
-                    }
-                }
-            }
+    async execute(action: AgentAction): Promise<AgentToolResult> {
+        const result = await this.toolRegistry.execute(action.action, action, { workspacePath: process.cwd() });
+        if (result.success) {
+            return result.data as AgentToolResult;
         }
-
-        return objects;
+        return { ok: false, output: result.error ?? `Tool failed: ${action.action}` };
     }
 
-    private isSupportedAction(action: string, data: Record<string, unknown>): boolean {
-        if (action === "ask_user") {
-            const reason = typeof data.reason === "string" ? data.reason.trim().slice(0, 300) : undefined;
-            return Boolean(normalizeClarificationRequest(data.question, data.options, data.decision, reason));
-        }
-        const builtInActions = new Set([
+    private registerActionTools(): void {
+        const actionNames = [
             "final",
+            "ask_user",
+            "refine_task",
             "list_files",
-            "search_project",
             "search_files",
+            "search_project",
             "read_file",
             "write_file",
             "edit_file",
             "delete_file",
             "run_command",
-            "refine_task",
             "mcp_list_tools",
             "mcp_call_tool"
-        ]);
+        ];
 
-        return builtInActions.has(action) || Boolean(this.mcpTool.resolveDirectCall(action, data));
-    }
-
-    async execute(action: AgentAction): Promise<AgentToolResult> {
-        try {
-            // Every model action is translated into a deterministic local
-            // operation. The model never touches the filesystem directly.
-            if (action.action === "final") {
-                return { ok: true, output: action.answer };
-            }
-
-            if (action.action === "ask_user") {
-                return { ok: false, output: "ask_user must be handled by the interactive agent loop." };
-            }
-
-            if (action.action === "list_files") {
-                return { ok: true, output: this.listFiles(action.path) };
-            }
-
-            if (action.action === "search_files") {
-                if (!action.query.trim()) {
-                    return { ok: false, output: "Missing search query." };
-                }
-
-                return { ok: true, output: this.searchFiles(action.query, action.path) };
-            }
-
-            if (action.action === "search_project") {
-                if (!action.query.trim()) {
-                    return { ok: false, output: "Missing project search query." };
-                }
-                if (action.path) this.resolveInsideWorkspace(action.path);
-                return { ok: true, output: this.currentProjectIndex().search(action.query, action.limit, action.path) };
-            }
-
-            if (action.action === "read_file") {
-                if (!action.path.trim()) {
-                    return { ok: false, output: "Missing file path." };
-                }
-
-                return { ok: true, output: this.readFile(action.path) };
-            }
-
-            if (action.action === "write_file") {
-                if (!action.path.trim()) {
-                    return { ok: false, output: "Missing file path." };
-                }
-
-                if (!action.content) {
-                    return { ok: false, output: "Missing file content." };
-                }
-
-                if (packageContentAddsBrowserAutoOpen(action.path, action.content)) {
-                    return { ok: false, output: "Blocked package script: automatic browser-opening flags such as --open are not allowed. Use a normal start script without auto-open." };
-                }
-                const mcpConfigError = this.mcpConfigWriteError(action.path, action.content);
-                if (mcpConfigError) return { ok: false, output: mcpConfigError };
-
-                const writeTarget = this.resolveInsideWorkspace(action.path);
-                if (fs.existsSync(writeTarget) && fs.statSync(writeTarget).isFile()
-                    && fs.readFileSync(writeTarget, "utf8") === action.content) {
-                    return { ok: true, changed: false, output: `No change needed: ${action.path} already has the requested content.` };
-                }
-
-                this.writeFile(action.path, action.content);
-                this.currentProjectIndex().markDirty();
-                return { ok: true, changed: true, output: `Wrote ${action.path}` };
-            }
-
-            if (action.action === "edit_file") {
-                const prepared = this.prepareEdit(action.path, action.old_text, action.new_text);
-                if (!prepared.ok || prepared.content === undefined) {
-                    return { ok: false, output: prepared.output };
-                }
-                if (packageContentAddsBrowserAutoOpen(action.path, prepared.content)) {
-                    return { ok: false, output: "Blocked package script: automatic browser-opening flags such as --open are not allowed. Use a normal start script without auto-open." };
-                }
-                const mcpConfigError = this.mcpConfigWriteError(action.path, prepared.content);
-                if (mcpConfigError) return { ok: false, output: mcpConfigError };
-                const editTarget = this.resolveInsideWorkspace(action.path);
-                if (fs.readFileSync(editTarget, "utf8") === prepared.content) {
-                    return { ok: true, changed: false, output: `No change needed: ${action.path} already contains the requested replacement.` };
-                }
-                this.writeFile(action.path, prepared.content);
-                this.currentProjectIndex().markDirty();
-                return { ok: true, changed: true, output: `Edited ${action.path} with one exact replacement` };
-            }
-
-            if (action.action === "delete_file") {
-                if (!action.path.trim()) return { ok: false, output: "Missing file path." };
-                const resolved = this.resolveInsideWorkspace(action.path);
-                if (!fs.existsSync(resolved)) return { ok: false, output: this.missingFileMessage(action.path) };
-                if (!fs.statSync(resolved).isFile()) return { ok: false, output: `delete_file only removes files: ${action.path}` };
-                fs.rmSync(resolved);
-                this.currentProjectIndex().markDirty();
-                return { ok: true, changed: true, output: `Deleted ${action.path}` };
-            }
-
-            if (action.action === "mcp_list_tools") {
-                return { ok: true, output: await this.mcpTool.listTools(action.server) };
-            }
-
-            if (action.action === "mcp_call_tool") {
-                return {
-                    ok: true,
-                    output: await this.mcpTool.callTool(action.server, action.tool, action.arguments)
-                };
-            }
-
-            if (action.action === "refine_task") {
-                return { ok: false, output: "refine_task must be handled by the interactive agent loop." };
-            }
-
-            if (!action.command.trim()) {
-                return { ok: false, output: "Missing command." };
-            }
-
-            const commandOutput = await this.runCommand(
-                action.command,
-                action.workdir,
-                action.mode,
-                action.timeout_ms,
-                action.expect
-            );
-            // Finite checks are usually read-only, but package/scaffold commands
-            // may create files. Refresh lazily before the next indexed search.
-            this.currentProjectIndex().markDirty();
-            return { ok: true, output: commandOutput };
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            if (action.action === "run_command") {
-                const commandError = error as Error & { code?: string; commandOutput?: string };
-                if (commandError.code === "EOUTPUTASSERT") {
-                    return {
-                        ok: true,
-                        assertionPassed: false,
-                        output: `Command exited with code 0, but its explicit output assertion did not match. Treat the exit code as command/build evidence only; it does not prove the asserted runtime behavior. Do not repeat the same command with invented output text. Run the distinct verification required by the task or use an exact observable string grounded in inspected project evidence.\n${message}`
-                    };
-                }
-                if (commandError.code === "ETIMEDOUT" && action.mode === "probe") {
-                    const observedOutput = commandError.commandOutput?.trim() || "[No output was observed before timeout]";
-                    if (action.expect) {
-                        try {
-                            this.assertCommandOutput(observedOutput, action.expect);
-                            return {
-                                ok: true,
-                                assertionPassed: true,
-                                probeTimedOut: true,
-                                output: `Probe observation window ended and the process tree was terminated. The grounded output assertion passed before timeout.\n${observedOutput}`
-                            };
-                        } catch (assertionError) {
-                            const assertionMessage = assertionError instanceof Error ? assertionError.message : String(assertionError);
-                            return {
-                                ok: true,
-                                assertionPassed: false,
-                                probeTimedOut: true,
-                                output: `Probe observation window ended and the process tree was terminated. The command did not prove the requested behavior.\n${assertionMessage}`
-                            };
-                        }
-                    }
-                    return {
-                        ok: true,
-                        assertionPassed: false,
-                        probeTimedOut: true,
-                        output: `Probe observation window ended and the process tree was terminated. Startup without a grounded output assertion is inconclusive and is not runtime or interaction verification.\n${observedOutput}`
-                    };
-                }
-                // A timed-out or failed scaffold/install may still leave files.
-                this.currentProjectIndex().markDirty();
-                const scriptRecovery = packageScriptRecovery(process.cwd(), action.command, message, action.workdir);
-                const guidance = commandFailureGuidance(process.cwd(), action.command, message, this.inferenceApiUrl, action.workdir);
-                const sourceContext = this.diagnosticSourceContext(message, action.command, action.workdir);
-                return {
-                    ok: false,
-                    failureKind: commandFailureKind(action.command, message, this.inferenceApiUrl),
-                    ...(scriptRecovery ? {
-                        recommendedCommand: scriptRecovery.command,
-                        recommendedWorkdir: scriptRecovery.workdir,
-                        ...(scriptRecovery.mode ? { recommendedMode: scriptRecovery.mode } : {})
-                    } : {}),
-                    output: `Recovery guidance: ${guidance}${sourceContext ? `\n${sourceContext}` : ""}\nOriginal command error:\n${message}`
-                };
-            }
-            return { ok: false, output: message };
+        for (const name of actionNames) {
+            this.toolRegistry.register({
+                name,
+                execute: async (input) => ({
+                    success: true,
+                    data: await this.actionExecutor.execute(input as AgentAction)
+                })
+            });
         }
     }
 
@@ -754,41 +276,11 @@ ${mcpSection}`;
     }
 
     prepareEdit(inputPath: string, oldText: string, newText: string): { ok: boolean; output: string; content?: string; changed?: boolean } {
-        if (!inputPath.trim()) return { ok: false, output: "Missing file path." };
-        if (!oldText) return { ok: false, output: "edit_file old_text must not be empty." };
+        return this.fileTools.prepareEdit(inputPath, oldText, newText);
+    }
 
-        const resolved = this.resolveInsideWorkspace(inputPath);
-        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-            return { ok: false, output: this.missingFileMessage(inputPath) };
-        }
-        const current = fs.readFileSync(resolved, "utf8");
-        const matchCount = current.split(oldText).length - 1;
-        if (matchCount === 0 && newText) {
-            const replacementCount = current.split(newText).length - 1;
-            if (replacementCount === 1) {
-                return {
-                    ok: true,
-                    changed: false,
-                    output: `Replacement is already present in ${inputPath}.`,
-                    content: current
-                };
-            }
-        }
-        if (matchCount !== 1) {
-            return {
-                ok: false,
-                output: matchCount === 0
-                    ? `edit_file old_text was not found in ${inputPath}. Read the file again and use an exact match. If line endings or whitespace still prevent an exact replacement after reading, use write_file with the complete corrected file content.`
-                    : `edit_file old_text matched ${matchCount} locations in ${inputPath}; provide more surrounding text so it matches exactly once.`
-            };
-        }
-        const content = current.replace(oldText, newText);
-        return {
-            ok: true,
-            changed: content !== current,
-            output: content === current ? `Replacement is already present in ${inputPath}.` : "Exact replacement prepared.",
-            content
-        };
+    diagnosticSourceContext(errorOutput: string, command = "", requestedWorkdir?: string): string | undefined {
+        return this.fileTools.diagnosticSourceContext(errorOutput, command, requestedWorkdir);
     }
 
     formatActionStatus(action: AgentAction, turn: number, maxTurns: number): string {
@@ -827,7 +319,7 @@ ${mcpSection}`;
     formatObservation(action: AgentAction, result: AgentToolResult): string {
         const actionName = action.action;
         const status = result.ok ? "ok" : "error";
-        const output = this.truncate(result.output, this.maxObservationChars);
+        const output = this.fileTools.truncate(result.output, this.maxObservationChars);
 
         const observation: Record<string, unknown> = {
             action: actionName,
@@ -845,536 +337,6 @@ ${mcpSection}`;
         return JSON.stringify(observation);
     }
 
-    private listFiles(inputPath?: string): string {
-        const root = this.resolveInsideWorkspace(inputPath || ".");
-        const files: string[] = [];
-
-        this.walk(root, files);
-
-        const limited = files.slice(0, this.maxListedFiles);
-        const suffix = files.length > limited.length ? `\n[Truncated: ${files.length - limited.length} more files]` : "";
-        return limited.length > 0 ? `${limited.join("\n")}${suffix}` : "[Workspace is empty]";
-    }
-
-    private searchFiles(query: string, inputPath?: string): string {
-        const root = this.resolveInsideWorkspace(inputPath || ".");
-        const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-        const files: string[] = [];
-        const matches: string[] = [];
-
-        this.walk(root, files);
-
-        for (const relativeFile of files) {
-            const absoluteFile = path.resolve(process.cwd(), relativeFile);
-            let buffer: Buffer;
-            try {
-                buffer = fs.readFileSync(absoluteFile);
-            } catch {
-                continue;
-            }
-            if (buffer.includes(0)) {
-                continue;
-            }
-
-            const lines = buffer.toString("utf8").split(/\r?\n/);
-            lines.forEach((line, index) => {
-                if (regex.test(line)) {
-                    matches.push(`${relativeFile}:${index + 1}: ${line.trim()}`);
-                }
-            });
-
-            if (matches.length >= 120) {
-                break;
-            }
-        }
-
-        return matches.length > 0 ? matches.join("\n") : "No matches.";
-    }
-
-    private readFile(inputPath: string): string {
-        const resolved = this.resolveInsideWorkspace(inputPath);
-
-        if (!fs.existsSync(resolved)) {
-            throw new Error(this.missingFileMessage(inputPath));
-        }
-
-        const stat = fs.statSync(resolved);
-        if (!stat.isFile()) {
-            throw new Error(`Not a file: ${inputPath}`);
-        }
-
-        const buffer = fs.readFileSync(resolved);
-        if (buffer.includes(0)) {
-            throw new Error("Binary file is not supported.");
-        }
-
-        const content = buffer.toString("utf8");
-        return this.truncate(`${content}${this.relatedManifestRecoveryContext(resolved, content)}`, this.maxFileChars);
-    }
-
-    private relatedManifestRecoveryContext(resolved: string, content: string): string {
-        if (path.basename(resolved).toLowerCase() !== "package.json") return "";
-
-        try {
-            const manifest = JSON.parse(content) as Record<string, unknown>;
-            const lockPath = path.join(path.dirname(resolved), "package-lock.json");
-            if (!fs.existsSync(lockPath)) return "";
-            const lock = JSON.parse(fs.readFileSync(lockPath, "utf8")) as {
-                packages?: Record<string, Record<string, unknown>>;
-            };
-            const root = lock.packages?.[""];
-            if (!root) return "";
-
-            const evidenceKeys = ["name", "version", "dependencies", "devDependencies"];
-            const evidence = Object.fromEntries(evidenceKeys.filter((key) => root[key] !== undefined).map((key) => [key, root[key]]));
-            const comparableManifest = Object.fromEntries(evidenceKeys.filter((key) => manifest[key] !== undefined).map((key) => [key, manifest[key]]));
-            if (JSON.stringify(evidence) === JSON.stringify(comparableManifest)) return "";
-
-            return `\n\n[Recovery context: this manifest disagrees with same-directory package-lock.json root metadata. For every displayed field, copy the lockfile value exactly: remove dependency keys absent from the evidence, add keys that are present, and preserve unrelated manifest-only fields such as scripts/private. Do not guess or downgrade versions.]\n${JSON.stringify(evidence, null, 2)}`;
-        } catch {
-            return "";
-        }
-    }
-
-    diagnosticSourceContext(errorOutput: string, command = "", requestedWorkdir?: string): string | undefined {
-        const missing = errorOutput.match(/Cannot find name ['"]([^'"]+)['"]/i);
-        const symbol = missing?.[1];
-        if (!symbol || missing?.index === undefined) return undefined;
-
-        const afterDiagnostic = errorOutput.slice(missing.index);
-        const beforeDiagnostic = errorOutput.slice(0, missing.index);
-        const location = afterDiagnostic.match(/(?:^|\r?\n)\s*([^\r\n]+?\.(?:ts|tsx|js|jsx|mjs|cjs|go|rs|py)):(\d+)(?::\d+)?:/i)?.[1]
-            ?? beforeDiagnostic.match(/(?:^|\r?\n)\s*([^\r\n]+?\.(?:ts|tsx|js|jsx|mjs|cjs|go|rs|py))\(\d+,\d+\):[^\r\n]*$/i)?.[1]
-            ?? beforeDiagnostic.match(/(?:^|\r?\n)\s*([^\r\n]+?\.(?:ts|tsx|js|jsx|mjs|cjs|go|rs|py)):\d+(?::\d+)?:[^\r\n]*$/i)?.[1];
-        if (!location) return undefined;
-
-        let workdir = requestedWorkdir || ".";
-        if (command.trim()) {
-            try {
-                workdir = resolveCommandWorkdir(process.cwd(), command, requestedWorkdir).workdir;
-            } catch {
-                // Keep the requested/default workdir when project inference fails.
-            }
-        }
-        const files: string[] = [];
-        this.walk(process.cwd(), files);
-        const initialTarget = path.resolve(process.cwd(), workdir, location);
-        const normalizedLocation = location.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-        const matchingTarget = files
-            .filter((relativeFile) => relativeFile.replace(/\\/g, "/").toLowerCase().endsWith(normalizedLocation))
-            .sort((left, right) => left.length - right.length)[0];
-        const target = fs.existsSync(initialTarget) ? initialTarget : matchingTarget
-            ? path.resolve(process.cwd(), matchingTarget)
-            : initialTarget;
-        const targetRelative = path.relative(process.cwd(), target).replace(/\\/g, "/");
-        const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const exportedDefinition = new RegExp(`\\bexport\\s+(?:default\\s+)?(?:abstract\\s+)?(?:class|function|const|let|var|interface|type|enum)\\s+${escaped}\\b`);
-        const definition = files.find((relativeFile) => {
-            const absolute = path.resolve(process.cwd(), relativeFile);
-            if (absolute.toLowerCase() === target.toLowerCase()) return false;
-            if (!/\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(relativeFile)) return false;
-            try {
-                return exportedDefinition.test(fs.readFileSync(absolute, "utf8"));
-            } catch {
-                return false;
-            }
-        });
-        if (!definition) {
-            return `Diagnostic source context: '${symbol}' is used in ${targetRelative}, but no exported definition was found in visible workspace source files. Define it or choose an existing exported symbol before retrying.`;
-        }
-
-        const definitionPath = definition.replace(/\\/g, "/");
-        let moduleSpecifier = path.relative(path.dirname(target), path.resolve(process.cwd(), definition)).replace(/\\/g, "/")
-            .replace(/\.(?:tsx?|jsx?|mjs|cjs)$/i, "")
-            .replace(/\/index$/i, "");
-        if (!moduleSpecifier.startsWith(".")) moduleSpecifier = `./${moduleSpecifier}`;
-        return `Diagnostic source context: '${symbol}' is used in ${targetRelative}; an existing exported definition was found in ${definitionPath}. The target file has no in-scope declaration for that symbol. A direct source-level correction is to import it there with: import { ${symbol} } from '${moduleSpecifier}'; Keep the existing symbol reference and do not edit an unrelated registry file.`;
-    }
-
-    private writeFile(inputPath: string, content: string): void {
-        const resolved = this.resolveInsideWorkspace(inputPath);
-        fs.mkdirSync(path.dirname(resolved), { recursive: true });
-        fs.writeFileSync(resolved, content, "utf8");
-    }
-
-    private mcpConfigWriteError(inputPath: string, content: string): string | undefined {
-        const normalizedPath = inputPath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-        if (normalizedPath !== ".cli/mcp.json") return undefined;
-
-        try {
-            const parsed = JSON.parse(content) as { mcpServers?: unknown };
-            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
-                || !parsed.mcpServers || typeof parsed.mcpServers !== "object" || Array.isArray(parsed.mcpServers)) {
-                return "Invalid .cli/mcp.json: it must be a JSON object with an object-valued mcpServers field. Use {\"mcpServers\":{...}}.";
-            }
-        } catch {
-            return "Invalid .cli/mcp.json: content must be valid JSON with an object-valued mcpServers field.";
-        }
-        return undefined;
-    }
-
-    private normalizeTaskContract(value: unknown): AgentTaskContract | undefined {
-        if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-        const task = value as Record<string, unknown>;
-        const taskTypes = new Set(["general", "web_research", "coding", "mcp_creation"]);
-        const verificationTypes = new Set(["none", "command", "runtime", "interaction"]);
-        const evidenceTypes = new Set(["source", "command", "runtime", "interaction", "visual"]);
-        if (typeof task.intent !== "string"
-            || !taskTypes.has(String(task.task_type))
-            || typeof task.continuation !== "boolean"
-            || typeof task.requires_workspace_changes !== "boolean"
-            || !verificationTypes.has(String(task.verification))
-            || !Array.isArray(task.evidence_requirements)
-            || !Array.isArray(task.success_criteria)) {
-            return undefined;
-        }
-        const evidenceRequirements = Array.from(new Set(task.evidence_requirements
-            .filter((item): item is AgentTaskContract["evidence_requirements"][number] => (
-                typeof item === "string" && evidenceTypes.has(item)
-            )))).slice(0, 5);
-        const successCriteria = task.success_criteria
-            .filter((item): item is string => typeof item === "string")
-            .map((item) => item.trim())
-            .filter(Boolean)
-            .slice(0, 6);
-        if (successCriteria.length === 0 || evidenceRequirements.length === 0) return undefined;
-        return {
-            intent: task.intent.trim().slice(0, 500),
-            task_type: task.task_type as AgentTaskContract["task_type"],
-            continuation: task.continuation,
-            requires_workspace_changes: task.requires_workspace_changes,
-            verification: task.verification as AgentTaskContract["verification"],
-            evidence_requirements: evidenceRequirements,
-            success_criteria: successCriteria
-        };
-    }
-
-    private async runCommand(
-        command: string,
-        workdir?: string,
-        mode: "normal" | "probe" = "normal",
-        requestedTimeoutMs?: number,
-        expectation?: CommandExpectation
-    ): Promise<string> {
-        const normalizedCommand = process.platform === "win32"
-            ? unwrapWindowsPowerShellCommand(command)
-            : command.trim();
-        if (process.platform === "win32" && /^(?:powershell|pwsh)(?:\.exe)?\b/i.test(normalizedCommand)) {
-            throw new Error("Unsupported nested PowerShell command. Pass the command body directly.");
-        }
-        if (!this.isSafeCommand(normalizedCommand)) {
-            throw new Error(`Blocked unsafe command: ${normalizedCommand}`);
-        }
-
-        if (process.platform === "win32" && /\b(grep|sed|awk)\b/i.test(normalizedCommand)) {
-            throw new Error("Unsupported Unix command on Windows PowerShell. Use Select-String or a built-in file action instead.");
-        }
-
-        const workdirResolution = resolveCommandWorkdir(process.cwd(), normalizedCommand, workdir);
-        const commandCwd = this.resolveInsideWorkspace(workdirResolution.workdir);
-        if (!fs.existsSync(commandCwd) || !fs.statSync(commandCwd).isDirectory()) {
-            throw new Error(`Command workdir is not a directory: ${workdirResolution.workdir}`);
-        }
-        const interactiveRisk = commandInteractiveRisk(
-            normalizedCommand,
-            process.cwd(),
-            workdirResolution.workdir,
-            { probe: mode === "probe" }
-        );
-        if (interactiveRisk) {
-            throw new Error(`Blocked interactive command: ${interactiveRisk}.`);
-        }
-
-        const timeout = this.commandTimeoutOverrideMs
-            ?? (mode === "probe"
-                ? Math.max(1000, Math.min(30000, requestedTimeoutMs ?? 10000))
-                : commandTimeoutMs(normalizedCommand));
-        let output = "";
-        for (let attempt = 1; attempt <= 2; attempt += 1) {
-            try {
-                output = await this.runFiniteProcess(normalizedCommand, commandCwd, timeout);
-                break;
-            } catch (error) {
-                const code = (error as NodeJS.ErrnoException).code;
-                if (attempt < 2 && (code === "EPERM" || code === "EBUSY")) continue;
-                throw error;
-            }
-        }
-
-        const commandOutput = output.trim() || "[Command completed with no output]";
-        this.assertCommandOutput(commandOutput, expectation);
-        return workdirResolution.autoSelected
-            ? `${commandOutput}\n[Auto-selected workdir: ${workdirResolution.workdir}]`
-            : commandOutput;
-    }
-
-    private assertCommandOutput(output: string, expectation?: CommandExpectation): void {
-        if (!expectation) return;
-        const missing = (expectation.output_includes ?? []).filter((text) => !output.includes(text));
-        const forbidden = (expectation.output_excludes ?? []).filter((text) => output.includes(text));
-        if (missing.length === 0 && forbidden.length === 0) return;
-        const details = [
-            missing.length > 0 ? `missing required output: ${missing.map((text) => JSON.stringify(text)).join(", ")}` : "",
-            forbidden.length > 0 ? `found forbidden output: ${forbidden.map((text) => JSON.stringify(text)).join(", ")}` : ""
-        ].filter(Boolean).join("; ");
-        const error = Object.assign(
-            new Error(`Command output assertion failed: ${details}\nObserved output:\n${output}`),
-            { code: "EOUTPUTASSERT", commandOutput: output }
-        );
-        throw error;
-    }
-
-    private runFiniteProcess(command: string, cwd: string, timeoutMs: number): Promise<string> {
-        return new Promise((resolve, reject) => {
-            const environment = {
-                ...process.env,
-                BROWSER: "none",
-                CI: "true",
-                NO_OPEN: "1"
-            };
-            const child = process.platform === "win32"
-                ? childProcess.spawn("powershell.exe", [
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    command
-                ], {
-                    cwd,
-                    env: environment,
-                    stdio: ["ignore", "pipe", "pipe"],
-                    windowsHide: true
-                })
-                : childProcess.spawn(command, {
-                    cwd,
-                    detached: true,
-                    env: environment,
-                    shell: true,
-                    stdio: ["ignore", "pipe", "pipe"]
-                });
-            let stdout = "";
-            let stderr = "";
-            let settled = false;
-            let timedOut = false;
-            const append = (current: string, chunk: Buffer): string => (
-                current.length >= 1_000_000 ? current : `${current}${chunk.toString("utf8")}`.slice(0, 1_000_000)
-            );
-            child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
-            child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
-
-            const timer = setTimeout(() => {
-                timedOut = true;
-                if (child.pid) this.terminateProcessTree(child.pid);
-            }, timeoutMs);
-
-            const finish = (callback: () => void): void => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                callback();
-            };
-
-            child.once("error", (error) => finish(() => reject(error)));
-            child.once("close", (code, signal) => finish(() => {
-                if (timedOut) {
-                    const combinedOutput = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-                    const error = Object.assign(
-                        new Error(`Command timed out after ${Math.ceil(timeoutMs / 1000)} seconds; the spawned process tree was terminated.${combinedOutput ? `\n${combinedOutput}` : ""}`),
-                        { code: "ETIMEDOUT", commandOutput: combinedOutput }
-                    );
-                    reject(error);
-                    return;
-                }
-                const combinedOutput = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-                if (code === 0) {
-                    resolve(combinedOutput);
-                    return;
-                }
-                const error = Object.assign(new Error(`Command failed with exit code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}: ${command}${combinedOutput ? `\n${combinedOutput}` : ""}`), { code: `EXIT_${code ?? "UNKNOWN"}` });
-                reject(error);
-            }));
-        });
-    }
-
-    private terminateProcessTree(pid: number): void {
-        try {
-            if (process.platform === "win32") {
-                childProcess.spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-                    stdio: "ignore",
-                    windowsHide: true
-                });
-            } else {
-                process.kill(-pid, "SIGKILL");
-            }
-        } catch {
-            try {
-                process.kill(pid, "SIGKILL");
-            } catch {
-                // The process may already have exited between timeout and cleanup.
-            }
-        }
-    }
-
-    private isSafeCommand(command: string): boolean {
-        // This is intentionally conservative: agent mode should verify builds
-        // and inspect state, not perform destructive shell operations.
-        const lower = command.toLowerCase();
-        const blockedPatterns = [
-            /\brm\b/,
-            /\brmdir\b/,
-            /\bdel\b/,
-            /\berase\b/,
-            /\bformat\b/,
-            /\bshutdown\b/,
-            /\bstop-process\b/,
-            /\btaskkill\b/,
-            /\bpkill\b/,
-            /\bkillall\b/,
-            /(?:^|[;&|]\s*)kill\s+(?:-\S+\s+)*(?:\d+|%?\w+)/,
-            /\bmove\b/,
-            /\bmv\b/,
-            /\bcopy\b/,
-            /\bcp\b/,
-            /\bren\b/,
-            /\brename\b/,
-            /\bmkdir\b/,
-            /\bmd\s+/,
-            /\bnew-item\b/,
-            /\bremove-item\b/,
-            /\bclear-content\b/,
-            /\bset-content\b/,
-            /\badd-content\b/,
-            /\bout-file\b/,
-            /(^|[^<])>(?!>)/,
-            /\bsetx\b/,
-            /\bgit\s+reset\b/,
-            /\bgit\s+checkout\b/,
-            /\bgit\s+clean\b/,
-            /\bnpm\s+publish\b/,
-            /\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+audit\s+fix\b/,
-            /\b(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:install|i|add)\b[^\r\n]*(?:--legacy-peer-deps|--force)\b/
-        ];
-
-        return !blockedPatterns.some((pattern) => pattern.test(lower));
-    }
-
-    private walk(root: string, files: string[]): void {
-        if (files.length >= this.maxListedFiles * 3) {
-            return;
-        }
-
-        let entries: fs.Dirent[];
-        try {
-            entries = fs.readdirSync(root, { withFileTypes: true });
-        } catch {
-            return;
-        }
-
-        entries.sort((left, right) => {
-            if (left.isFile() !== right.isFile()) return left.isFile() ? -1 : 1;
-            return left.name.localeCompare(right.name);
-        });
-
-        for (const entry of entries) {
-            const absolute = path.join(root, entry.name);
-            if (entry.isDirectory() && this.shouldIgnoreDirectory(absolute, entry.name)) {
-                continue;
-            }
-
-            const relative = path.relative(process.cwd(), absolute) || ".";
-
-            if (entry.isDirectory()) {
-                this.walk(absolute, files);
-            } else if (entry.isFile()) {
-                files.push(relative);
-            }
-        }
-    }
-
-    private shouldIgnoreDirectory(absolutePath: string, name: string): boolean {
-        const normalized = name.toLowerCase();
-        if (this.ignoredDirectories.has(normalized) || normalized === "cache" || normalized === ".cache") return true;
-        if (!normalized.startsWith(".")) return false;
-        try {
-            return fs.statSync(path.join(absolutePath, "cache")).isDirectory();
-        } catch {
-            return false;
-        }
-    }
-
-    private missingFileMessage(inputPath: string): string {
-        const files: string[] = [];
-        this.walk(process.cwd(), files);
-        const normalizedTarget = inputPath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-        const targetName = path.posix.basename(normalizedTarget);
-        const targetDirectory = path.posix.dirname(normalizedTarget);
-        const targetExtension = path.posix.extname(targetName);
-        const targetSegments = targetDirectory === "." ? [] : targetDirectory.split("/");
-        const commonDirectorySuffix = (candidate: string): number => {
-            const candidateSegments = path.posix.dirname(candidate).split("/");
-            let shared = 0;
-            while (shared < targetSegments.length && shared < candidateSegments.length
-                && targetSegments[targetSegments.length - shared - 1] === candidateSegments[candidateSegments.length - shared - 1]) {
-                shared += 1;
-            }
-            return shared;
-        };
-        const distance = (left: string, right: string): number => {
-            const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-            for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
-                const current = [leftIndex];
-                for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-                    current[rightIndex] = Math.min(
-                        (current[rightIndex - 1] ?? 0) + 1,
-                        (previous[rightIndex] ?? 0) + 1,
-                        (previous[rightIndex - 1] ?? 0) + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1)
-                    );
-                }
-                previous.splice(0, previous.length, ...current);
-            }
-            return previous[right.length] ?? Math.max(left.length, right.length);
-        };
-        const candidates = files
-            .map((file) => file.replace(/\\/g, "/"))
-            .map((file) => {
-                const name = path.posix.basename(file).toLowerCase();
-                const exactNameBonus = name === targetName ? -30 : 0;
-                const extensionBonus = targetExtension && path.posix.extname(name) === targetExtension ? -4 : 0;
-                const directoryBonus = commonDirectorySuffix(file.toLowerCase()) * -5;
-                return { file, score: distance(targetName, name) * 4 + exactNameBonus + extensionBonus + directoryBonus };
-            })
-            .sort((left, right) => left.score - right.score || left.file.length - right.file.length || left.file.localeCompare(right.file))
-            .slice(0, 5)
-            .map((candidate) => candidate.file);
-        return candidates.length > 0
-            ? `File not found: ${inputPath}\nClosest visible files (verify the intended target before editing):\n${candidates.map((file) => `- ${file}`).join("\n")}`
-            : `File not found: ${inputPath}`;
-    }
-
-    private resolveInsideWorkspace(inputPath: string): string {
-        // Keep all file reads/writes inside the current project directory.
-        const workspace = process.cwd();
-        const resolved = path.resolve(workspace, inputPath);
-        const relative = path.relative(workspace, resolved);
-
-        if (relative.startsWith("..") || path.isAbsolute(relative)) {
-            throw new Error(`Path is outside workspace: ${inputPath}`);
-        }
-
-        return resolved;
-    }
-
-    private truncate(content: string, maxChars: number): string {
-        if (content.length <= maxChars) {
-            return content;
-        }
-
-        const headChars = Math.ceil(maxChars / 2);
-        const tailChars = Math.floor(maxChars / 2);
-        return `${content.slice(0, headChars)}\n\n[Middle truncated; showing first ${headChars} and last ${tailChars} characters]\n\n${content.slice(-tailChars)}`;
-    }
 }
 
 module.exports = {
