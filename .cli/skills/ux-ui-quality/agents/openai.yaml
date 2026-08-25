@@ -1,0 +1,4 @@
+interface:
+  display_name: "UX/UI Quality Designer"
+  short_description: "Design product-specific, accessible UX/UI without generic AI styling"
+  default_prompt: "Use $ux-ui-quality to design or review this interface with product-specific UX, responsive behavior, and accessibility checks."
