@@ -92,6 +92,18 @@ function withoutMcpActions(responseFormat: Record<string, unknown>): Record<stri
     };
 }
 
+function getAllowedActionNames(responseFormat: Record<string, unknown>): AgentActionName[] {
+    const schema = responseFormat.schema as { oneOf?: Array<Record<string, unknown>> } | undefined;
+    if (!Array.isArray(schema?.oneOf)) return [];
+    return schema.oneOf.flatMap((variant) => {
+        const properties = variant.properties as { action?: { const?: unknown } } | undefined;
+        const action = properties?.action?.const;
+        return typeof action === "string" && action in AgentActionSchemas
+            ? [action as AgentActionName]
+            : [];
+    });
+}
+
 function getInitialAgentResponseFormat(): Record<string, unknown> {
     const taskSchema = getTaskContractJsonSchema();
     const variants = workflowActions.general
@@ -130,6 +142,7 @@ module.exports = {
     getAgentReadOnlyResponseFormat,
     getAgentFinalResponseFormat,
     getInitialAgentResponseFormat,
+    getAllowedActionNames,
     withoutMcpActions
 };
 

@@ -1,9 +1,9 @@
 import z = require("zod");
-const { ActionMetadataSchema } = require("./shared.schema");
+const { ActionMetadataSchema, NonEmptyStringSchema } = require("./shared.schema");
 
 const DeleteFileActionSchema = z.object({
     action: z.literal("delete_file"),
-    path: z.string(),
+    path: NonEmptyStringSchema,
     ...ActionMetadataSchema
 }).strict();
 

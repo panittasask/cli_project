@@ -10,6 +10,7 @@ type HarnessOptions = {
     clarificationAnswers?: string[];
     timeoutMs?: number;
     environment?: Record<string, string>;
+    passWorkspaceArgument?: boolean;
 };
 
 function stripAnsi(value: string): string {
@@ -40,7 +41,13 @@ async function runAgentCliHarness(options: HarnessOptions): Promise<{ output: st
     const repositoryRoot = path.resolve(__dirname, "..");
     const tsx = path.resolve(repositoryRoot, "node_modules", "tsx", "dist", "cli.mjs");
     const terminal = path.resolve(repositoryRoot, "cli", "terminal.ts");
-    const child = childProcess.spawn(process.execPath, [tsx, terminal, "--session", sessionId, "--workspace", options.workspace], {
+    const child = childProcess.spawn(process.execPath, [
+        tsx,
+        terminal,
+        "--session",
+        sessionId,
+        ...(options.passWorkspaceArgument === false ? [] : ["--workspace", options.workspace])
+    ], {
         cwd: options.appRoot,
         detached: process.platform !== "win32",
         env: {

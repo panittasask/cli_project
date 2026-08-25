@@ -45,15 +45,36 @@ const {
 };
 type ClarificationRequest = import("./clarificationTypes").ClarificationRequest;
 type ClarificationAnswer = import("./clarificationTypes").ClarificationAnswer;
-const { LlamaCppProvider } = require("./model/llamaCppProvider") as { LlamaCppProvider: new (apiUrl: string, timeoutMs?: number) => {
+type ModelCapabilitySettings = Partial<import("./model/modelCapabilities").ModelCapabilities>;
+const { LlamaCppProvider } = require("./model/llamaCppProvider") as { LlamaCppProvider: new (apiUrl: string, timeoutMs?: number, options?: {
+    headers?: Record<string, string>;
+    healthCheckOnRetry?: boolean;
+    requestDelayMs?: number;
+    provider?: "llama.cpp" | "openrouter";
+    capabilities?: ModelCapabilitySettings;
+}) => {
     chat: (request: {
         model: string;
-        messages: Array<{ role: "system" | "user" | "assistant"; content: unknown }>;
+        messages: Array<{
+            role: "system" | "user" | "assistant" | "tool";
+            content: unknown;
+            tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
+            tool_call_id?: string;
+        }>;
         responseFormat?: Record<string, unknown>;
         sampling?: Record<string, unknown>;
         signal?: AbortSignal | undefined;
         onRetry?: (attempt: number, errorCode: string) => void;
-    }) => Promise<{ data: any; content: string; reasoningContent?: unknown; finishReason?: unknown; usage?: unknown; timings?: unknown }>;
+    }) => Promise<{
+        data: any;
+        content: string;
+        rawProviderContent?: string;
+        toolCall?: { id: string; name: string; arguments: string };
+        reasoningContent?: unknown;
+        finishReason?: unknown;
+        usage?: unknown;
+        timings?: unknown;
+    }>;
     formatError: (error: unknown) => string;
     close: () => void;
 } };
@@ -86,23 +107,45 @@ const { DefaultTaskCoordinator } = require("./agent/task/taskCoordinator") as {
     }) => TaskCoordinator;
 };
 const { DefaultVerificationCoordinator } = require("./agent/verification/verificationCoordinator") as {
-    DefaultVerificationCoordinator: new (events: AgentEventSink) => VerificationCoordinator;
+    DefaultVerificationCoordinator: new (services: {
+        events: AgentEventSink;
+        commandInvocationError: (output: string) => boolean;
+        commandMutatesWorkspaceFiles: (command: string) => boolean;
+        missingCommandTargetError: (output: string) => boolean;
+        commandSatisfiesAcceptance: (command: string, acceptance: { evidence: "source" | "command" | "runtime" | "interaction"; verification: "none" | "command" | "runtime"; reason: string }, options?: { probe?: boolean }) => boolean;
+        projectChecksForCommand: (command: string, checks: ProjectCheck[], workdir?: string) => string[];
+    }) => VerificationCoordinator;
 };
 const { DefaultCompletionCoordinator } = require("./agent/completion/completionCoordinator") as {
-    DefaultCompletionCoordinator: new () => CompletionCoordinator;
+    DefaultCompletionCoordinator: new (
+        workspace: string,
+        projectCheckProviders: ProjectCheckProvider[],
+        services: {
+            effectiveCompletionStatus: typeof effectiveCompletionStatus;
+            continuationNoWriteCompletionAllowed: typeof continuationNoWriteCompletionAllowed;
+            noChangeCompletionBlockReason: typeof noChangeCompletionBlockReason;
+            answerLooksLikeBlockingClarification: typeof answerLooksLikeBlockingClarification;
+            answerDefersRequiredWork: typeof answerDefersRequiredWork;
+            discoverProjectChecks: typeof discoverProjectChecks;
+            evaluateProjectCompletion: typeof evaluateProjectCompletion;
+            requiredProjectChecks: typeof requiredProjectChecks;
+            formatIncompleteTaskAnswer: typeof formatIncompleteTaskAnswer;
+        }
+    ) => CompletionCoordinator;
 };
 const { ModelRouterClient } = require("./modelRouter") as { ModelRouterClient: new (apiUrl: string, loadTimeoutMs?: number) => {
     list: () => Promise<RouterModel[]>;
     switch: (selection: string) => Promise<{ model: RouterModel; unloaded: string[] }>;
     formatError: (error: unknown) => string;
 } };
-const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, getTerminalSettings, initializeCliSettings, validateCliSettingsFile } = require("./config") as {
+const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarificationSettings, getProjectCheckProviders, getTerminalSettings, getLlmConnectionSettings, initializeCliSettings, validateCliSettingsFile } = require("./config") as {
     loadCliSettings: (appRoot?: string) => CliSettings;
     getSamplingSettings: (settings: CliSettings, kind: "chat" | "planner" | "action") => SamplingSettings;
     getAgentGuardSettings: (settings: CliSettings) => AgentGuardSettings;
     getClarificationSettings: (settings: CliSettings) => ClarificationSettings;
     getProjectCheckProviders: (settings: CliSettings) => ProjectCheckProvider[];
     getTerminalSettings: (settings: CliSettings) => { llmMessageColor: string };
+    getLlmConnectionSettings: (settings: CliSettings) => { provider: "llama.cpp" | "openrouter"; apiUrl: string; headers: Record<string, string>; apiKeyEnv?: string; model?: string; requestDelayMs: number; reasoning?: Record<string, unknown>; capabilities?: ModelCapabilitySettings };
     initializeCliSettings: (appRoot?: string) => { created: boolean; path: string; message: string };
     validateCliSettingsFile: (appRoot?: string) => { ok: boolean; path: string; source: string; errors: string[] };
 };
@@ -155,14 +198,7 @@ const { FailedCommandRegistry } = require("./failedCommandRegistry") as {
         clear: () => void;
     };
 };
-const { shouldActivateVerificationRecovery, verificationRecoveryTurnAllowance } = require("./verificationRecovery") as {
-    shouldActivateVerificationRecovery: (input: {
-        boundedRun: boolean;
-        baseLimitReached: boolean;
-        unresolvedVerificationFailure?: string;
-        verificationRequiredAndUnsatisfied?: boolean;
-        pendingProjectChecks?: boolean;
-    }) => boolean;
+const { verificationRecoveryTurnAllowance } = require("./verificationRecovery") as {
     verificationRecoveryTurnAllowance: (maxTurnsPerSegment: number) => number;
 };
 const { commandAddsTooling, commandCreatesWorkspaceFiles, commandMutatesWorkspaceFiles, commandInvocationError, commandInvokesAgentTool, diagnosticRecoveryGuidance, missingCommandTargetError, normalizeCommandSignature, packageLifecycleRoleChanges, packageMutationRisk, packageScriptCommandsEquivalent } = require("./commandNormalizer") as {
@@ -428,7 +464,12 @@ const { ToolRouter } = require("./tools/toolRouter") as { ToolRouter: new () => 
         contextReason: string;
     } | undefined;
 } };
-const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number, inferenceApiUrl?: string) => {
+const { AgentTool } = require("./tools/agentTool") as { AgentTool: new (
+    configRoot?: string,
+    commandTimeoutOverrideMs?: number,
+    inferenceApiUrl?: string,
+    options?: { tolerateUnescapedControlCharacters?: boolean; repairMalformedJson?: boolean }
+) => {
     buildSystemPrompt: (workflowInstructions?: string) => Promise<string>;
     parseAction: (content: string | undefined | null) => unknown;
     explainParseFailure: (content: string | undefined | null) => string;
@@ -529,7 +570,27 @@ type SessionUsage = ApiUsage & {
 type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
+    provider?: "llama.cpp" | "openrouter";
     apiUrl?: string;
+    apiKeyEnv?: string;
+    httpReferer?: string;
+    xTitle?: string;
+    apiEndpoint?: {
+        provider?: "llama.cpp" | "openrouter";
+        apiUrl?: string;
+        bearerToken?: string;
+        apiKeyEnv?: string;
+        httpReferer?: string;
+        xTitle?: string;
+        model?: string;
+        requestDelayMs?: number;
+        reasoning?: {
+            effort?: "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
+            max_tokens?: number;
+            exclude?: boolean;
+        };
+        capabilities?: ModelCapabilitySettings;
+    };
     routerMode?: boolean;
     modelsMax?: number;
     defaultModel?: string;
@@ -652,22 +713,40 @@ rl.on("SIGINT", () => {
     rl.prompt();
 });
 
-const apiUrl = process.env.LLAMA_API_URL?.trim()
-    || cliSettings.apiUrl?.trim()
-    || "http://127.0.0.1:8080/v1/chat/completions";
+const llmConnection = getLlmConnectionSettings(cliSettings);
+const apiUrl = llmConnection.apiUrl;
+const llmProvider = llmConnection.provider;
+const isOpenRouter = llmProvider === "openrouter";
 const agentGuardSettings = getAgentGuardSettings(cliSettings);
 const clarificationSettings = getClarificationSettings(cliSettings);
 const projectCheckProviders = getProjectCheckProviders(cliSettings);
 const terminalSettings = getTerminalSettings(cliSettings);
 // The request-level Axios timeout must not fire before the user-visible Agent
 // wall-clock guard. A zero guard is deliberately unbounded, so Axios must also
-// receive zero (its no-timeout value) rather than a five-second fallback.
+// receive zero (its no-timeout value) for llama.cpp. OpenRouter is different:
+// its remote request must still have a finite transport deadline or a stalled
+// provider can leave the CLI in Planning forever when the agent guard is 0.
+const openRouterRequestTimeoutMs = 120_000;
+const providerTimeoutMs = agentGuardSettings.maxDurationMs > 0
+    ? agentGuardSettings.maxDurationMs + 5000
+    : isOpenRouter
+        ? openRouterRequestTimeoutMs
+        : 0;
 const llamaClient = new LlamaCppProvider(
     apiUrl,
-    agentGuardSettings.maxDurationMs > 0 ? agentGuardSettings.maxDurationMs + 5000 : 0
+    providerTimeoutMs,
+    {
+        headers: llmConnection.headers,
+        healthCheckOnRetry: !isOpenRouter,
+        requestDelayMs: llmConnection.requestDelayMs,
+        provider: llmProvider,
+        ...(llmConnection.capabilities ? { capabilities: llmConnection.capabilities } : {})
+    }
 );
 const modelRouterClient = new ModelRouterClient(apiUrl);
-const defaultModel = process.env.LLAMA_MODEL?.trim()
+const defaultModel = process.env.LLM_MODEL?.trim()
+    || process.env.LLAMA_MODEL?.trim()
+    || llmConnection.model?.trim()
     || cliSettings.defaultModel?.trim()
     || "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf";
 const configuredContextValue = Number(
@@ -680,9 +759,12 @@ let activeContextLength = configuredContextLength;
 let model = defaultModel;
 let plannerModel = defaultModel;
 let serverModelSynced = false;
-const chatSampling = getSamplingSettings(cliSettings, "chat");
-const plannerSampling = getSamplingSettings(cliSettings, "planner");
-const actionSampling = getSamplingSettings(cliSettings, "action");
+const reasoningSampling = isOpenRouter && llmConnection.reasoning
+    ? { reasoning: llmConnection.reasoning }
+    : {};
+const chatSampling = { ...getSamplingSettings(cliSettings, "chat"), ...reasoningSampling };
+const plannerSampling = { ...getSamplingSettings(cliSettings, "planner"), ...reasoningSampling };
+const actionSampling = { ...getSamplingSettings(cliSettings, "action"), ...reasoningSampling };
 const historyMessageLimit = Math.max(0, Math.floor(cliSettings.historyMessages ?? 6));
 let contextStartedAt = 0;
 let debugEnabled = process.env.CLI_DEBUG
@@ -764,7 +846,10 @@ const imageTool = new ImageTool();
 const readFileTool = new ReadFileTool();
 const editFileTool = new EditFileTool();
 const toolRouter = new ToolRouter();
-const agentTool = new AgentTool(appRoot, undefined, apiUrl);
+const agentTool = new AgentTool(appRoot, undefined, apiUrl, {
+    tolerateUnescapedControlCharacters: true,
+    repairMalformedJson: true
+});
 const actionCoordinator = new DefaultActionCoordinator(agentTool);
 const taskCoordinator = new DefaultTaskCoordinator({ deriveTaskEvidencePolicy, taskContractsEquivalent });
 const checkpointStore = new FileCheckpointStore(appRoot);
@@ -772,11 +857,32 @@ const skillLoader = new SkillLoader();
 let activeRequestController: AbortController | undefined;
 let activeRequestSpinner: InstanceType<typeof Spinner> | undefined;
 const terminalEventSink = new TerminalAgentEventSink(() => activeRequestSpinner);
-const verificationCoordinator = new DefaultVerificationCoordinator(terminalEventSink);
-const completionCoordinator = new DefaultCompletionCoordinator();
+const verificationCoordinator = new DefaultVerificationCoordinator({
+    events: terminalEventSink,
+    commandInvocationError,
+    commandMutatesWorkspaceFiles,
+    missingCommandTargetError,
+    commandSatisfiesAcceptance,
+    projectChecksForCommand
+});
+const completionCoordinator = new DefaultCompletionCoordinator(
+    activeWorkspace,
+    projectCheckProviders,
+    {
+        effectiveCompletionStatus,
+        continuationNoWriteCompletionAllowed,
+        noChangeCompletionBlockReason,
+        answerLooksLikeBlockingClarification,
+        answerDefersRequiredWork,
+        discoverProjectChecks,
+        evaluateProjectCompletion,
+        requiredProjectChecks,
+        formatIncompleteTaskAnswer
+    }
+);
 let statusSessionId: string | undefined;
 const statusBar = new StatusBar(() => ({
-    model: serverModelSynced ? model : "server unavailable",
+    model: serverModelSynced || isOpenRouter ? model : "server unavailable",
     contextUsed: statusSessionId ? sessionTool.getUsage(statusSessionId).activeContextTokens : 0,
     contextLimit: activeContextLength,
     workspace: activeWorkspace
@@ -794,7 +900,7 @@ const agentRunner = new DefaultAgentRunner({
         actionSampling,
         get model() { return model; },
         get activeContextLength() { return activeContextLength; },
-        llmProvider: llamaClient,
+        provider: llamaClient,
         recordResponseUsage,
         isReasoningOnlyTruncation,
         reasoningOnlyRetryMaxTokens,
@@ -808,7 +914,6 @@ const agentRunner = new DefaultAgentRunner({
         discoverProjectChecks,
         get activeWorkspace() { return activeWorkspace; },
         projectCheckProviders,
-        appRoot,
         agentTool,
         actionCoordinator,
         formatProjectChecksPrompt,
@@ -821,18 +926,19 @@ const agentRunner = new DefaultAgentRunner({
         commandCreatesWorkspaceFiles,
         projectChecksAffectedByWorkdir,
         projectChecksAffectedByPath,
-        projectChecksForCommand,
         commandAddsTooling,
         packageLifecycleRoleChanges,
         diagnosticRecoveryGuidance,
-        missingCommandTargetError,
         commandInvokesAgentTool,
         unownedProjectMutationReason,
         isVisualPresentationMutation,
         searchReturnedNoResults,
-        checkpointStore
+        checkpointStore,
+        evaluateProjectCompletion,
+        protectedProjectDeletionReason
     },
     task: {
+        coordinator: taskCoordinator,
         selectTaskContext,
         historyMessageLimit,
         summarizeTaskContext,
@@ -844,40 +950,29 @@ const agentRunner = new DefaultAgentRunner({
         relevantClarificationInspections,
         promptForClarification,
         discoverProjectRoots,
-        deriveTaskEvidencePolicy,
-        taskContractsEquivalent,
-        taskCoordinator
+        clarificationSettings,
     },
     verification: {
-        AgentGuard,
-        agentGuardSettings,
+        coordinator: verificationCoordinator,
         verificationRecoveryTurnAllowance,
-        shouldActivateVerificationRecovery,
         WriteValidator,
         FailedCommandRegistry,
-        commandSatisfiesAcceptance,
         countCompilerDiagnostics,
-        compilerDiagnosticFingerprint,
-        verificationCoordinator
+        compilerDiagnosticFingerprint
     },
     completion: {
-        continuationNoWriteCompletionAllowed,
-        effectiveCompletionStatus,
-        noChangeCompletionBlockReason,
-        formatIncompleteTaskAnswer,
-        evaluateProjectCompletion,
-        requiredProjectChecks,
-        answerDefersRequiredWork,
-        protectedProjectDeletionReason,
-        completionCoordinator
+        coordinator: completionCoordinator
     },
     state: {
-        AgentTrace,
+        get workspace() { return activeWorkspace; },
+        appRoot,
+        guard: AgentGuard,
+        guardSettings: agentGuardSettings,
+        trace: AgentTrace,
         debugLog,
-        sessionTool,
-        AgentResponseLog,
-        resolveJsonlLogPath,
-        clarificationSettings
+        session: sessionTool,
+        responseLog: AgentResponseLog,
+        resolveJsonlLogPath
     },
     events: terminalEventSink
 });
@@ -922,6 +1017,8 @@ function printSessionUsage(sessionId: string): void {
 }
 
 async function getLoadedServerModels(): Promise<string[]> {
+    if (isOpenRouter) return [];
+
     try {
         const routerModels = await modelRouterClient.list();
         return routerModels.filter((entry) => entry.status === "loaded").map((entry) => entry.id);
@@ -943,6 +1040,8 @@ async function getLoadedServerModels(): Promise<string[]> {
 }
 
 async function getServerContextInfo(modelId?: string): Promise<{ contextLength: number; totalSlots?: number } | undefined> {
+    if (isOpenRouter) return undefined;
+
     try {
         const propsUrl = new URL("/props", apiUrl).toString();
         const url = new URL(propsUrl);
@@ -965,6 +1064,11 @@ async function getServerContextInfo(modelId?: string): Promise<{ contextLength: 
 }
 
 async function syncModelFromServer(): Promise<boolean> {
+    if (isOpenRouter) {
+        serverModelSynced = model.trim().length > 0;
+        return serverModelSynced;
+    }
+
     const [loadedModel] = await getLoadedServerModels();
     if (!loadedModel) {
         return false;
@@ -980,7 +1084,7 @@ async function printModelInfo(): Promise<void> {
     const [loadedModels, serverContext, routerModels] = await Promise.all([
         getLoadedServerModels(),
         getServerContextInfo(model),
-        modelRouterClient.list().catch(() => undefined)
+        isOpenRouter ? Promise.resolve(undefined) : modelRouterClient.list().catch(() => undefined)
     ]);
     if (loadedModels[0]) {
         model = loadedModels[0];
@@ -989,17 +1093,19 @@ async function printModelInfo(): Promise<void> {
         statusBar.render();
     }
 
-    console.log(serverModelSynced
+    console.log(serverModelSynced || isOpenRouter
         ? `CLI request model: ${model}`
         : `Configured fallback model: ${model} (server model unavailable)`);
-    console.log(loadedModels.length > 0
+    console.log(isOpenRouter
+        ? "OpenRouter model selection is configured by the model setting"
+        : loadedModels.length > 0
         ? `Loaded by llama.cpp: ${loadedModels.join(", ")}`
         : "Loaded by llama.cpp: unavailable (server is not running or still loading)");
     console.log(`Configured context: ${configuredContextLength.toLocaleString()} tokens`);
     console.log(serverContext
         ? `Active server context: ${serverContext.contextLength.toLocaleString()} tokens per slot${serverContext.totalSlots ? ` (${serverContext.totalSlots} slot${serverContext.totalSlots === 1 ? "" : "s"})` : ""}`
         : "Active server context: unavailable (use /model while llama.cpp is running)");
-    console.log(`llama.cpp API: ${apiUrl}`);
+    console.log(`${llmProvider} API: ${apiUrl}`);
 
     if (routerModels) {
         routerModelSuggestionCache = routerModels;
@@ -1084,6 +1190,11 @@ function settingSource(envName: string, configured: boolean): string {
 function printEffectiveSettings(): void {
     const agent = cliSettings.agent ?? {};
     const rows: Array<[string, string | number | boolean, string]> = [
+        ["llm.provider", llmProvider, process.env.LLM_PROVIDER?.trim() ? "environment" : cliSettings.apiEndpoint?.provider ? "api-endpoints.json" : settingSource("LLM_PROVIDER", cliSettings.provider !== undefined)],
+        ["llm.apiUrl", apiUrl, process.env.LLM_API_URL?.trim() || process.env.LLAMA_API_URL?.trim() ? "environment" : cliSettings.apiEndpoint?.apiUrl ? "api-endpoints.json" : cliSettings.apiUrl ? settingsFileSource() : "built-in default"],
+        ["llm.model", model, llmConnection.model ? "api-endpoints.json" : settingSource("LLM_MODEL", cliSettings.defaultModel !== undefined)],
+        ["llm.requestDelayMs", llmConnection.requestDelayMs, cliSettings.apiEndpoint?.requestDelayMs !== undefined ? "api-endpoints.json" : "built-in default"],
+        ["llm.apiKey", isOpenRouter ? `configured via ${llmConnection.apiKeyEnv ?? "api-endpoints.json"}` : "not used", isOpenRouter ? cliSettings.apiEndpoint?.bearerToken ? "api-endpoints.json" : settingSource("LLM_API_KEY_ENV", cliSettings.apiKeyEnv !== undefined) : "not used"],
         ["agent.profile", agentGuardSettings.profile, settingSource("CLI_AGENT_PROFILE", agent.profile !== undefined)],
         ["agent.maxTurns", agentGuardSettings.maxTurns, settingSource("CLI_AGENT_MAX_TURNS", agent.maxTurns !== undefined)],
         ["agent.maxSegments", agentGuardSettings.maxSegments, settingSource("CLI_AGENT_MAX_SEGMENTS", agent.maxSegments !== undefined)],
@@ -1147,6 +1258,7 @@ function isModelSuggestionInput(line: string, cursor: number): boolean {
 }
 
 async function loadRouterModelSuggestions(force = false): Promise<void> {
+    if (isOpenRouter) return;
     if (routerModelSuggestionsLoading || (!force && routerModelSuggestionCache.length > 0)) return;
     routerModelSuggestionsLoading = true;
     routerModelSuggestionError = undefined;
@@ -1993,6 +2105,12 @@ function ask(activeSession: ChatSession, runMode: RunMode): void {
         }
 
         if (modelCommand?.type === "set" && modelCommand.model) {
+            if (isOpenRouter) {
+                console.log("OpenRouter model switching is not available from the llama.cpp server menu. Set defaultModel in .cli/settings.json instead.");
+                console.log();
+                ask(activeSession, runMode);
+                return;
+            }
             try {
                 console.log(`Switching server model to: ${modelCommand.model}`);
                 const result = await modelRouterClient.switch(modelCommand.model);
@@ -2451,13 +2569,13 @@ async function start(): Promise<void> {
     console.log("Cancel active request: Ctrl+C | restore latest file change: /undo");
     console.log("Skills: /skills");
     console.log(`Workspace: ${activeWorkspace}`);
-    console.log(`llama.cpp API: ${apiUrl}`);
+    console.log(`${llmProvider} API: ${apiUrl}`);
     console.log(`Configured context: ${configuredContextLength.toLocaleString()} tokens`);
     console.log(serverContext
         ? `Active server context: ${serverContext.contextLength.toLocaleString()} tokens per slot${serverContext.totalSlots ? ` (${serverContext.totalSlots} slot${serverContext.totalSlots === 1 ? "" : "s"})` : ""}`
         : "Active server context: unavailable");
     console.log(modelSynced
-        ? `llama.cpp loaded model: ${model}`
+        ? `${llmProvider} model: ${model}`
         : "llama.cpp status: server is not running or still loading");
     console.log("Workspace option: --workspace <project-path>");
     console.log("Tip: type /, $skill, or /model for inline suggestions");

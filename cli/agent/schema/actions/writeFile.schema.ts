@@ -1,9 +1,9 @@
 import z = require("zod");
-const { ActionMetadataSchema } = require("./shared.schema");
+const { ActionMetadataSchema, NonEmptyStringSchema } = require("./shared.schema");
 
 const WriteFileActionSchema = z.object({
     action: z.literal("write_file"),
-    path: z.string(),
+    path: NonEmptyStringSchema,
     content: z.string(),
     ...ActionMetadataSchema
 }).strict();

@@ -1,10 +1,10 @@
 import z = require("zod");
-const { ActionMetadataSchema } = require("./shared.schema");
+const { ActionMetadataSchema, NonEmptyStringSchema } = require("./shared.schema");
 
 const McpCallActionSchema = z.object({
     action: z.literal("mcp_call_tool"),
-    server: z.string(),
-    tool: z.string(),
+    server: NonEmptyStringSchema,
+    tool: NonEmptyStringSchema,
     arguments: z.record(z.unknown()),
     ...ActionMetadataSchema
 }).strict();

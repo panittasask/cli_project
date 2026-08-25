@@ -1,9 +1,38 @@
 import fs = require("node:fs");
 import path = require("node:path");
-import type { AgentRunnerDependencies } from "./agentRunnerDependencies";
+import type { AgentMessage, AgentRunnerDependencies } from "./agentRunnerDependencies";
 import type { AgentContext } from "./agentContext";
 import type { AgentAction } from "./schema/agentAction.schema";
+import type { FinalAction } from "./completion/completionCoordinator";
 const { createAgentContext } = require("./agentContext") as { createAgentContext: (workspaceRoot: string) => AgentContext };
+const {
+    MAX_PROTOCOL_REGENERATION_ATTEMPTS,
+    buildProtocolRegenerationPrompt,
+    getProtocolRegenerationSampling
+} = require("../model/jsonResponseRepair") as {
+    MAX_PROTOCOL_REGENERATION_ATTEMPTS: number;
+    buildProtocolRegenerationPrompt: (failure: { kind: string; issues: string[]; toolCallName?: string }) => string;
+    getProtocolRegenerationSampling: (sampling: Record<string, unknown>) => Record<string, unknown>;
+};
+const { getAllowedActionNames } = require("../agentProtocol") as {
+    getAllowedActionNames: (responseFormat: Record<string, unknown>) => string[];
+};
+const { ModelProtocolHealth } = require("../model/modelProtocolHealth") as {
+    ModelProtocolHealth: new (protocolFailureThreshold?: number, transportFailureThreshold?: number) => {
+        recordProtocolFailure: () => Record<string, unknown>;
+        recordTransportFailure: () => Record<string, unknown>;
+        recordToolExecutionFailure: () => Record<string, unknown>;
+        recordVerificationFailure: () => Record<string, unknown>;
+        recordValidAction: () => Record<string, unknown>;
+        snapshot: () => Record<string, unknown>;
+    };
+};
+
+// A model can keep repeating a blocked final claim without producing new
+// evidence. Keep a few retries for normal recovery, then stop with an honest
+// incomplete result instead of burning the whole unbounded run on the same
+// completion gate.
+const MAX_CONSECUTIVE_FINAL_BLOCKS = 4;
 
 type WorkflowKind = "general" | "web_research" | "coding" | "mcp_creation";
 type AcceptanceContract = {
@@ -16,6 +45,18 @@ type ClarificationAnswer = import("../clarificationTypes").ClarificationAnswer;
 type ProjectCompletionRequirement = import("../projectTypes").ProjectCompletionRequirement;
 type ProjectCheck = import("../projectTypes").ProjectCheck;
 type RequestBudgetControl = { pause: () => void; resume: () => void; clear: () => void };
+
+const FIRST_RESPONSE_TASK_CONTRACT_INSTRUCTION = [
+    "MANDATORY FIRST RESPONSE CONTRACT:",
+    "Return exactly ONE JSON object and nothing else.",
+    "The task contract must be a top-level `task` field in the SAME JSON object as the top-level `action` field.",
+    "Never return the task contract as a separate JSON object, never return two JSON objects, and never omit `task`.",
+    "The first response must include: action, task, and the action fields required by the selected action.",
+    "The `task` object must include exactly these required fields: intent, task_type, continuation, requires_workspace_changes, verification, evidence_requirements, success_criteria.",
+    "Use this shape (choose the real action and values; do not copy the example literally):",
+    '{"action":"list_files","path":".","reason":"inspect the workspace","task":{"intent":"understand the workspace before acting","task_type":"coding","continuation":false,"requires_workspace_changes":true,"verification":"none","evidence_requirements":["source"],"success_criteria":["identify the relevant files"]}}',
+    "Do not add markdown fences, explanations, or a standalone task object before or after the action object."
+].join("\n");
 
 type AgentRunnerResult = {
     answer: string;
@@ -46,116 +87,43 @@ type AgentRunRequest = {
     requestBudget: RequestBudgetControl;
 };
 
-type LegacyRunnerServiceMap = { [serviceName: string]: any };
-
 class DefaultAgentRunner {
     constructor(private readonly dependencies: AgentRunnerDependencies) {}
 
     async run(request: AgentRunRequest): Promise<AgentRunnerResult> {
         const { llm, tools, task, verification, completion, state, events } = this.dependencies;
-        const services = {
-            ...llm,
-            ...tools,
-            ...task,
-            ...verification,
-            ...completion,
-            ...state
-        } as unknown as LegacyRunnerServiceMap;
-        const {
-            userMessage,
-            historyForModel,
-            historyForTask,
-            sessionId,
-            taskId,
-            signal,
-            requestBudget
-        } = request;
-        const {
-            AgentGuard,
-            agentGuardSettings,
-            verificationRecoveryTurnAllowance,
-            shouldActivateVerificationRecovery,
-            discoverProjectChecks,
-            activeWorkspace,
-            projectCheckProviders,
-            getAgentReadOnlyResponseFormat,
-            getAgentResponseFormat,
-            getInitialAgentResponseFormat,
-            llmProvider,
-            selectTaskContext,
-            historyMessageLimit,
-            summarizeTaskContext,
-            WriteValidator,
-            skillLoader,
-            FailedCommandRegistry,
-            appRoot,
-            AgentTrace,
-            debugLog,
-            sessionTool,
-            AgentResponseLog,
-            resolveJsonlLogPath,
-            agentTool,
-            actionCoordinator,
-            formatProjectChecksPrompt,
-            formatProjectCompletionPrompt,
-            buildInitialAgentMessages,
-            getAgentRecoveryResponseFormat,
-            buildCompactedAgentMessages,
-            withoutMcpActions,
-            actionSampling,
-            model,
-            activeContextLength,
-            recordResponseUsage,
-            isReasoningOnlyTruncation,
-            reasoningOnlyRetryMaxTokens,
-            MAX_REASONING_ONLY_RETRIES,
-            REASONING_ONLY_PARSE_ERROR,
-            formatReasoningOnlyRecoveryPrompt,
-            answerLooksLikeBlockingClarification,
-            clarificationBlockReason,
-            clarificationObservation,
-            clarificationTranscriptLine,
-            relevantClarificationInspections,
-            promptForClarification,
-            discoverProjectRoots,
-            deriveTaskEvidencePolicy,
-            taskContractsEquivalent,
-            taskCoordinator,
-            getAgentMutationResponseFormat,
-            getAgentFinalResponseFormat,
-            continuationNoWriteCompletionAllowed,
-            effectiveCompletionStatus,
-            noChangeCompletionBlockReason,
-            formatIncompleteTaskAnswer,
-            evaluateProjectCompletion,
-            requiredProjectChecks,
-            answerDefersRequiredWork,
-            protectedProjectDeletionReason,
-            completionCoordinator,
-            commandInvocationError,
-            normalizeCommandSignature,
-            packageScriptCommandsEquivalent,
-            packageMutationRisk,
-            commandMutatesWorkspaceFiles,
-            commandCreatesWorkspaceFiles,
-            projectChecksAffectedByWorkdir,
-            projectChecksAffectedByPath,
-            projectChecksForCommand,
-            commandSatisfiesAcceptance,
-            verificationCoordinator,
-            commandAddsTooling,
-            unownedProjectMutationReason,
-            countCompilerDiagnostics,
-            compilerDiagnosticFingerprint,
-            packageLifecycleRoleChanges,
-            diagnosticRecoveryGuidance,
-            missingCommandTargetError,
-            commandInvokesAgentTool,
-            isVisualPresentationMutation,
-            searchReturnedNoResults,
-            checkpointStore,
-            clarificationSettings
-        } = services;
+        const { userMessage, historyForModel, historyForTask, sessionId, taskId, signal, requestBudget } = request;
+        const activeWorkspace = state.workspace;
+        const projectCheckProviders = tools.projectCheckProviders;
+        const appRoot = state.appRoot;
+        const AgentTrace = state.trace;
+        const AgentResponseLog = state.responseLog;
+        const sessionTool = state.session;
+        const debugLog = state.debugLog;
+        const resolveJsonlLogPath = state.resolveJsonlLogPath;
+        const agentTool = tools.agentTool;
+        const llmProvider = llm.provider;
+        const model = llm.model;
+        const activeContextLength = llm.activeContextLength;
+        const actionSampling = llm.actionSampling;
+        const { getAgentReadOnlyResponseFormat, getAgentResponseFormat, getInitialAgentResponseFormat,
+            getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentFinalResponseFormat,
+            buildInitialAgentMessages, buildCompactedAgentMessages, withoutMcpActions, recordResponseUsage,
+            isReasoningOnlyTruncation: _isReasoningOnlyTruncation } = llm;
+        const { selectTaskContext, historyMessageLimit, summarizeTaskContext, skillLoader,
+            answerLooksLikeBlockingClarification, clarificationBlockReason, clarificationObservation,
+            clarificationTranscriptLine, relevantClarificationInspections, promptForClarification,
+            discoverProjectRoots, clarificationSettings } = task;
+        const { discoverProjectChecks, formatProjectChecksPrompt, formatProjectCompletionPrompt,
+            commandInvocationError, normalizeCommandSignature, packageScriptCommandsEquivalent,
+            packageMutationRisk, commandMutatesWorkspaceFiles, commandCreatesWorkspaceFiles,
+            projectChecksAffectedByWorkdir, projectChecksAffectedByPath,
+            commandAddsTooling, packageLifecycleRoleChanges, diagnosticRecoveryGuidance,
+            commandInvokesAgentTool, unownedProjectMutationReason,
+            isVisualPresentationMutation, searchReturnedNoResults, checkpointStore,
+            evaluateProjectCompletion, protectedProjectDeletionReason } = tools;
+        const { verificationRecoveryTurnAllowance, WriteValidator,
+            FailedCommandRegistry, countCompilerDiagnostics, compilerDiagnosticFingerprint } = verification;
 
         const progress = {
             update: (message: string) => events.emit({ type: "status", message }),
@@ -164,12 +132,14 @@ class DefaultAgentRunner {
             resume: () => events.emit({ type: "input_resumed" })
         };
         const context = createAgentContext(activeWorkspace);
+        context.input.originalUserMessage = userMessage;
+        context.input.effectiveUserMessage = userMessage;
         events.emit({ type: "task_started", task: userMessage });
 
-            const guard = new AgentGuard(agentGuardSettings);
+            const guard = new state.guard(state.guardSettings);
             const maxTurnsPerSegment = guard.settings.maxTurns;
             const hasStepCadence = maxTurnsPerSegment > 0;
-            const maxSegments = agentGuardSettings.maxSegments;
+            const maxSegments = state.guardSettings.maxSegments;
             const unboundedSegments = maxSegments === 0;
             const maxSegmentsLabel = unboundedSegments ? "unbounded" : String(maxSegments);
             const maxTurns = unboundedSegments || !hasStepCadence ? Number.POSITIVE_INFINITY : maxTurnsPerSegment * maxSegments;
@@ -178,70 +148,22 @@ class DefaultAgentRunner {
                 ? verificationRecoveryTurnAllowance(maxTurnsPerSegment)
                 : 0;
             const recoveryMaxTurns = Number.isFinite(maxTurns) ? maxTurns + recoveryTurnAllowance : maxTurns;
-            let verificationRecoveryActive = false;
-            let effectiveUserMessage = userMessage;
-            let workflow: { kind: WorkflowKind; reason: string } = {
-                kind: "general",
-                reason: "Pending semantic classification in the agent's first tool action."
-            };
-            let readOnlyRequest = false;
-            let mustWrite = false;
-            let acceptance: AcceptanceContract = {
-                evidence: "source",
-                verification: "none",
-                reason: "Pending the model-owned task contract."
-            };
-            let verificationRequirement = acceptance.verification;
-            let readOnlyAllowsCommands = false;
-            let projectRequirement: ProjectCompletionRequirement | undefined;
-            let taskContract: {
-                intent: string;
-                task_type: WorkflowKind;
-                continuation: boolean;
-                requires_workspace_changes: boolean;
-                verification: "none" | "command" | "runtime" | "interaction";
-                evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
-                success_criteria: string[];
-            } | undefined;
-            let projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-            let agentResponseFormat = readOnlyRequest ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands) : getAgentResponseFormat(workflow.kind);
+            context.workspace.projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+            let agentResponseFormat = context.policy.readOnly
+                ? getAgentReadOnlyResponseFormat(context.workflow.kind, context.policy.readOnlyAllowsCommands)
+                : getAgentResponseFormat(context.workflow.kind);
             const initialAgentResponseFormat = getInitialAgentResponseFormat();
-            const relevantHistory = selectTaskContext(userMessage, historyForModel, workflow.kind, historyMessageLimit);
+            const relevantHistory = selectTaskContext(userMessage, historyForModel, context.workflow.kind, historyMessageLimit);
             const contextSummary = summarizeTaskContext(relevantHistory);
             const writeValidator = new WriteValidator(activeWorkspace);
             const availableSkills = skillLoader.discover(activeWorkspace);
             const selectedSkills = skillLoader.select(userMessage, availableSkills);
             const skillPrompt = skillLoader.formatPrompt(selectedSkills);
-            const readPaths = new Set<string>();
-            const explicitlyRequestedFiles = Array.from(effectiveUserMessage.matchAll(/(?:^|[\s"'`])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go))(?=$|[\s"'`,)])/gi))
+            context.workspace.explicitlyRequestedFiles = Array.from(context.input.effectiveUserMessage.matchAll(/(?:^|[\s"'`])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|js|mjs|json|md|py|ps1|yml|yaml|go))(?=$|[\s"'`,)])/gi))
                 .map((match) => path.resolve(activeWorkspace, match[1] ?? "").toLowerCase());
-            const validationFailures = new Set<string>();
-            let unresolvedVerificationFailure: string | undefined;
-            let unresolvedToolFailure: { action: string; output: string } | undefined;
-            let pendingRuntimePortCorrection: string | undefined;
-            let pendingPackageScriptRecovery: { command: string; workdir: string; mode?: "probe" } | undefined;
-            let unresolvedMissingCommandTarget = false;
-            let lastFailedCommand: string | undefined;
-            let inconclusiveVerificationBlocker: string | undefined;
-            let unsatisfiedFinalAttempts = 0;
             const failedCommands = new FailedCommandRegistry(activeWorkspace);
-            let verificationSatisfied = verificationRequirement === "none";
-            const successfulProjectChecks = new Set<string>();
-            const pendingProjectChecks = new Set<string>();
             const clarificationTranscript: string[] = [];
             const answeredClarifications = new Map<string, Record<string, unknown>>();
-            const contextInspections: Array<{ action: "list_files" | "search_project" | "search_files" | "read_file"; path?: string; query?: string }> = [];
-            const writtenPaths = new Set<string>();
-            const visualPresentationPaths = new Set<string>();
-            const satisfiedPaths = new Set<string>();
-            const successfulEvidenceRefs = new Set<string>();
-            const successfulWorkspaceEvidenceRefs = new Set<string>();
-            let successfulMcpDiscovery = false;
-            let successfulMcpCall = false;
-            let mcpCallsDisabled = false;
-            const sourceUrls = new Set<string>();
-            let consecutiveEmptyWebSearches = 0;
-            let webResearchExhausted = false;
             const logDirectory = path.resolve(appRoot, ".cli", "logs", "agent");
             const traceTarget = { directory: logDirectory, basename: "agent-trace" };
             const responseTarget = { directory: logDirectory, basename: "agent-model-responses" };
@@ -257,6 +179,7 @@ class DefaultAgentRunner {
                 });
             });
             const responseLog = new AgentResponseLog(responseTarget, taskId);
+            const protocolHealth = new ModelProtocolHealth(3, 2);
             trace.add({
                 turn: 0,
                 status: "action",
@@ -265,68 +188,60 @@ class DefaultAgentRunner {
                     workflow: "pending_model_classification",
                     model,
                     contextLength: activeContextLength,
-                    agentProfile: agentGuardSettings.profile,
+                    agentProfile: state.guardSettings.profile,
                     maxSteps: unboundedSegments || !hasStepCadence ? "unbounded" : maxTurns,
                     verificationRecoverySteps: recoveryTurnAllowance,
-                    maxDurationMs: agentGuardSettings.maxDurationMs
+                    maxDurationMs: state.guardSettings.maxDurationMs
                 })
             });
             trace.save();
-            const responseLogDisplayPath = path.relative(appRoot, resolveJsonlLogPath(responseTarget));
             const buildCurrentSystemPrompt = (): Promise<string> => agentTool.buildSystemPrompt([
-                taskContract
-                    ? `Model-owned task contract: ${JSON.stringify(taskContract)}`
-                    : "First-response requirement: infer the user's intent and observable success criteria, include the task contract, and choose the first useful action in the same JSON response.",
-                taskContract && verificationRequirement !== "none"
-                    ? `Completion requirement: ${verificationRequirement} verification must succeed after the latest file change before final.`
+                context.task
+                    ? `Model-owned task contract: ${JSON.stringify(context.task)}`
+                    : FIRST_RESPONSE_TASK_CONTRACT_INSTRUCTION,
+                context.task && context.verification.requirement !== "none"
+                    ? `Completion requirement: ${context.verification.requirement} verification must succeed after the latest file change before final.`
                     : "",
-                taskContract ? `Final claims must not exceed successful ${acceptance.evidence} evidence.` : "",
-                acceptance.evidence === "interaction"
+                context.task ? `Final claims must not exceed successful ${context.policy.acceptance.evidence} evidence.` : "",
+                context.policy.acceptance.evidence === "interaction"
                     ? "Trace the rendered declaration through its owning implementation, imports/providers, event handler, state transition, and output before editing. Inspect co-located implementation companions referenced by the target. Then use a finite automated interaction test that performs the user-visible action and asserts its observable outcome. A build, typecheck, source read, response-body text search, or unrelated HTTP probe is not sufficient. Prefer an existing project test runner over starting a development server."
                     : "",
-                taskContract?.evidence_requirements.includes("visual")
-                    ? "This task has a visual acceptance requirement. Inspect the owning rendered component/template and its styling companion, make a concrete styling change, and run a finite headless interaction check. Do not claim visual success from a build or source read alone."
+                context.task?.evidence_requirements.includes("visual")
+                    ? "This task has a visual presentation requirement. Inspect the owning rendered component/template and its styling companion, make a concrete styling change, and run a finite headless interaction check. Do not claim visual success from a build or source read alone."
                     : "",
-                readOnlyRequest ? "Read-only task contract: workspace changes are not part of this task. Do not edit, write, delete, install, scaffold, or run any command that mutates files." : "",
-                formatProjectChecksPrompt(projectChecks),
-                projectRequirement ? formatProjectCompletionPrompt(projectRequirement, projectChecks) : "",
+                context.policy.readOnly ? "Read-only task contract: workspace changes are not part of this task. Do not edit, write, delete, install, scaffold, or run any command that mutates files." : "",
+                formatProjectChecksPrompt(context.workspace.projectChecks),
+                context.workspace.projectRequirement ? formatProjectCompletionPrompt(context.workspace.projectRequirement, context.workspace.projectChecks) : "",
                 skillPrompt
             ].filter(Boolean).join("\n\n"));
             let systemPrompt = await buildCurrentSystemPrompt();
-            let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
+            let messages: AgentMessage[] = buildInitialAgentMessages(systemPrompt, contextSummary, userMessage);
             let recoveryResponseFormat: Record<string, unknown> | undefined;
-            let reasoningOnlyRetryPending = false;
-            let consecutiveReasoningOnlyTruncations = 0;
+            let consecutiveFinalBlocks = 0;
             const recoveryFormat = (extra: string | string[] = []) => getAgentRecoveryResponseFormat(
-                workflow.kind,
+                context.workflow.kind,
                 Array.from(new Set(Array.isArray(extra) ? extra : [extra])).filter(Boolean)
             );
             let segmentEvents: string[] = [];
             let contextCompactionCount = 0;
             const stepStatus = (step: number): string => hasStepCadence
-                ? `step ${step}/${verificationRecoveryActive ? recoveryMaxTurns : maxTurns}`
+                ? `step ${step}/${context.verification.recoveryActive ? recoveryMaxTurns : maxTurns}`
                 : `step ${step}`;
 
             if (selectedSkills.length > 0) progress.log(`Skills: ${selectedSkills.map((skill: { name: string }) => skill.name).join(", ")}`);
 
             let lastExecutedTurn = 0;
             for (let turn = 1; ; turn += 1) {
-                if (turn > maxTurns && !verificationRecoveryActive) {
-                    verificationRecoveryActive = shouldActivateVerificationRecovery({
-                        boundedRun: Number.isFinite(maxTurns),
-                        baseLimitReached: true,
-                        verificationRequiredAndUnsatisfied: verificationRequirement !== "none" && !verificationSatisfied,
-                        pendingProjectChecks: Array.from(pendingProjectChecks).some((checkId) => !successfulProjectChecks.has(checkId)),
-                        ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {})
-                    });
-                    if (verificationRecoveryActive) {
+                if (turn > maxTurns && !context.verification.recoveryActive) {
+                    context.verification.recoveryActive = verification.coordinator.recover(context);
+                    if (context.verification.recoveryActive) {
                         const observation = `Verification failed at the normal step limit. Continuing for up to ${recoveryTurnAllowance} recovery steps so the agent can inspect the error, correct the project, and rerun verification.`;
                         events.emit({ type: "recovery_started", message: observation });
                         trace.add({ turn, status: "action", action: "verification_recovery_started", observation });
                         trace.save();
                     }
                 }
-                if (turn > maxTurns && (!verificationRecoveryActive || turn > recoveryMaxTurns)) break;
+                if (turn > maxTurns && (!context.verification.recoveryActive || turn > recoveryMaxTurns)) break;
                 lastExecutedTurn = turn;
                 context.turn = turn;
                 const segmentTurn = hasStepCadence ? (turn - 1) % maxTurnsPerSegment + 1 : turn;
@@ -340,27 +255,27 @@ class DefaultAgentRunner {
                     const compactedSegment = Math.max(segment, contextCompactionCount + 1);
                     messages = buildCompactedAgentMessages(systemPrompt, userMessage, {
                         segment: compactedSegment,
-                        maxSegments: verificationRecoveryActive && maxSegments > 0
+                        maxSegments: context.verification.recoveryActive && maxSegments > 0
                             ? maxSegments + 1
                             : maxSegments,
-                        writtenPaths: Array.from(writtenPaths),
-                        satisfiedPaths: Array.from(satisfiedPaths),
-                        validationFailures: Array.from(validationFailures),
-                        ...(unresolvedVerificationFailure ? { unresolvedVerificationFailure } : {}),
-                        verificationRequirement,
-                        verificationSatisfied,
-                        successfulEvidenceRefs: Array.from(successfulEvidenceRefs),
-                        successfulWorkspaceEvidenceRefs: Array.from(successfulWorkspaceEvidenceRefs),
-                        sourceUrls: Array.from(sourceUrls),
+                        writtenPaths: Array.from(context.workspace.writtenPaths),
+                        satisfiedPaths: Array.from(context.workspace.satisfiedPaths),
+                        validationFailures: Array.from(context.workspace.validationFailures),
+                        ...(context.verification.failure ? { unresolvedVerificationFailure: context.verification.failure } : {}),
+                        verificationRequirement: context.verification.requirement,
+                        verificationSatisfied: context.verification.satisfied,
+                        successfulEvidenceRefs: Array.from(context.workspace.successfulEvidenceRefs),
+                        successfulWorkspaceEvidenceRefs: Array.from(context.workspace.successfulWorkspaceEvidenceRefs),
+                        sourceUrls: Array.from(context.research.sourceUrls),
                         recentEvents: segmentEvents,
-                        mcpCallsDisabled
+                        mcpCallsDisabled: context.research.mcpCallsDisabled
                     });
                     segmentEvents = [];
-                    readPaths.clear();
+                    context.workspace.readPaths.clear();
                     sessionTool.resetActiveContextUsage(sessionId);
                     recoveryResponseFormat = undefined;
                     const trigger = compactForTokens ? `at 70% context usage (${contextTokenThreshold.toLocaleString()} tokens)` : "at the turn boundary";
-                    const segmentLabel = verificationRecoveryActive && compactedSegment > maxSegments
+                    const segmentLabel = context.verification.recoveryActive && compactedSegment > maxSegments
                         ? `${maxSegmentsLabel} + recovery`
                         : maxSegmentsLabel;
                     progress.log(`Compacted agent context ${trigger}; continuing segment ${compactedSegment}/${segmentLabel}.`);
@@ -376,7 +291,7 @@ class DefaultAgentRunner {
                 }
                 const selectedResponseFormat = recoveryResponseFormat
                     ?? (turn === 1 ? initialAgentResponseFormat : agentResponseFormat);
-                const requestFormat = mcpCallsDisabled
+                const requestFormat = context.research.mcpCallsDisabled
                     ? withoutMcpActions(selectedResponseFormat)
                     : selectedResponseFormat;
                 recoveryResponseFormat = undefined;
@@ -384,211 +299,348 @@ class DefaultAgentRunner {
                     ? `Planning next step (step ${turn}, ${guard.formatRemaining()})...`
                     : `Reviewing results (step ${turn}, ${guard.formatRemaining()})...`);
 
-                const samplingForRequest = reasoningOnlyRetryPending
-                    ? { ...actionSampling, max_tokens: reasoningOnlyRetryMaxTokens(actionSampling.max_tokens) }
-                    : actionSampling;
-                reasoningOnlyRetryPending = false;
+                const samplingForRequest = actionSampling;
                 const modelStartedAt = Date.now();
                 debugLog("LLM request", { turn, model, messages, responseFormat: requestFormat, sampling: samplingForRequest });
-                const response = await llmProvider.chat({
-                    model,
-                    messages,
-                    responseFormat: requestFormat,
-                    sampling: samplingForRequest,
-                    signal,
-                    onRetry: (_attempt: number, errorCode: string) => {
-                        events.emit({ type: "retrying", message: `llama.cpp connection ${errorCode}; retrying...` });
-                    }
-                });
+                let response: Awaited<ReturnType<typeof llmProvider.chat>>;
+                try {
+                    response = await llmProvider.chat({
+                        model,
+                        messages,
+                        responseFormat: requestFormat,
+                        allowNativeTools: Boolean(context.task),
+                        sampling: samplingForRequest,
+                        signal,
+                        onRetry: (_attempt: number, errorCode: string) => {
+                            events.emit({ type: "retrying", message: `Model connection ${errorCode}; retrying...` });
+                        }
+                    });
+                } catch (error) {
+                    const providerFailure = formatProviderFailure(error);
+                    const failureKind = classifyModelFailure(error, providerFailure);
+                    const health = failureKind === "rate_limited"
+                        ? protocolHealth.snapshot()
+                        : protocolHealth.recordTransportFailure();
+                    responseLog.append({
+                        turn,
+                        maxTurns: maxTurnsForLog,
+                        kind: "provider_failure",
+                        requestFormat,
+                        rawContent: null,
+                        parseError: `${failureKind}: ${providerFailure}`,
+                        protocolRegenerationAttempt: 0,
+                        protocolFailureKind: failureKind,
+                        durationMs: Date.now() - modelStartedAt,
+                        protocolHealth: health,
+                        transport: (error as { transportMeta?: unknown } | undefined)?.transportMeta,
+                        executorCalled: false
+                    });
+                    const answer = formatModelFailureAnswer(failureKind, providerFailure);
+                    trace.add({ turn, status: "error", action: "model_transport_failure", observation: answer });
+                    trace.save();
+                    return { answer, trace, clarifications: clarificationTranscript };
+                }
                 const responseUsage = recordResponseUsage(sessionId, response.data);
                 guard.recordCompletionTokens(responseUsage?.completionTokens ?? 0);
 
-                const choice = response.data.choices[0];
-                const rawAssistantContent = choice.message.content;
-                const assistantContent = typeof rawAssistantContent === "string" ? rawAssistantContent.trim() : "";
-                const reasoningOnlyTruncation = isReasoningOnlyTruncation({
-                    content: rawAssistantContent,
-                    reasoningContent: choice.message.reasoning_content,
-                    finishReason: choice.finish_reason
+                const choice = response.data?.choices?.[0] ?? { message: {}, finish_reason: response.finishReason };
+                let rawAssistantContent = response.rawProviderContent ?? response.content;
+                let assistantContent = typeof response.content === "string" ? response.content.trim() : "";
+                let currentToolCall = response.toolCall;
+                let admission = tools.actionCoordinator.admit({
+                    content: assistantContent,
+                    finishReason: response.finishReason ?? choice.finish_reason,
+                    hasToolCall: Boolean(currentToolCall),
+                    requireTaskContract: !context.task
                 });
-                const action = actionCoordinator.parse(assistantContent) as {
-                    action?: string;
-                    answer?: string;
-                    completion_status?: "completed" | "already_satisfied" | "no_change_needed" | "incomplete";
-                    evidence?: string[];
-                    tool?: string;
-                    reason?: string;
-                    path?: string;
-                    query?: string;
-                    content?: string;
-                    old_text?: string;
-                    new_text?: string;
-                    command?: string;
-                    workdir?: string;
-                    mode?: "normal" | "probe";
-                    timeout_ms?: number;
-                    expect?: {
-                        exit_code?: 0;
-                        output_includes?: string[];
-                        output_excludes?: string[];
-                    };
-                    question?: string;
-                    decision?: ClarificationRequest["decision"];
-                    options?: Array<{ id: string; label: string; description?: string }>;
-                    server?: string;
-                    arguments?: Record<string, unknown>;
-                    task?: {
-                        intent: string;
-                        task_type: WorkflowKind;
-                        continuation: boolean;
-                        requires_workspace_changes: boolean;
-                        verification: "none" | "command" | "runtime" | "interaction";
-                        evidence_requirements: Array<"source" | "command" | "runtime" | "interaction" | "visual">;
-                        success_criteria: string[];
-                    };
-                } | undefined;
-                const parseError = action
-                    ? undefined
-                    : reasoningOnlyTruncation
-                        ? REASONING_ONLY_PARSE_ERROR
-                        : actionCoordinator.explainParseFailure(assistantContent);
+                let action: AgentAction | undefined = admission.ok ? admission.action : undefined;
+                let parseError = admission.ok ? undefined : `${admission.kind}: ${admission.issues.join(" | ")}`;
+                let protocolHealthSnapshot = admission.ok
+                    ? protocolHealth.recordValidAction()
+                    : protocolHealth.recordProtocolFailure();
                 debugLog("LLM response", {
                     turn,
                     rawContent: rawAssistantContent,
-                    reasoningContent: choice.message.reasoning_content,
-                    finishReason: choice.finish_reason,
+                    normalizedContent: assistantContent,
+                    toolCall: currentToolCall,
+                    reasoningContent: response.reasoningContent ?? choice.message.reasoning_content,
+                    finishReason: response.finishReason ?? choice.finish_reason,
                     usage: response.data.usage,
                     timings: response.data.timings,
                     parsedAction: action,
-                    parseError
+                    parseError,
+                    admission,
+                    protocolHealth: protocolHealthSnapshot,
+                    transport: (response as { transportMeta?: unknown }).transportMeta
                 });
                 responseLog.append({
                     turn,
                     maxTurns: maxTurnsForLog,
                     requestFormat,
                     rawContent: rawAssistantContent,
-                    reasoningContent: choice.message.reasoning_content,
-                    finishReason: choice.finish_reason,
+                    normalizedContent: assistantContent,
+                    toolCall: currentToolCall,
+                    reasoningContent: response.reasoningContent ?? choice.message.reasoning_content,
+                    finishReason: response.finishReason ?? choice.finish_reason,
                     parsedAction: action?.action,
                     parseError,
                     durationMs: Date.now() - modelStartedAt,
                     usage: response.data.usage,
-                    timings: response.data.timings
+                    timings: response.data.timings,
+                    admission,
+                    syntaxValid: admission.syntaxValid,
+                    schemaValid: admission.schemaValid,
+                    semanticValid: admission.semanticValid,
+                    localRepairUsed: admission.localRepairUsed,
+                    protocolRegenerationAttempt: 0,
+                    protocolFailureKind: admission.ok ? undefined : admission.kind,
+                    protocolHealth: protocolHealthSnapshot,
+                    circuitBreakerTripped: protocolHealthSnapshot.circuitBreakerTripped,
+                    transport: (response as { transportMeta?: unknown }).transportMeta,
+                    executorCalled: false
                 });
 
-                messages.push({
-                    role: "assistant",
-                    content: !action && choice.finish_reason === "length"
-                        ? "[Truncated model response omitted; use a smaller action.]"
-                        : assistantContent
-                });
+                if (!admission.ok && MAX_PROTOCOL_REGENERATION_ATTEMPTS > 0) {
+                    const compactProtocolContext = segmentEvents.slice(-3)
+                        .map((event) => event.slice(0, 500))
+                        .join("\n");
+                    for (let regenerationAttempt = 1; regenerationAttempt <= MAX_PROTOCOL_REGENERATION_ATTEMPTS; regenerationAttempt += 1) {
+                        const regenerationStartedAt = Date.now();
+                        const regenerationPrompt = buildProtocolRegenerationPrompt({
+                            kind: admission.kind,
+                            issues: admission.issues,
+                            ...(currentToolCall?.name ? { toolCallName: currentToolCall.name } : {})
+                        });
+                        progress.log(`[${stepStatus(turn)}] Regenerating clean action (attempt ${regenerationAttempt}/${MAX_PROTOCOL_REGENERATION_ATTEMPTS}) after ${admission.kind}...`);
+                        const regenerationMessages: AgentMessage[] = [
+                            {
+                                role: "system",
+                                content: [
+                                    "You are in isolated protocol regeneration mode.",
+                                    "Generate one new action object matching the supplied response schema.",
+                                    "Do not return analysis, markdown, or the previous malformed object.",
+                                    context.task
+                                        ? `Current model-owned task contract: ${JSON.stringify(context.task)}`
+                                        : FIRST_RESPONSE_TASK_CONTRACT_INSTRUCTION
+                                ].join("\n")
+                            },
+                            {
+                                role: "user",
+                                content: [
+                                    `Original user request:\n${context.input.effectiveUserMessage}`,
+                                    compactProtocolContext ? `Recent valid host events:\n${compactProtocolContext}` : "",
+                                    regenerationPrompt
+                                ].filter(Boolean).join("\n\n")
+                            }
+                        ];
+
+                        try {
+                        const regenerationResponse = await llmProvider.chat({
+                            model,
+                            messages: regenerationMessages,
+                            responseFormat: requestFormat,
+                            allowNativeTools: Boolean(context.task),
+                            sampling: getProtocolRegenerationSampling(samplingForRequest),
+                            signal,
+                            onRetry: (_attempt: number, errorCode: string) => {
+                                events.emit({ type: "retrying", message: `Model protocol regeneration connection ${errorCode}; retrying...` });
+                            }
+                        });
+                        const regenerationUsage = recordResponseUsage(sessionId, regenerationResponse.data);
+                        guard.recordCompletionTokens(regenerationUsage?.completionTokens ?? 0);
+                        const regeneratedRawContent = regenerationResponse.rawProviderContent ?? regenerationResponse.content;
+                        const regeneratedContent = typeof regenerationResponse.content === "string"
+                            ? regenerationResponse.content.trim()
+                            : "";
+                        const regenerationFinishReason = regenerationResponse.finishReason
+                            ?? regenerationResponse.data?.choices?.[0]?.finish_reason;
+                        const regeneratedAdmission = tools.actionCoordinator.admit({
+                            content: regeneratedContent,
+                            finishReason: regenerationFinishReason,
+                            hasToolCall: Boolean(regenerationResponse.toolCall),
+                            requireTaskContract: !context.task
+                        });
+                        const regenerationParseError = regeneratedAdmission.ok
+                            ? undefined
+                            : `${regeneratedAdmission.kind}: ${regeneratedAdmission.issues.join(" | ")}`;
+                        protocolHealthSnapshot = regeneratedAdmission.ok
+                            ? protocolHealth.recordValidAction()
+                            : protocolHealth.recordProtocolFailure();
+                        responseLog.append({
+                            turn,
+                            maxTurns: maxTurnsForLog,
+                            kind: "protocol_regeneration",
+                            regenerationAttempt,
+                            requestFormat,
+                            rawContent: regeneratedRawContent,
+                            normalizedContent: regeneratedContent,
+                            toolCall: regenerationResponse.toolCall,
+                            finishReason: regenerationFinishReason,
+                            parsedAction: regeneratedAdmission.ok ? regeneratedAdmission.action.action : undefined,
+                            parseError: regenerationParseError,
+                            durationMs: Date.now() - regenerationStartedAt,
+                            usage: regenerationResponse.data?.usage,
+                            timings: regenerationResponse.data?.timings,
+                            admission: regeneratedAdmission,
+                            syntaxValid: regeneratedAdmission.syntaxValid,
+                            schemaValid: regeneratedAdmission.schemaValid,
+                            semanticValid: regeneratedAdmission.semanticValid,
+                            localRepairUsed: regeneratedAdmission.localRepairUsed,
+                            protocolRegenerationAttempt: regenerationAttempt,
+                            protocolFailureKind: regeneratedAdmission.ok ? undefined : regeneratedAdmission.kind,
+                            protocolHealth: protocolHealthSnapshot,
+                            circuitBreakerTripped: protocolHealthSnapshot.circuitBreakerTripped,
+                            transport: (regenerationResponse as { transportMeta?: unknown }).transportMeta,
+                            executorCalled: false
+                        });
+                        debugLog("LLM protocol regeneration response", {
+                            turn,
+                            regenerationAttempt,
+                            rawContent: regeneratedRawContent,
+                            normalizedContent: regeneratedContent,
+                            toolCall: regenerationResponse.toolCall,
+                            finishReason: regenerationFinishReason,
+                            admission: regeneratedAdmission,
+                            protocolHealth: protocolHealthSnapshot,
+                            transport: (regenerationResponse as { transportMeta?: unknown }).transportMeta
+                        });
+                        if (regeneratedAdmission.ok) {
+                            admission = regeneratedAdmission;
+                            action = regeneratedAdmission.action;
+                            rawAssistantContent = regeneratedRawContent;
+                            assistantContent = regeneratedContent;
+                            currentToolCall = regenerationResponse.toolCall;
+                            parseError = undefined;
+                            progress.log(`[${stepStatus(turn)}] Protocol regeneration produced a valid action.`);
+                            break;
+                        } else {
+                            admission = regeneratedAdmission;
+                            parseError = regenerationParseError;
+                            progress.log(`[${stepStatus(turn)}] Regeneration attempt ${regenerationAttempt} returned invalid action; ${regenerationAttempt < MAX_PROTOCOL_REGENERATION_ATTEMPTS ? "retrying" : "stopping"}.`);
+                        }
+                    } catch (error) {
+                        const regenerationFailure = formatProviderFailure(error);
+                        const failureKind = classifyModelFailure(error, regenerationFailure);
+                        protocolHealthSnapshot = failureKind === "rate_limited"
+                            ? protocolHealth.snapshot()
+                            : protocolHealth.recordTransportFailure();
+                        responseLog.append({
+                            turn,
+                            maxTurns: maxTurnsForLog,
+                            kind: "protocol_regeneration",
+                            regenerationAttempt,
+                            requestFormat,
+                            rawContent: null,
+                            parseError: `${failureKind}: ${regenerationFailure}`,
+                            durationMs: Date.now() - regenerationStartedAt,
+                            protocolRegenerationAttempt: regenerationAttempt,
+                            protocolFailureKind: failureKind,
+                            protocolHealth: protocolHealthSnapshot,
+                            executorCalled: false
+                        });
+                        debugLog("LLM protocol regeneration failed", {
+                            turn,
+                            regenerationAttempt,
+                            kind: failureKind,
+                            error: regenerationFailure
+                        });
+                        const answer = formatProtocolRegenerationFailure(failureKind, regenerationFailure);
+                        trace.add({ turn, status: "error", action: "model_protocol_circuit_breaker", observation: answer });
+                        trace.save();
+                        return { answer, trace, clarifications: clarificationTranscript };
+                    }
+                    }
+                }
 
                 if (!action) {
-                    if (!reasoningOnlyTruncation) consecutiveReasoningOnlyTruncations = 0;
-                    segmentEvents.push(`Step ${segmentTurn}: invalid model action (${parseError ?? "unknown parse error"})`);
-                    progress.log(`[${stepStatus(turn)}] Invalid model action (${parseError}); logged to ${responseLogDisplayPath}`);
-                    trace.add({
-                        turn,
-                        status: "parse_error",
-                        action: "invalid_action",
-                        observation: assistantContent.slice(0, 1000)
-                    });
+                    const answer = `Agent stopped safely because the selected model repeatedly returned invalid tool/action output (${parseError ?? "unsupported_protocol"}). No workspace action was executed from invalid responses.`;
+                    trace.add({ turn, status: "error", action: "model_protocol_circuit_breaker", observation: answer });
                     trace.save();
-                    if (reasoningOnlyTruncation) {
-                        consecutiveReasoningOnlyTruncations += 1;
-                        if (consecutiveReasoningOnlyTruncations > MAX_REASONING_ONLY_RETRIES) {
-                            const answer = `Agent stopped safely after ${MAX_REASONING_ONLY_RETRIES} reasoning-only recovery retries because the model still emitted no action JSON. The response log contains the truncated reasoning for diagnosis.`;
-                            trace.add({
-                                turn,
-                                status: "error",
-                                action: "reasoning_only_recovery_exhausted",
-                                observation: answer
-                            });
-                            trace.save();
-                            return { answer, trace, clarifications: clarificationTranscript };
-                        }
-                        reasoningOnlyRetryPending = true;
-                        recoveryResponseFormat = recoveryFormat();
-                        messages.push({
-                            role: "user",
-                            content: formatReasoningOnlyRecoveryPrompt(consecutiveReasoningOnlyTruncations)
-                        });
-                    } else if (choice.finish_reason === "length") {
-                        recoveryResponseFormat = recoveryFormat("write_file");
-                        messages.push({
-                            role: "user",
-                            content: "Your response reached the completion limit and was cut off. Do not resend the full file. For an existing file, use edit_file with a small exact old_text/new_text replacement. Read the file again first if needed."
-                        });
-                    } else {
-                        messages.push({
-                            role: "user",
-                            content: "Your last response was not one supported action object. Return exactly one valid JSON object using an action from Available actions."
-                        });
-                    }
-                    continue;
+                    return { answer, trace, clarifications: clarificationTranscript };
                 }
-                consecutiveReasoningOnlyTruncations = 0;
+                messages.push(currentToolCall
+                    ? {
+                        role: "assistant",
+                        content: "",
+                        tool_calls: [{
+                            id: currentToolCall.id,
+                            type: "function",
+                            function: { name: currentToolCall.name, arguments: currentToolCall.arguments }
+                        }]
+                    }
+                    : { role: "assistant", content: assistantContent });
+                if (currentToolCall
+                    && !["list_files", "search_files", "search_project", "read_file", "write_file", "edit_file", "delete_file", "run_command", "mcp_list_tools", "mcp_call_tool"].includes(action.action)) {
+                    messages.push({
+                        role: "tool",
+                        tool_call_id: currentToolCall.id,
+                        content: "The host received this action and is processing its workflow transition."
+                    });
+                }
+                if (action.action !== "final") {
+                    consecutiveFinalBlocks = 0;
+                }
+                if (action.action !== "final") {
+                    completion.coordinator.resetForAction(context);
+                }
                 context.actions.push({
                     turn,
                     action: action.action as AgentAction["action"]
                 });
 
-                if (!taskContract && !action.task) {
-                    recoveryResponseFormat = initialAgentResponseFormat;
-                    const output = "The first action is missing the required model-owned task contract.";
-                    progress.log(`[${stepStatus(turn)}] ${output}`);
-                    trace.add({ turn, status: "parse_error", action: "missing_task_contract", observation: output });
-                    trace.save();
-                    messages.push({
-                        role: "user",
-                        content: "Return one action again and include task with intent, task_type, continuation, requires_workspace_changes, verification, evidence_requirements, and observable success_criteria. Set continuation semantically from the current request and session context. Choose all evidence requirements implied by the outcome and choose the useful first action in the same JSON object."
-                    });
-                    continue;
-                }
-
-                if (!taskContract && action.task) {
-                    taskContract = action.task;
-                    workflow = {
-                        kind: taskContract.task_type,
-                        reason: `Classified semantically by the agent: ${taskContract.intent}`
+                const initialTask = action.task;
+                if (!context.task && initialTask) {
+                    context.task = initialTask;
+                    context.workflow = {
+                        kind: initialTask.task_type,
+                        reason: `Classified semantically by the agent: ${initialTask.intent}`
                     };
-                    const preparedTask = taskCoordinator.prepare(taskContract);
-                    context.task = taskContract;
-                    context.verification = {
-                        requirement: preparedTask.acceptance.verification,
-                        satisfied: preparedTask.verificationSatisfied
-                    };
-                    readOnlyRequest = preparedTask.readOnly;
-                    mustWrite = preparedTask.mustWrite;
-                    verificationRequirement = preparedTask.acceptance.verification;
-                    acceptance = preparedTask.acceptance;
-                    readOnlyAllowsCommands = preparedTask.readOnlyAllowsCommands;
-                    verificationSatisfied = preparedTask.verificationSatisfied;
-                    agentResponseFormat = readOnlyRequest
-                        ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands)
-                        : getAgentResponseFormat(workflow.kind);
+                    const preparedTask = task.coordinator.prepare(initialTask);
+                    context.verification.requirement = preparedTask.acceptance.verification;
+                    context.verification.satisfied = preparedTask.verificationSatisfied;
+                    context.verification.attempted = false;
+                    context.verification.failure = undefined;
+                    context.verification.unresolvedMissingCommandTarget = false;
+                    context.verification.inconclusiveBlocker = undefined;
+                    context.verification.recoveryAttempts = 0;
+                    context.verification.recoveryActive = false;
+                    context.policy.readOnly = preparedTask.readOnly;
+                    context.policy.mustWrite = preparedTask.mustWrite;
+                    context.policy.acceptance = preparedTask.acceptance;
+                    context.policy.readOnlyAllowsCommands = preparedTask.readOnlyAllowsCommands;
+                    context.verification.satisfied = preparedTask.verificationSatisfied;
+                    agentResponseFormat = context.policy.readOnly
+                        ? getAgentReadOnlyResponseFormat(context.workflow.kind, context.policy.readOnlyAllowsCommands)
+                        : getAgentResponseFormat(context.workflow.kind);
                     systemPrompt = await buildCurrentSystemPrompt();
-                    const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
+                    const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, context.input.effectiveUserMessage)[0];
                     if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
                     trace.add({
                         turn,
                         status: "action",
                         action: "task_contract",
-                        observation: JSON.stringify(taskContract)
+                        observation: JSON.stringify(context.task)
                     });
                     trace.save();
-                    segmentEvents.push(`Task contract: ${taskContract.intent}`);
-                    progress.log(`Task understood as ${workflow.kind}: ${taskContract.intent}`);
+                    segmentEvents.push(`Task contract: ${initialTask.intent}`);
+                    progress.log(`Task understood as ${context.workflow.kind}: ${initialTask.intent}`);
                 }
 
                 if (action.action === "refine_task") {
                     const refinedTask = action.task;
+                    const currentTask = context.task;
+                    if (!refinedTask || !currentTask) {
+                        const answer = "Agent stopped safely because refine_task did not contain a valid current and replacement task contract.";
+                        trace.add({ turn, status: "error", action: "model_protocol_circuit_breaker", observation: answer });
+                        trace.save();
+                        return { answer, trace, clarifications: clarificationTranscript };
+                    }
                     const citedEvidence = action.evidence ?? [];
-                    const refinementCheck = taskCoordinator.validateRefinement(
-                        taskContract,
+                    const refinementCheck = task.coordinator.validateRefinement(
+                        currentTask,
                         refinedTask,
                         citedEvidence,
-                        successfulWorkspaceEvidenceRefs
+                        context.workspace.successfulWorkspaceEvidenceRefs
                     );
                     if (!refinementCheck.accepted) {
                         const observation = refinementCheck.reason;
@@ -598,38 +650,42 @@ class DefaultAgentRunner {
                         trace.save();
                         messages.push({
                             role: "user",
-                            content: `${observation} Do not repeat refine_task unchanged. Continue the current contract using file actions or the distinct verification it still requires. Successful workspace Evidence IDs currently available: ${Array.from(successfulWorkspaceEvidenceRefs).join(", ") || "none yet"}.`
+                            content: `${observation} Do not repeat refine_task unchanged. Continue the current contract using file actions or the distinct verification it still requires. Successful workspace Evidence IDs currently available: ${Array.from(context.workspace.successfulWorkspaceEvidenceRefs).join(", ") || "none yet"}.`
                         });
                         continue;
                     }
 
-                    if (!refinedTask) continue;
-                    const previousTaskContract = taskContract;
-                    taskContract = refinedTask;
-                    const preparedTask = taskCoordinator.prepare(
-                        taskContract,
+                    const previousTaskContract = currentTask;
+                    context.task = refinedTask;
+                    const preparedTask = task.coordinator.prepare(
+                        refinedTask,
                         `Refined by the model from workspace evidence ${citedEvidence.join(", ")}`
                     );
-                    context.task = taskContract;
-                    context.verification = {
-                        requirement: preparedTask.acceptance.verification,
-                        satisfied: preparedTask.verificationSatisfied
-                    };
-                    verificationRequirement = preparedTask.acceptance.verification;
-                    acceptance = preparedTask.acceptance;
-                    readOnlyAllowsCommands = preparedTask.readOnlyAllowsCommands;
-                    verificationSatisfied = preparedTask.verificationSatisfied;
+                    context.verification.requirement = preparedTask.acceptance.verification;
+                    context.verification.satisfied = preparedTask.verificationSatisfied;
+                    context.verification.attempted = false;
+                    context.verification.failure = undefined;
+                    context.verification.unresolvedMissingCommandTarget = false;
+                    context.verification.inconclusiveBlocker = undefined;
+                    context.verification.recoveryAttempts = 0;
+                    context.verification.recoveryActive = false;
+                    context.verification.requirement = preparedTask.acceptance.verification;
+                    context.policy.acceptance = preparedTask.acceptance;
+                    context.policy.readOnlyAllowsCommands = preparedTask.readOnlyAllowsCommands;
+                    context.verification.satisfied = preparedTask.verificationSatisfied;
+                    context.policy.readOnly = preparedTask.readOnly;
+                    context.policy.mustWrite = preparedTask.mustWrite;
                     recoveryResponseFormat = undefined;
-                    agentResponseFormat = readOnlyRequest
-                        ? getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands)
-                        : getAgentResponseFormat(workflow.kind);
+                    agentResponseFormat = context.policy.readOnly
+                        ? getAgentReadOnlyResponseFormat(context.workflow.kind, context.policy.readOnlyAllowsCommands)
+                        : getAgentResponseFormat(context.workflow.kind);
                     systemPrompt = await buildCurrentSystemPrompt();
-                    const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
+                    const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, context.input.effectiveUserMessage)[0];
                     if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
                     guard.resetActionHistory();
                     const observation = JSON.stringify({
                         previous: previousTaskContract,
-                        refined: taskContract,
+                        refined: context.task,
                         evidence: citedEvidence
                     });
                     trace.add({
@@ -652,9 +708,9 @@ class DefaultAgentRunner {
                 // The loop ends only when the model explicitly returns final. Until
                 // then each action becomes an observation for the next reasoning step.
                 if (action.action === "ask_user") {
-                    if (unresolvedToolFailure) {
-                        const failure = unresolvedToolFailure.output.slice(0, 1400);
-                        const output = `Blocked recovery clarification: ${unresolvedToolFailure.action} is still failing. Tool failures must be diagnosed and corrected autonomously; do not ask the user to choose retry flags, troubleshooting commands, or implementation workarounds.`;
+                    if (context.verification.unresolvedToolFailure) {
+                        const failure = context.verification.unresolvedToolFailure.output.slice(0, 1400);
+                        const output = `Blocked recovery clarification: ${context.verification.unresolvedToolFailure.action} is still failing. Tool failures must be diagnosed and corrected autonomously; do not ask the user to choose retry flags, troubleshooting commands, or implementation workarounds.`;
                         recoveryResponseFormat = recoveryFormat(["ask_user", "final"]);
                         trace.add({
                             turn,
@@ -697,17 +753,17 @@ class DefaultAgentRunner {
                         continue;
                     }
                     const clarificationBlocked = clarificationBlockReason({
-                        workspaceMutationRequired: mustWrite,
+                        workspaceMutationRequired: context.policy.mustWrite,
                         successfulInspections: relevantClarificationInspections({
                             decision: request.decision,
                             question: request.question,
-                            inspections: contextInspections
+                            inspections: context.workspace.inspections
                         }).length,
                         answeredClarifications: answeredClarifications.size,
                         hasNewBlocker: Boolean(
-                            unresolvedVerificationFailure
-                            || unresolvedMissingCommandTarget
-                            || validationFailures.size > 0
+                            context.verification.failure
+                            || context.verification.unresolvedMissingCommandTarget
+                            || context.workspace.validationFailures.size > 0
                         ),
                         decision: request.decision,
                         knownProjectRoots: discoverProjectRoots(activeWorkspace, projectCheckProviders).length,
@@ -754,8 +810,8 @@ class DefaultAgentRunner {
                     });
                     trace.save();
                     if (answer.kind === "cancel") {
-                        const completedWrites = writtenPaths.size > 0
-                            ? ` การเปลี่ยนแปลงที่ทำสำเร็จก่อนยกเลิกยังอยู่ใน workspace: ${Array.from(writtenPaths).join(", ")}`
+                        const completedWrites = context.workspace.writtenPaths.size > 0
+                            ? ` การเปลี่ยนแปลงที่ทำสำเร็จก่อนยกเลิกยังอยู่ใน workspace: ${Array.from(context.workspace.writtenPaths).join(", ")}`
                             : "";
                         return {
                             answer: `ยกเลิกงานตามคำขอแล้ว${completedWrites}`,
@@ -764,9 +820,9 @@ class DefaultAgentRunner {
                         };
                     }
                     answeredClarifications.set(clarificationKey, observation);
-                    effectiveUserMessage = `${userMessage}\n\nUser clarifications:\n${clarificationTranscript.map((line) => `- ${line}`).join("\n")}`;
+                    context.input.effectiveUserMessage = `${userMessage}\n\nUser clarifications:\n${clarificationTranscript.map((line) => `- ${line}`).join("\n")}`;
                     systemPrompt = await buildCurrentSystemPrompt();
-                    const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, effectiveUserMessage)[0];
+                    const refreshedSystemMessage = buildInitialAgentMessages(systemPrompt, contextSummary, context.input.effectiveUserMessage)[0];
                     if (refreshedSystemMessage) messages[0] = refreshedSystemMessage;
                     guard.resetActionHistory();
                     segmentEvents.push(`Step ${segmentTurn}: user clarification answered`);
@@ -778,254 +834,58 @@ class DefaultAgentRunner {
                 }
 
                 if (action.action === "final") {
-                    const rejectFinal = (summary: string, feedback: string): void => {
+                    const gate = await completion.coordinator.evaluateFinal(
+                        action as unknown as FinalAction,
+                        context
+                    );
+                    if (gate.status === "rejected") {
+                        consecutiveFinalBlocks += 1;
+                        if (consecutiveFinalBlocks > MAX_CONSECUTIVE_FINAL_BLOCKS) {
+                            const loopReason = `The model repeated the same completion blocker ${consecutiveFinalBlocks} times without producing new evidence: ${gate.reason}`;
+                            const answer = completion.coordinator.formatIncomplete(context, [loopReason]);
+                            trace.add({
+                                turn,
+                                status: "error",
+                                action: "final_loop_stop",
+                                reason: action.reason,
+                                observation: loopReason
+                            });
+                            trace.save();
+                            return { answer, trace, clarifications: clarificationTranscript };
+                        }
                         recoveryResponseFormat = recoveryFormat("final");
-                        progress.log(`[${stepStatus(turn)}] Final blocked: ${summary}`);
+                        progress.log(`[${stepStatus(turn)}] Final blocked: ${gate.reason}`);
                         trace.add({
                             turn,
                             status: "error",
                             action: "final_blocked",
                             reason: action.reason,
-                            observation: summary
+                            observation: gate.reason
                         });
                         trace.save();
-                        segmentEvents.push(`final_blocked [error]: ${summary}`);
-                        messages.push({ role: "user", content: feedback });
-                    };
-                    const proposedAnswer = action.answer?.trim() || "Done.";
-                    const completionStatus = effectiveCompletionStatus(
-                        action.completion_status ?? "completed",
-                        writtenPaths.size
-                    );
-                    const noChangeOutcome = completionStatus === "already_satisfied"
-                        || completionStatus === "no_change_needed";
-                    const incompleteReason = unresolvedToolFailure?.output
-                        || unresolvedVerificationFailure
-                        || inconclusiveVerificationBlocker
-                        || (validationFailures.size > 0
-                            ? `validation remains unresolved for ${Array.from(validationFailures).join(", ")}`
-                            : verificationRequirement !== "none" && !verificationSatisfied
-                                ? `required ${verificationRequirement} verification has not succeeded`
-                                : undefined);
-                    const finishIncomplete = (reason: string, useProposedAnswer: boolean): {
-                        answer: string;
-                        trace: AgentTraceLike;
-                        clarifications: string[];
-                    } => {
-                        const conciseReason = reason.replace(/\s+/g, " ").trim().slice(0, 1200);
-                        const answer = useProposedAnswer
-                            ? `Status: incomplete.\n\n${proposedAnswer}\n\nUnverified requirement: ${conciseReason}`
-                            : `Status: incomplete.\n\nWorkspace changes remain in place, but the required verification could not be completed. ${conciseReason}\n\nThe CLI stopped recovery instead of continuing an unproductive verification loop.`;
+                        segmentEvents.push(`final_blocked [error]: ${gate.reason}`);
+                        messages.push({ role: "user", content: gate.feedback });
+                        continue;
+                    }
+                    if (gate.status === "incomplete") {
                         trace.add({
                             turn,
                             status: "final",
                             action: "final_incomplete",
                             reason: action.reason,
-                            observation: conciseReason
+                            observation: gate.reason
                         });
                         trace.save();
-                        return { answer, trace, clarifications: clarificationTranscript };
-                    };
-                    if (completionStatus === "incomplete") {
-                        if (!incompleteReason) {
-                            rejectFinal(
-                                "incomplete status requires an actual unresolved implementation, tool, validation, or verification blocker",
-                                "Use completion_status incomplete only when a concrete blocker remains. Otherwise return the evidence-backed completed, already_satisfied, or no_change_needed outcome."
-                            );
-                            continue;
-                        }
-                        return finishIncomplete(incompleteReason, true);
-                    }
-                    if (incompleteReason && inconclusiveVerificationBlocker) {
-                        if (unsatisfiedFinalAttempts >= 1) {
-                            return finishIncomplete(incompleteReason, false);
-                        }
-                        unsatisfiedFinalAttempts += 1;
-                    }
-                    const continuationStateSatisfied = continuationNoWriteCompletionAllowed({
-                        continuation: taskContract?.continuation === true,
-                        evidence: action.evidence ?? [],
-                        successfulEvidenceRefs,
-                        successfulWorkspaceEvidenceRefs,
-                        verificationRequired: verificationRequirement !== "none",
-                        verificationSatisfied,
-                        hasUnresolvedFailures: Boolean(
-                            unresolvedToolFailure
-                            || unresolvedVerificationFailure
-                            || validationFailures.size > 0
-                            || pendingProjectChecks.size > 0
-                        )
-                    });
-                    const noChangeBlocker = noChangeCompletionBlockReason({
-                        status: completionStatus,
-                        evidence: action.evidence ?? [],
-                        successfulEvidenceRefs,
-                        successfulWorkspaceEvidenceRefs,
-                        workspaceChangeRequired: mustWrite,
-                        verificationRequired: verificationRequirement !== "none",
-                        verificationSatisfied,
-                        hasUnresolvedFailures: Boolean(
-                            unresolvedToolFailure
-                            || unresolvedVerificationFailure
-                            || validationFailures.size > 0
-                        )
-                    });
-                    if (answerLooksLikeBlockingClarification(proposedAnswer)) {
-                        rejectFinal(
-                            "blocking clarification must use the interactive choice action",
-                            "Do not return a blocking question as final. Use ask_user with 2-6 concrete choices grounded in the context you already inspected; the CLI automatically accepts a free-text answer outside those choices."
-                        );
-                        continue;
-                    }
-                    if (unresolvedToolFailure) {
-                        rejectFinal(
-                            `latest ${unresolvedToolFailure.action} action is still failing`,
-                            `You cannot report completion while the latest tool failure is unresolved. Inspect the error and make a concrete correction or run a successful corrective command. A read-only inspection does not clear this failure. If the implementation progress is preserved but the required verifier is unavailable after this grounded attempt, return final with completion_status "incomplete" and describe the exact unverified criterion. Failure evidence: ${unresolvedToolFailure.output.slice(0, 1400)}`
-                        );
-                        continue;
-                    }
-                    if (taskContract?.continuation && verificationRequirement !== "none" && !verificationSatisfied) {
-                        const requiredCheck = verificationRequirement === "runtime"
-                            ? acceptance.evidence === "interaction"
-                                ? "run a finite automated interaction test that performs the action and asserts the resulting state"
-                                : "run the manifest-defined runtime lifecycle or an OS-compatible probe of the requested URL, endpoint, server, or UI; use mode probe with a finite timeout for start/dev/serve scripts"
-                            : "run the relevant test, build, lint, or verification command";
-                        rejectFinal(
-                            `required ${verificationRequirement} verification has not succeeded for this continuation`,
-                            `You cannot report completion yet. ${requiredCheck}. A successful build, typecheck, or file read alone does not prove runtime behavior. Continue the current contract; do not use refine_task merely to remove continuation or weaken its evidence requirement. If no finite verifier is available after a grounded attempt, return final with completion_status "incomplete" instead of changing unrelated configuration or substituting another service.`
-                        );
-                        continue;
-                    }
-                    if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0 && !noChangeOutcome && !continuationStateSatisfied) {
-                        rejectFinal(
-                            "this request requires a successful file write",
-                            taskContract?.continuation
-                                ? "This is continuation work. If current workspace evidence proves the prior edits already satisfy the task, run every required verification and return final citing both workspace and verification Evidence IDs; do not create a cosmetic change. Otherwise use edit_file or write_file for the real remaining correction."
-                                : "You cannot return final yet. The user requested a file change, but no file has been changed. Use edit_file for an existing file or write_file for a new file, then verify the result before returning final."
-                        );
-                        continue;
-                    }
-                    if (taskContract?.evidence_requirements.includes("visual")
-                        && visualPresentationPaths.size === 0
-                        && !noChangeOutcome
-                        && !continuationStateSatisfied) {
-                        rejectFinal(
-                            "visual presentation work has no successful styling mutation",
-                            "You cannot return final yet. The current task contract requires a rendered visual result, but no stylesheet or concrete embedded-style mutation succeeded. If successful workspace inspection proves the initial visual requirement was incorrect, use refine_task with those exact Evidence IDs while preserving task type and write scope. Otherwise inspect the styling owner, implement the visual styling, and run finite interaction verification."
-                        );
-                        continue;
-                    }
-                    if (validationFailures.size > 0) {
-                        const failed = Array.from(validationFailures).join(", ");
-                        rejectFinal(
-                            `validation still failing for ${failed}`,
-                            `You cannot return final yet. Validation is failing for: ${failed}. Inspect the error, fix the file, and validate again.`
-                        );
-                        continue;
-                    }
-                    projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-                    if (projectRequirement) {
-                        const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
-                        if (missingArtifacts.length > 0) {
-                            const missing = missingArtifacts.join(", ");
-                            rejectFinal(
-                                `project completion profile is missing: ${missing}`,
-                                `You cannot return final yet. The requested ${projectRequirement.label} is incomplete. Missing: ${missing}. Implement these items, then run the required checks. Do not return a starter scaffold or tell the user to expand it later.`
-                            );
-                            continue;
-                        }
-                        const missingChecks = requiredProjectChecks(projectRequirement, projectChecks)
-                            .filter((check: ProjectCheck) => !successfulProjectChecks.has(check.id));
-                        if (missingChecks.length > 0) {
-                            const descriptions = missingChecks.map((check: ProjectCheck) => `${check.command} (workdir ${check.workdir})`);
-                            rejectFinal(
-                                `required project checks have not succeeded: ${descriptions.join(", ")}`,
-                                `You cannot return final yet. Run successful verification for: ${descriptions.join(", ")}. Use run_command.workdir exactly as discovered from each project manifest.`
-                            );
-                            continue;
-                        }
-                    }
-                        const pendingChecks = projectChecks.filter((check: ProjectCheck) => (
-                        pendingProjectChecks.has(check.id) && !successfulProjectChecks.has(check.id)
-                    ));
-                    if (pendingChecks.length > 0) {
-                            const descriptions = pendingChecks.map((check: ProjectCheck) => `${check.command} (workdir ${check.workdir})`);
-                        rejectFinal(
-                            `checks affected by the latest changes have not succeeded: ${descriptions.join(", ")}`,
-                            `You cannot return final yet. The latest file changes invalidated these manifest-discovered checks: ${descriptions.join(", ")}. Run each command in its discovered workdir; do not substitute an unrelated verification command.`
-                        );
-                        continue;
-                    }
-                    if (unresolvedVerificationFailure) {
-                        recoveryResponseFormat = recoveryFormat(["run_command", "final"]);
-                        rejectFinal(
-                            "the latest verification command failed",
-                            `You cannot report verified success yet because the latest verification command failed: ${unresolvedVerificationFailure}. Inspect the error and run an OS-compatible verification command successfully. A read_file or search_files action can diagnose the problem but does not clear the failed verification. Do not assume a localhost server exists.`
-                        );
-                        continue;
-                    }
-                    if (projectRequirement && answerDefersRequiredWork(proposedAnswer)) {
-                        rejectFinal(
-                            "the answer describes a starter scaffold or defers required work",
-                            "Do not return a partial scaffold or ask the user to expand it later. Finish the requested implementation and checks, then summarize concrete completed behavior."
-                        );
-                        continue;
-                    }
-                    // Intent is refined semantically by the model's selected action.
-                    // Only require a previously inferred verification after the task
-                    // has actually entered a workspace-verification path; a final
-                    // response chosen as the first action remains valid conversation.
-                    const verificationWasActivated = verificationRequirement !== "none";
-                    if (!verificationSatisfied && verificationWasActivated) {
-                        const requiredCheck = verificationRequirement === "runtime"
-                            ? acceptance.evidence === "interaction"
-                                ? "run a finite automated interaction test that performs the action and asserts the resulting state"
-                                : "run the manifest-defined runtime lifecycle or an OS-compatible probe of the requested URL, endpoint, server, or UI; use mode probe with a finite timeout for start/dev/serve scripts"
-                            : "run the relevant test, build, lint, or verification command";
-                        rejectFinal(
-                            `required ${verificationRequirement} verification has not succeeded after the latest write`,
-                            `You cannot report completion yet. The user gave an observable completion criterion. ${requiredCheck}, inspect and fix any failure, and return final only after that command succeeds. A file read or successful build alone does not prove runtime behavior. If the required finite verifier is unavailable after a grounded attempt, return final with completion_status "incomplete" and state what remains unverified.`
-                        );
-                        continue;
-                    }
-                    if (noChangeBlocker) {
-                        const availableWorkspaceEvidence = Array.from(successfulWorkspaceEvidenceRefs);
-                        const availableVerificationEvidence = Array.from(successfulEvidenceRefs)
-                            .filter((reference) => !successfulWorkspaceEvidenceRefs.has(reference));
-                        rejectFinal(
-                            noChangeBlocker,
-                            `You cannot claim already_satisfied or no_change_needed without citing the evidence that proves it. Cite at least one successful workspace Evidence ID${availableWorkspaceEvidence.length > 0 ? ` (${availableWorkspaceEvidence.join(", ")})` : ""}${verificationRequirement !== "none" ? ` and the successful verification Evidence ID${availableVerificationEvidence.length > 0 ? ` (${availableVerificationEvidence.join(", ")})` : ""}` : ""}. Do not refine the contract or create a cosmetic change.`
-                        );
-                        continue;
-                    }
-                    if (workflow.kind === "web_research" && !mcpCallsDisabled && !webResearchExhausted && sourceUrls.size < 2) {
-                        rejectFinal(
-                            "web research needs at least two relevant source URLs",
-                            "You cannot return final yet. Web research requires at least two relevant source URLs from successful MCP observations. Refine the web query; do not use search_files."
-                        );
-                        continue;
-                    }
-                    if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
-                        rejectFinal(
-                            "MCP discovery and a successful tool call are required",
-                            "You cannot claim MCP completion yet. Run mcp_list_tools and one relevant mcp_call_tool successfully after implementation."
-                        );
-                        continue;
+                        return { answer: gate.answer, trace, clarifications: clarificationTranscript };
                     }
                     progress.update("Preparing final answer...");
-                    const answer = proposedAnswer;
-                    const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
-                    const finalAnswer = missingSources.length === 0
-                        ? answer
-                        : `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
                     trace.add({ turn, status: "final", action: "final", reason: action.reason });
                     trace.save();
-                    return { answer: finalAnswer, trace, clarifications: clarificationTranscript };
+                    return { answer: gate.answer, trace, clarifications: clarificationTranscript };
                 }
-
-                if (action.action === "run_command" && action.command && lastFailedCommand
-                    && unresolvedVerificationFailure && commandInvocationError(unresolvedVerificationFailure)
-                    && normalizeCommandSignature(action.command) !== normalizeCommandSignature(lastFailedCommand)) {
+                if (action.action === "run_command" && action.command && context.verification.lastFailedCommand
+                    && context.verification.failure && commandInvocationError(context.verification.failure)
+                    && normalizeCommandSignature(action.command) !== normalizeCommandSignature(context.verification.lastFailedCommand)) {
                     guard.resetActionHistory();
                 }
                 if (action.action === "run_command" && action.command
@@ -1069,8 +929,8 @@ class DefaultAgentRunner {
                     progress.log(`[${stepStatus(turn)}] ${guardDecision.message}`);
                     trace.add({ turn, status: "error", action: "repeat_quarantine", arguments: action, observation: repeatObservation });
                     trace.save();
-                    const completedWrites = writtenPaths.size > 0
-                        ? ` Successful writes so far: ${Array.from(writtenPaths).join(", ")}.`
+                    const completedWrites = context.workspace.writtenPaths.size > 0
+                        ? ` Successful writes so far: ${Array.from(context.workspace.writtenPaths).join(", ")}.`
                         : "";
                     messages.push({
                         role: "user",
@@ -1090,7 +950,7 @@ class DefaultAgentRunner {
                 }
 
                 if (action.action === "run_command" && commandInvokesAgentTool(action.command ?? "")) {
-                    const output = mcpCallsDisabled
+                    const output = context.research.mcpCallsDisabled
                         ? "Blocked protocol misuse: MCP is disabled for this task because no configured server is available. Do not invoke agent action names through the shell."
                         : "Blocked protocol misuse: mcp_call_tool and mcp_list_tools are agent actions, not shell commands. Return the corresponding MCP action JSON instead.";
                     recoveryResponseFormat = recoveryFormat(["run_command", "final"]);
@@ -1102,7 +962,7 @@ class DefaultAgentRunner {
                 }
 
                 if (action.action === "run_command" && action.command
-                    && unresolvedMissingCommandTarget
+                    && context.verification.unresolvedMissingCommandTarget
                     && commandAddsTooling(action.command)
                     && !/(?:\blint(?:er|ing)?\b|\btooling\b|\bplugin\b|ติดตั้ง|เพิ่ม.*(?:เครื่องมือ|ปลั๊กอิน))/i.test(userMessage)) {
                     const output = "Blocked scope expansion: a missing optional command target does not authorize installing new tooling. Use a finite verification command already declared by the project, or inspect the manifest to find one.";
@@ -1112,13 +972,13 @@ class DefaultAgentRunner {
                     messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
                     continue;
                 }
-                const attemptsReadOnlyMutation = readOnlyRequest && (
+                const attemptsReadOnlyMutation = context.policy.readOnly && (
                     ["write_file", "edit_file", "delete_file"].includes(action.action ?? "")
                     || (action.action === "run_command" && commandMutatesWorkspaceFiles(action.command ?? ""))
                 );
                 if (attemptsReadOnlyMutation) {
                     const output = "Blocked by the model-owned read-only task contract: workspace changes are outside this task. Inspect with read/list/search or return a factual final answer without mutating files.";
-                    recoveryResponseFormat = getAgentReadOnlyResponseFormat(workflow.kind, readOnlyAllowsCommands);
+                    recoveryResponseFormat = getAgentReadOnlyResponseFormat(context.workflow.kind, context.policy.readOnlyAllowsCommands);
                     progress.log(`[${stepStatus(turn)}] ${output}`);
                     trace.add({ turn, status: "error", action: "read_only_mutation_blocked", reason: action.reason, arguments: action, observation: output });
                     trace.save();
@@ -1128,7 +988,7 @@ class DefaultAgentRunner {
 
                 if (["write_file", "edit_file", "delete_file"].includes(action.action ?? "") && action.path) {
                     const normalizedMutationPath = action.path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-                    if (normalizedMutationPath === ".cli/mcp.json" && workflow.kind !== "mcp_creation") {
+                    if (normalizedMutationPath === ".cli/mcp.json" && context.workflow.kind !== "mcp_creation") {
                         const output = "Blocked MCP config mutation: .cli/mcp.json is only changed for an explicit MCP-server creation task. Keep the existing configuration while working on this project.";
                         recoveryResponseFormat = recoveryFormat(["read_file", "final"]);
                         progress.log(`[${stepStatus(turn)}] ${output}`);
@@ -1137,8 +997,8 @@ class DefaultAgentRunner {
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
                         continue;
                     }
-                    projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-                    const scopeFailure = unownedProjectMutationReason(action.path, projectChecks);
+                    context.workspace.projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+                    const scopeFailure = unownedProjectMutationReason(action.path, context.workspace.projectChecks);
                     if (scopeFailure) {
                         const output = `Blocked unscoped project mutation: ${scopeFailure}`;
                         recoveryResponseFormat = recoveryFormat([action.action ?? "write_file", "final"]);
@@ -1151,8 +1011,8 @@ class DefaultAgentRunner {
                 }
 
                 if (action.action === "run_command" && action.command) {
-                    if (pendingRuntimePortCorrection) {
-                        const output = `Blocked repeated runtime probe: ${pendingRuntimePortCorrection} Inspect and edit the real workspace server/client port configuration before running another command. Do not create or validate an auxiliary substitute server.`;
+                    if (context.verification.pendingRuntimePortCorrection) {
+                        const output = `Blocked repeated runtime probe: ${context.verification.pendingRuntimePortCorrection} Inspect and edit the real workspace server/client port configuration before running another command. Do not create or validate an auxiliary substitute server.`;
                         recoveryResponseFormat = recoveryFormat(["run_command", "write_file", "delete_file", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
                         progress.log(`[${stepStatus(turn)}] ${output}`);
                         trace.add({ turn, status: "error", action: "runtime_probe_blocked_pending_correction", reason: action.reason, arguments: action, observation: output });
@@ -1160,17 +1020,17 @@ class DefaultAgentRunner {
                         messages.push({ role: "user", content: `Observation: ${JSON.stringify({ action: action.action, status: "error", output })}` });
                         continue;
                     }
-                    if (pendingPackageScriptRecovery) {
-                        const sameCommand = normalizeCommandSignature(action.command) === normalizeCommandSignature(pendingPackageScriptRecovery.command)
-                            || packageScriptCommandsEquivalent(action.command, pendingPackageScriptRecovery.command);
+                    if (context.verification.pendingPackageScriptRecovery) {
+                        const sameCommand = normalizeCommandSignature(action.command) === normalizeCommandSignature(context.verification.pendingPackageScriptRecovery.command)
+                            || packageScriptCommandsEquivalent(action.command, context.verification.pendingPackageScriptRecovery.command);
                         const sameWorkdir = path.resolve(activeWorkspace, action.workdir ?? ".")
-                            === path.resolve(activeWorkspace, pendingPackageScriptRecovery.workdir);
-                        const correctMode = pendingPackageScriptRecovery.mode !== "probe" || action.mode === "probe";
+                            === path.resolve(activeWorkspace, context.verification.pendingPackageScriptRecovery.workdir);
+                        const correctMode = context.verification.pendingPackageScriptRecovery.mode !== "probe" || action.mode === "probe";
                         if (!sameCommand || !sameWorkdir || !correctMode) {
-                            const modeHint = pendingPackageScriptRecovery.mode === "probe"
+                            const modeHint = context.verification.pendingPackageScriptRecovery.mode === "probe"
                                 ? ', "mode":"probe", "timeout_ms":10000'
                                 : "";
-                            const output = `Blocked repeated local-executable workaround: the project manifest already provides the authoritative lifecycle command. Run {"action":"run_command","command":${JSON.stringify(pendingPackageScriptRecovery.command)},"workdir":${JSON.stringify(pendingPackageScriptRecovery.workdir)}${modeHint}} before trying another command. File inspection and source corrections remain available.`;
+                            const output = `Blocked repeated local-executable workaround: the project manifest already provides the authoritative lifecycle command. Run {"action":"run_command","command":${JSON.stringify(context.verification.pendingPackageScriptRecovery.command)},"workdir":${JSON.stringify(context.verification.pendingPackageScriptRecovery.workdir)}${modeHint}} before trying another command. File inspection and source corrections remain available.`;
                             recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "edit_file", "write_file", "delete_file", "run_command", "final"]);
                             progress.log(`[${stepStatus(turn)}] ${output}`);
                             trace.add({ turn, status: "error", action: "local_executable_workaround_blocked", reason: action.reason, arguments: action, observation: output });
@@ -1212,8 +1072,8 @@ class DefaultAgentRunner {
                     && writeValidator.exists(action.path)
                     ? fs.readFileSync(path.resolve(activeWorkspace, action.path), "utf8")
                     : undefined;
-                const completionBeforeDelete = action.action === "delete_file" && projectRequirement
-                    ? evaluateProjectCompletion(activeWorkspace, projectRequirement)
+                const completionBeforeDelete = action.action === "delete_file" && context.workspace.projectRequirement
+                    ? evaluateProjectCompletion(activeWorkspace, context.workspace.projectRequirement)
                     : undefined;
                 let mutationCheckpointId: string | undefined;
                 if (action.action === "write_file" && action.path && typeof action.content === "string") {
@@ -1252,53 +1112,49 @@ class DefaultAgentRunner {
                     ...(action.reason ? { reason: action.reason } : {}),
                     arguments: action
                 });
-                progress.log(actionCoordinator.formatStatus(action, segmentTurn, maxTurnsPerSegment));
+                progress.log(tools.actionCoordinator.formatStatus(action, segmentTurn, maxTurnsPerSegment));
                 events.emit({ type: "tool_started", tool: action.action ?? "unknown_action" });
                 debugLog("Tool request", { turn, action });
-                let result = await actionCoordinator.execute(action);
-                verificationCoordinator.observe(action, result, context);
-                context.actions[context.actions.length - 1] = {
-                    turn,
-                    action: action.action as AgentAction["action"],
-                    success: result.ok,
-                    observation: result.output.slice(0, 500)
-                };
+                let result = await tools.actionCoordinator.execute(action);
                 if (action.action === "run_command" && !result.ok && result.recommendedCommand) {
-                    pendingPackageScriptRecovery = {
+                    context.verification.pendingPackageScriptRecovery = {
                         command: result.recommendedCommand,
                         workdir: result.recommendedWorkdir ?? action.workdir ?? ".",
                         ...(result.recommendedMode ? { mode: result.recommendedMode } : {})
                     };
                     recoveryResponseFormat = recoveryFormat(["read_file", "search_project", "search_files", "edit_file", "write_file", "delete_file", "run_command", "final"]);
-                } else if (action.action === "run_command" && pendingPackageScriptRecovery
-                    && (normalizeCommandSignature(action.command ?? "") === normalizeCommandSignature(pendingPackageScriptRecovery.command)
-                        || packageScriptCommandsEquivalent(action.command ?? "", pendingPackageScriptRecovery.command))) {
+                } else if (action.action === "run_command" && context.verification.pendingPackageScriptRecovery
+                    && (normalizeCommandSignature(action.command ?? "") === normalizeCommandSignature(context.verification.pendingPackageScriptRecovery.command)
+                        || packageScriptCommandsEquivalent(action.command ?? "", context.verification.pendingPackageScriptRecovery.command))) {
                     // Once the authoritative lifecycle was actually attempted, any
                     // further failure belongs to the project rather than invocation recovery.
-                    pendingPackageScriptRecovery = undefined;
+                    context.verification.pendingPackageScriptRecovery = undefined;
                 }
                 if (action.action === "run_command" && !result.ok && result.failureKind === "inference_port_collision") {
-                    pendingRuntimePortCorrection = "The previous runtime request reached the CLI's llama.cpp inference endpoint on the same loopback port instead of the workspace service.";
+                    context.verification.pendingRuntimePortCorrection = "The previous runtime request reached the CLI's llama.cpp inference endpoint on the same loopback port instead of the workspace service.";
                     recoveryResponseFormat = recoveryFormat(["run_command", "write_file", "delete_file", "mcp_call_tool", "mcp_list_tools", "ask_user", "final"]);
                 }
-                if (workflow.kind !== "mcp_creation" && action.action === "mcp_list_tools" && result.ok
+                if (action.action === "run_command" && action.command && !result.ok) {
+                    failedCommands.record(action.command, action.workdir ?? ".", result.output);
+                }
+                if (context.workflow.kind !== "mcp_creation" && action.action === "mcp_list_tools" && result.ok
                     && (/"servers"\s*:\s*\[\s*\]/i.test(result.output) || /Unknown MCP server/i.test(result.output))) {
-                    mcpCallsDisabled = true;
+                    context.research.mcpCallsDisabled = true;
                     result = {
                         ok: false,
                         output: `${result.output}\nMCP disabled for this request because no configured server is available. Use local file tools and do not invent server names.`
                     };
                 }
-                if (workflow.kind !== "mcp_creation" && action.action === "mcp_call_tool" && !result.ok
+                if (context.workflow.kind !== "mcp_creation" && action.action === "mcp_call_tool" && !result.ok
                     && /Unknown MCP server|No MCP servers configured/i.test(result.output)) {
-                    mcpCallsDisabled = true;
+                    context.research.mcpCallsDisabled = true;
                     result = {
                         ...result,
                         output: `${result.output}\nMCP disabled for this request. Use local file tools and do not invent server names.`
                     };
                 }
                 if (result.ok && ["list_files", "search_project", "search_files", "read_file"].includes(action.action ?? "")) {
-                    contextInspections.push({
+                    context.workspace.inspections.push({
                         action: action.action as "list_files" | "search_project" | "search_files" | "read_file",
                         ...(action.path ? { path: action.path } : {}),
                         ...(action.query ? { query: action.query } : {})
@@ -1306,29 +1162,26 @@ class DefaultAgentRunner {
                 }
                 if (action.action === "read_file" && result.ok && action.path) {
                     const resolvedReadPath = path.resolve(activeWorkspace, action.path).toLowerCase();
-                    readPaths.add(resolvedReadPath);
-                    if (readOnlyRequest && verificationRequirement === "none" && explicitlyRequestedFiles.length > 0
-                        && explicitlyRequestedFiles.every((requestedPath) => readPaths.has(requestedPath))) {
+                    context.workspace.readPaths.add(resolvedReadPath);
+                    if (context.policy.readOnly && context.verification.requirement === "none" && context.workspace.explicitlyRequestedFiles.length > 0
+                        && context.workspace.explicitlyRequestedFiles.every((requestedPath) => context.workspace.readPaths.has(requestedPath))) {
                         recoveryResponseFormat = getAgentFinalResponseFormat();
                     }
                 }
                 if (action.action === "run_command" && result.ok && commandMutatesWorkspaceFiles(action.command ?? "")) {
                     guard.recordFileProgress();
                     failedCommands.clear();
-                    inconclusiveVerificationBlocker = undefined;
-                    unsatisfiedFinalAttempts = 0;
-                    writtenPaths.add(commandCreatesWorkspaceFiles(action.command ?? "")
+                    context.workspace.writtenPaths.add(commandCreatesWorkspaceFiles(action.command ?? "")
                         ? "[project scaffold generated by command]"
                         : "[dependency metadata updated by command]");
-                    projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+                    context.workspace.projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
                     const effectiveWorkdir = action.workdir
                         ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
-                    projectChecksAffectedByWorkdir(effectiveWorkdir, projectChecks).forEach((checkId: string) => {
-                        successfulProjectChecks.delete(checkId);
-                        pendingProjectChecks.add(checkId);
+                    projectChecksAffectedByWorkdir(effectiveWorkdir, context.workspace.projectChecks).forEach((checkId: string) => {
+                        context.workspace.successfulProjectChecks.delete(checkId);
+                        context.workspace.pendingProjectChecks.add(checkId);
                     });
-                    result.output += `\n${formatProjectChecksPrompt(projectChecks)}`;
-                    if (verificationRequirement !== "none") verificationSatisfied = false;
+                    result.output += `\n${formatProjectChecksPrompt(context.workspace.projectChecks)}`;
                 }
                 if ((action.action === "write_file" || action.action === "edit_file") && result.ok && action.path) {
                     let validation = writeValidator.validate(action.path);
@@ -1366,43 +1219,40 @@ class DefaultAgentRunner {
                         ...(result.changed !== undefined ? { changed: result.changed } : {}),
                         output: `${result.output}\nValidator: ${validation.validator}\n${validation.output}${diagnosticGuidance ? `\nRecovery guidance: ${diagnosticGuidance}` : ""}${diagnosticSourceContext ? `\n${diagnosticSourceContext}` : ""}${rollback?.ok ? `\nMutation rolled back because it introduced additional validation failures. ${rollback.message} The failed ${action.action} action is quarantined until a different mutation persists.` : ""}`
                     };
-                    if (validation.ok || rollback?.ok) validationFailures.delete(action.path);
-                    else validationFailures.add(action.path);
+                    if (validation.ok || rollback?.ok) context.workspace.validationFailures.delete(action.path);
+                    else context.workspace.validationFailures.add(action.path);
                     if (!rollback?.ok && result.changed !== false) {
                         // A write changes the file version. Do not let an earlier read
                         // authorize a later mutation against stale contents.
-                        readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
+                        context.workspace.readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                         guard.recordFileProgress();
                         failedCommands.clear();
-                        inconclusiveVerificationBlocker = undefined;
-                        unsatisfiedFinalAttempts = 0;
-                        writtenPaths.add(action.path);
+                        context.workspace.writtenPaths.add(action.path);
                         if (isVisualPresentationMutation(
                             action.path,
                             action.action === "write_file" ? action.content ?? "" : action.new_text ?? ""
-                        )) visualPresentationPaths.add(action.path);
-                        projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-                        projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId: string) => {
-                            successfulProjectChecks.delete(checkId);
-                            pendingProjectChecks.add(checkId);
+                        )) context.workspace.visualPresentationPaths.add(action.path);
+                        context.workspace.projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+                        projectChecksAffectedByPath(action.path, context.workspace.projectChecks).forEach((checkId: string) => {
+                            context.workspace.successfulProjectChecks.delete(checkId);
+                            context.workspace.pendingProjectChecks.add(checkId);
                         });
-                        result.output += `\n${formatProjectChecksPrompt(projectChecks)}`;
-                        if (verificationRequirement !== "none") verificationSatisfied = false;
-                        if (workflow.kind === "mcp_creation") {
-                            successfulMcpDiscovery = false;
-                            successfulMcpCall = false;
+                        result.output += `\n${formatProjectChecksPrompt(context.workspace.projectChecks)}`;
+                        if (context.workflow.kind === "mcp_creation") {
+                            context.research.successfulMcpDiscovery = false;
+                            context.research.successfulMcpCall = false;
                         }
-                        if (action.action === "edit_file" && validation.ok) pendingRuntimePortCorrection = undefined;
+                        if (action.action === "edit_file" && validation.ok) context.verification.pendingRuntimePortCorrection = undefined;
                     } else if (validation.ok && result.changed === false) {
-                        satisfiedPaths.add(action.path);
-                        if (verificationRequirement === "none" && !projectRequirement) {
+                        context.workspace.satisfiedPaths.add(action.path);
+                        if (context.verification.requirement === "none" && !context.workspace.projectRequirement) {
                             recoveryResponseFormat = getAgentFinalResponseFormat();
                         }
                     }
                 }
                 if (action.action === "delete_file" && result.ok && action.path) {
-                    const completionAfterDelete = projectRequirement
-                        ? evaluateProjectCompletion(activeWorkspace, projectRequirement)
+                    const completionAfterDelete = context.workspace.projectRequirement
+                        ? evaluateProjectCompletion(activeWorkspace, context.workspace.projectRequirement)
                         : [];
                     const introducedBlockers = completionBeforeDelete
                         ? completionAfterDelete.filter((reason: string) => !completionBeforeDelete.includes(reason))
@@ -1420,122 +1270,56 @@ class DefaultAgentRunner {
                         };
                     } else {
                         // A deleted file likewise invalidates any prior read evidence.
-                        readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
+                        context.workspace.readPaths.delete(path.resolve(activeWorkspace, action.path).toLowerCase());
                         guard.recordFileProgress();
                         failedCommands.clear();
-                        inconclusiveVerificationBlocker = undefined;
-                        unsatisfiedFinalAttempts = 0;
-                        validationFailures.delete(action.path);
-                        writtenPaths.add(action.path);
-                        projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-                        projectChecksAffectedByPath(action.path, projectChecks).forEach((checkId: string) => {
-                            successfulProjectChecks.delete(checkId);
-                            pendingProjectChecks.add(checkId);
+                        context.workspace.validationFailures.delete(action.path);
+                        context.workspace.writtenPaths.add(action.path);
+                        context.workspace.projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
+                        projectChecksAffectedByPath(action.path, context.workspace.projectChecks).forEach((checkId: string) => {
+                            context.workspace.successfulProjectChecks.delete(checkId);
+                            context.workspace.pendingProjectChecks.add(checkId);
                         });
-                        result.output += `\n${formatProjectChecksPrompt(projectChecks)}`;
-                        if (verificationRequirement !== "none") verificationSatisfied = false;
-                        if (workflow.kind === "mcp_creation") {
-                            successfulMcpDiscovery = false;
-                            successfulMcpCall = false;
+                        result.output += `\n${formatProjectChecksPrompt(context.workspace.projectChecks)}`;
+                        if (context.workflow.kind === "mcp_creation") {
+                            context.research.successfulMcpDiscovery = false;
+                            context.research.successfulMcpCall = false;
                         }
                     }
                 }
-                if (action.action === "mcp_list_tools" && result.ok) successfulMcpDiscovery = true;
-                if (action.action === "mcp_call_tool" && result.ok) successfulMcpCall = true;
-                if (action.action === "run_command"
-                    && verificationRequirement !== "none"
-                    && (
-                        (result.ok && result.probeTimedOut && result.assertionPassed !== true)
-                        || (!result.ok
-                            && action.mode === "probe"
-                            && ["runtime", "timeout", "inference_port_collision"].includes(result.failureKind ?? ""))
-                    )) {
-                    inconclusiveVerificationBlocker = result.output.slice(0, 2000);
-                }
-                if (action.action === "run_command" && !result.ok) {
-                    lastFailedCommand = action.command;
-                    failedCommands.record(action.command ?? "", action.workdir ?? ".", result.output);
-                    unresolvedMissingCommandTarget = missingCommandTargetError(result.output);
-                    const invocationFailure = commandInvocationError(result.output);
-                    const effectiveWorkdir = action.workdir
-                        ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
-                    const failedKnownCheck = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir).length > 0;
-                    const failedRequiredVerification = commandSatisfiesAcceptance(
-                        action.command ?? "",
-                        acceptance,
-                        { probe: action.mode === "probe" }
-                    );
-                    // A rejected command line never exercised the project. Preserve it
-                    // as diagnostic feedback, but do not mistake it for failed product
-                    // verification that permanently blocks completion.
-                    if (!invocationFailure && (failedKnownCheck || failedRequiredVerification)) {
-                        unresolvedVerificationFailure = result.output.slice(0, 2000);
-                    }
-                    if (invocationFailure) {
-                        recoveryResponseFormat = recoveryFormat(["edit_file", "write_file", "delete_file", "final"]);
-                    }
-                    if (verificationRequirement !== "none") verificationSatisfied = false;
-                } else if (action.action === "run_command" && result.ok) {
-                    lastFailedCommand = undefined;
-                    projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-                    const effectiveWorkdir = action.workdir
-                        ?? result.output.match(/\[Auto-selected workdir: (.+)]/)?.[1];
-                    const completedProjectChecks = projectChecksForCommand(action.command ?? "", projectChecks, effectiveWorkdir);
-                    completedProjectChecks.forEach((checkId: string) => successfulProjectChecks.add(checkId));
-                    const wroteInteractionTest = acceptance.evidence === "interaction"
-                        && Array.from(writtenPaths).some((file) => /(?:^|[\\/])[^\\/]*(?:e2e|spec|test)\.[^\\/]+$/i.test(file));
-                    const satisfiesRequiredCheck = commandSatisfiesAcceptance(
-                        action.command ?? "",
-                        acceptance,
-                        { probe: action.mode === "probe" }
-                    )
-                        || (wroteInteractionTest && completedProjectChecks.length > 0 && /\btest\b/i.test(action.command ?? ""));
-                    if (completedProjectChecks.length > 0) {
-                        unresolvedVerificationFailure = undefined;
-                        unresolvedMissingCommandTarget = false;
-                    }
-                    if (satisfiesRequiredCheck && result.assertionPassed !== false) {
-                        verificationSatisfied = true;
-                        unresolvedVerificationFailure = undefined;
-                        unresolvedMissingCommandTarget = false;
-                        inconclusiveVerificationBlocker = undefined;
-                        unsatisfiedFinalAttempts = 0;
-                    } else if (satisfiesRequiredCheck && result.assertionPassed === false) {
-                        unresolvedVerificationFailure = result.output.slice(0, 2000);
-                    }
-                }
-                const nonBlockingInvocationFailure = action.action === "run_command"
-                    && !result.ok
-                    && commandInvocationError(result.output);
-                if (!result.ok) {
-                    if (!nonBlockingInvocationFailure) {
-                        unresolvedToolFailure = {
-                            action: action.action ?? "unknown_action",
-                            output: result.output
-                        };
-                    }
-                } else if (["write_file", "edit_file", "delete_file", "run_command"].includes(action.action ?? "")) {
-                    unresolvedToolFailure = undefined;
-                }
+                if (action.action === "mcp_list_tools" && result.ok) context.research.successfulMcpDiscovery = true;
+                if (action.action === "mcp_call_tool" && result.ok) context.research.successfulMcpCall = true;
+                await verification.coordinator.observeAction(action, result, context);
+                await verification.coordinator.evaluate(context);
+                const executionFailureKind = result.ok
+                    ? undefined
+                    : action.action === "run_command" && context.verification.requirement !== "none"
+                        ? "verification_failed"
+                        : "tool_execution_failed";
+                const executionHealth = result.ok
+                    ? protocolHealth.snapshot()
+                    : executionFailureKind === "verification_failed"
+                        ? protocolHealth.recordVerificationFailure()
+                        : protocolHealth.recordToolExecutionFailure();
+                responseLog.append({
+                    turn,
+                    maxTurns: maxTurnsForLog,
+                    kind: "action_execution",
+                    requestFormat,
+                    rawContent: null,
+                    parsedAction: action.action,
+                    executorCalled: true,
+                    toolExecutionStatus: result.ok ? "ok" : "error",
+                    executionFailureKind,
+                    protocolHealth: executionHealth
+                });
+                context.actions[context.actions.length - 1] = {
+                    turn,
+                    action: action.action as AgentAction["action"],
+                    success: result.ok,
+                    observation: result.output.slice(0, 500)
+                };
                 const observationGuardDecision = guard.recordObservation(action as Record<string, unknown>, result);
-                if (result.ok && (
-                    ["list_files", "search_project", "search_files", "read_file", "run_command", "mcp_list_tools", "mcp_call_tool"].includes(action.action ?? "")
-                    || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
-                )) {
-                    const evidenceRef = `evidence_${turn}_${action.action}`;
-                    successfulEvidenceRefs.add(evidenceRef);
-                    context.evidence.push(evidenceRef);
-                    if (
-                        ["list_files", "search_project", "search_files", "read_file"].includes(action.action ?? "")
-                        || (["write_file", "edit_file"].includes(action.action ?? "") && result.changed === false)
-                    ) {
-                        successfulWorkspaceEvidenceRefs.add(evidenceRef);
-                    }
-                    result = {
-                        ...result,
-                        output: `${result.output}\nEvidence ID: ${evidenceRef}`
-                    };
-                }
                 if (observationGuardDecision.status === "replan") {
                     const quarantineMessage = observationGuardDecision.message ?? "This exact action is quarantined.";
                     trace.add({
@@ -1565,11 +1349,11 @@ class DefaultAgentRunner {
                 segmentEvents.push(`${action.action} [${result.ok ? "ok" : "error"}]${eventTarget ? ` ${eventTarget}` : ""}: ${result.output.replace(/\s+/g, " ").slice(0, 240)}`);
                 if (action.action === "mcp_call_tool" && action.tool?.toLowerCase().includes("search") && result.ok) {
                     const urls = result.output.match(/https?:\/\/[^"\\\s]+/g) || [];
-                    urls.forEach((sourceUrl: string) => sourceUrls.add(sourceUrl));
-                    if (workflow.kind === "web_research" && urls.length === 0 && searchReturnedNoResults(result.output)) {
-                        consecutiveEmptyWebSearches += 1;
-                        if (consecutiveEmptyWebSearches >= 2) {
-                            webResearchExhausted = true;
+                    urls.forEach((sourceUrl: string) => context.research.sourceUrls.add(sourceUrl));
+                    if (context.workflow.kind === "web_research" && urls.length === 0 && searchReturnedNoResults(result.output)) {
+                        context.research.consecutiveEmptyWebSearches += 1;
+                        if (context.research.consecutiveEmptyWebSearches >= 2) {
+                            context.research.webResearchExhausted = true;
                             recoveryResponseFormat = getAgentFinalResponseFormat();
                             const observation = "Web search returned no usable results for two distinct attempts. Stop searching and return a concise final answer that clearly states the information could not be found through the configured search provider.";
                             trace.add({ turn, status: "error", action: "web_search_exhausted", observation });
@@ -1578,73 +1362,21 @@ class DefaultAgentRunner {
                             continue;
                         }
                     } else if (urls.length > 0) {
-                        consecutiveEmptyWebSearches = 0;
+                        context.research.consecutiveEmptyWebSearches = 0;
                     }
                 }
-                const observation = actionCoordinator.formatObservation(action, result);
-                context.verification = {
-                    requirement: verificationRequirement,
-                    satisfied: verificationSatisfied,
-                    ...(unresolvedVerificationFailure ? { failure: unresolvedVerificationFailure } : {})
-                };
+                const observation = tools.actionCoordinator.formatObservation(action, result);
                 debugLog("Tool observation -> LLM", { turn, action: action.action, observation });
-                messages.push({
-                    role: "user",
-                    content: `Observation: ${observation}`
-                });
+                messages.push(currentToolCall
+                    ? { role: "tool", tool_call_id: currentToolCall.id, content: observation }
+                    : { role: "user", content: `Observation: ${observation}` });
             }
 
-            const toolLimitBlockers: string[] = [];
-            const continuationStateSatisfiedAtLimit = continuationNoWriteCompletionAllowed({
-                continuation: taskContract?.continuation === true,
-                evidence: Array.from(successfulEvidenceRefs),
-                successfulEvidenceRefs,
-                successfulWorkspaceEvidenceRefs,
-                verificationRequired: verificationRequirement !== "none",
-                verificationSatisfied,
-                hasUnresolvedFailures: Boolean(
-                    unresolvedToolFailure
-                    || unresolvedVerificationFailure
-                    || validationFailures.size > 0
-                    || pendingProjectChecks.size > 0
-                )
-            });
-            if (mustWrite && writtenPaths.size === 0 && satisfiedPaths.size === 0 && !continuationStateSatisfiedAtLimit) {
-                toolLimitBlockers.push("no successful workspace change or already-satisfied target was recorded");
-            }
-            if (validationFailures.size > 0) toolLimitBlockers.push(`validation failing for ${Array.from(validationFailures).join(", ")}`);
-            if (unresolvedVerificationFailure) toolLimitBlockers.push(`latest verification failed: ${unresolvedVerificationFailure}`);
-            projectChecks = discoverProjectChecks(activeWorkspace, projectCheckProviders);
-            if (projectRequirement) {
-                const missingArtifacts = evaluateProjectCompletion(activeWorkspace, projectRequirement);
-                if (missingArtifacts.length > 0) toolLimitBlockers.push(`missing project artifacts: ${missingArtifacts.join(", ")}`);
-                const missingChecks = requiredProjectChecks(projectRequirement, projectChecks)
-                    .filter((check: ProjectCheck) => !successfulProjectChecks.has(check.id));
-                if (missingChecks.length > 0) {
-                    toolLimitBlockers.push(`project checks not passed: ${missingChecks.map((check: ProjectCheck) => `${check.command} in ${check.workdir}`).join(", ")}`);
-                }
-            }
-                const pendingChecks = projectChecks.filter((check: ProjectCheck) => (
-                pendingProjectChecks.has(check.id) && !successfulProjectChecks.has(check.id)
-            ));
-            if (pendingChecks.length > 0) {
-                    toolLimitBlockers.push(`checks invalidated by file changes: ${pendingChecks.map((check: ProjectCheck) => `${check.command} in ${check.workdir}`).join(", ")}`);
-            }
-            if (!verificationSatisfied) toolLimitBlockers.push(`${verificationRequirement} verification not satisfied`);
-            if (workflow.kind === "web_research" && !mcpCallsDisabled && !webResearchExhausted && sourceUrls.size < 2) {
-                toolLimitBlockers.push("fewer than two web source URLs were collected");
-            }
-            if (workflow.kind === "mcp_creation" && writtenPaths.size > 0 && (!successfulMcpDiscovery || !successfulMcpCall)) {
-                toolLimitBlockers.push("MCP discovery and a successful tool call were not completed");
-            }
-            context.completion = {
-                status: toolLimitBlockers.length > 0 ? "blocked" : "continue",
-                blockers: [...toolLimitBlockers]
-            };
-            const completionDecision = completionCoordinator.evaluate(context);
+            const toolLimitBlockers = completion.coordinator.evaluateAtToolLimit(context);
+            const completionDecision = completion.coordinator.evaluate(context);
             if (toolLimitBlockers.length > 0 || completionDecision.status === "blocked") {
-                const answer = formatIncompleteTaskAnswer(toolLimitBlockers, Array.from(writtenPaths));
-                const executedTurnLimit = verificationRecoveryActive ? recoveryMaxTurns : maxTurns;
+                const answer = completion.coordinator.formatIncomplete(context, toolLimitBlockers);
+                const executedTurnLimit = context.verification.recoveryActive ? recoveryMaxTurns : maxTurns;
                 progress.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached; task remains incomplete`);
                 trace.add({
                     turn: lastExecutedTurn + 1,
@@ -1655,8 +1387,7 @@ class DefaultAgentRunner {
                 trace.save();
                 return { answer, trace, clarifications: clarificationTranscript };
             }
-
-            const executedTurnLimit = verificationRecoveryActive ? recoveryMaxTurns : maxTurns;
+            const executedTurnLimit = context.verification.recoveryActive ? recoveryMaxTurns : maxTurns;
             progress.log(`[${lastExecutedTurn}/${executedTurnLimit}] Tool limit reached after all completion gates passed; preparing a final summary`);
             progress.update("Summarizing completed work...");
             messages.push({
@@ -1668,11 +1399,12 @@ class DefaultAgentRunner {
 
             try {
                 const modelStartedAt = Date.now();
-                debugLog("LLM final-summary request", { model, messages, responseFormat: agentResponseFormat, sampling: actionSampling });
+                const finalResponseFormat = getAgentFinalResponseFormat();
+                debugLog("LLM final-summary request", { model, messages, responseFormat: finalResponseFormat, sampling: actionSampling });
                 const response = await llmProvider.chat({
                     model,
                     messages,
-                    responseFormat: agentResponseFormat,
+                    responseFormat: finalResponseFormat,
                     sampling: actionSampling,
                     signal,
                     onRetry: (_attempt: number, errorCode: string) => {
@@ -1681,39 +1413,52 @@ class DefaultAgentRunner {
                 });
                 const responseUsage = recordResponseUsage(sessionId, response.data);
                 guard.recordCompletionTokens(responseUsage?.completionTokens ?? 0);
-                const choice = response.data.choices[0];
-                const rawAssistantContent = choice.message.content;
-                const assistantContent = typeof rawAssistantContent === "string" ? rawAssistantContent.trim() : "";
-                const finalAction = actionCoordinator.parse(assistantContent) as {
-                    action?: string;
-                    answer?: string;
-                    reason?: string;
-                } | undefined;
+                const choice = response.data?.choices?.[0] ?? { message: {}, finish_reason: response.finishReason };
+                const rawAssistantContent = response.rawProviderContent ?? response.content;
+                const assistantContent = typeof response.content === "string" ? response.content.trim() : "";
+                const finalAdmission = tools.actionCoordinator.admit({
+                    content: assistantContent,
+                    finishReason: response.finishReason ?? choice.finish_reason,
+                    hasToolCall: Boolean(response.toolCall),
+                    allowedActions: getAllowedActionNames(finalResponseFormat)
+                });
+                const finalAction = finalAdmission.ok ? finalAdmission.action : undefined;
                 debugLog("LLM final-summary response", {
                     rawContent: rawAssistantContent,
                     reasoningContent: choice.message.reasoning_content,
                     finishReason: choice.finish_reason,
                     parsedAction: finalAction,
                     usage: response.data.usage,
-                    timings: response.data.timings
+                    timings: response.data.timings,
+                    admission: finalAdmission,
+                    transport: (response as { transportMeta?: unknown }).transportMeta
                 });
                 responseLog.append({
                     turn: lastExecutedTurn + 1,
                     maxTurns: maxTurnsForLog,
-                    requestFormat: agentResponseFormat,
+                    requestFormat: finalResponseFormat,
                     rawContent: rawAssistantContent,
                     reasoningContent: choice.message.reasoning_content,
                     finishReason: choice.finish_reason,
                     parsedAction: finalAction?.action,
-                    parseError: finalAction ? undefined : actionCoordinator.explainParseFailure(assistantContent),
+                    parseError: finalAdmission.ok ? undefined : `${finalAdmission.kind}: ${finalAdmission.issues.join(" | ")}`,
                     durationMs: Date.now() - modelStartedAt,
                     usage: response.data.usage,
-                    timings: response.data.timings
+                    timings: response.data.timings,
+                    admission: finalAdmission,
+                    syntaxValid: finalAdmission.syntaxValid,
+                    schemaValid: finalAdmission.schemaValid,
+                    semanticValid: finalAdmission.semanticValid,
+                    localRepairUsed: finalAdmission.localRepairUsed,
+                    protocolRegenerationAttempt: 0,
+                    protocolFailureKind: finalAdmission.ok ? undefined : finalAdmission.kind,
+                    transport: (response as { transportMeta?: unknown }).transportMeta,
+                    executorCalled: false
                 });
 
-                if (finalAction?.action === "final" && finalAction.answer?.trim()) {
+                if (finalAction?.action === "final" && finalAction.answer.trim()) {
                     const answer = finalAction.answer.trim();
-                    const missingSources = Array.from(sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
+                    const missingSources = Array.from(context.research.sourceUrls).filter((sourceUrl) => !answer.includes(sourceUrl));
                     const finalAnswer = missingSources.length === 0
                         ? answer
                         : `${answer}\n\nSources:\n${missingSources.slice(0, 5).map((sourceUrl) => `- ${sourceUrl}`).join("\n")}`;
@@ -1742,6 +1487,92 @@ class DefaultAgentRunner {
             return { answer, trace, clarifications: clarificationTranscript };
 
     }
+}
+
+function formatProviderFailure(error: unknown): string {
+    const candidate = error as {
+        code?: unknown;
+        message?: unknown;
+        response?: { status?: unknown; data?: unknown };
+        transportMeta?: { initialHttpStatus?: number; finalHttpStatus?: number };
+    } | undefined;
+    const status = typeof candidate?.response?.status === "number"
+        ? candidate.response.status
+        : candidate?.transportMeta?.finalHttpStatus ?? candidate?.transportMeta?.initialHttpStatus;
+    const responseData = candidate?.response?.data as {
+        error?: { message?: unknown; metadata?: unknown; details?: unknown };
+        message?: unknown;
+    } | undefined;
+    const responseMessage = responseData?.error?.message ?? responseData?.message;
+    const responseDetails = responseData?.error?.metadata ?? responseData?.error?.details;
+    const code = status !== undefined
+        ? `HTTP_${status}`
+        : typeof candidate?.code === "string" && candidate.code
+            ? candidate.code
+            : "MODEL_REQUEST_FAILED";
+    const message = responseMessage !== undefined
+        ? String(responseMessage)
+        : typeof candidate?.message === "string" && candidate.message
+            ? candidate.message
+            : String(error);
+    const details = responseDetails === undefined ? "" : ` | details: ${safeErrorDetails(responseDetails)}`;
+    return `${code}: ${redactProviderText(message)}${details}`;
+}
+
+function safeErrorDetails(value: unknown): string {
+    try {
+        return redactProviderText(JSON.stringify(value)).slice(0, 1400);
+    } catch {
+        return "[unavailable]";
+    }
+}
+
+function redactProviderText(value: string): string {
+    return value
+        .replace(/Bearer\s+[^\s"']+/gi, "Bearer [redacted]")
+        .replace(/sk-[A-Za-z0-9_-]+/gi, "[redacted]");
+}
+
+function providerErrorCode(providerFailure: string): string {
+    const separator = providerFailure.indexOf(":");
+    return separator > 0 ? providerFailure.slice(0, separator) : "MODEL_REQUEST_FAILED";
+}
+
+function classifyModelFailure(error: unknown, message: string): "timeout" | "rate_limited" | "transport_error" {
+    const transportMeta = (error as { transportMeta?: { initialHttpStatus?: number; finalHttpStatus?: number } } | undefined)?.transportMeta;
+    const status = (error as { response?: { status?: number } } | undefined)?.response?.status
+        ?? transportMeta?.finalHttpStatus
+        ?? transportMeta?.initialHttpStatus;
+    if (status === 429 || /\b429\b|rate[- ]?limit|temporarily rate-limited/i.test(message)) return "rate_limited";
+    if (status === 408 || /timeout|ECONNABORTED/i.test(message)) return "timeout";
+    return "transport_error";
+}
+
+function formatModelFailureAnswer(failureKind: "timeout" | "rate_limited" | "transport_error", providerFailure: string): string {
+    const guidance = failureKind === "rate_limited"
+        ? "Retry shortly or switch model/provider."
+        : failureKind === "timeout"
+            ? "Retry after reducing the reasoning/output budget or check provider availability."
+            : "Check the endpoint, API key, model, and provider response.";
+    return [
+        "Agent stopped safely because the model request failed.",
+        `Error code: ${providerErrorCode(providerFailure)} (${failureKind})`,
+        `Error message: ${providerFailure}`,
+        guidance,
+        "No workspace action was executed."
+    ].join("\n");
+}
+
+function formatProtocolRegenerationFailure(failureKind: "timeout" | "rate_limited" | "transport_error", providerFailure: string): string {
+    const guidance = failureKind === "rate_limited"
+        ? "Retry shortly or switch model/provider."
+        : "No workspace action was executed from the invalid response.";
+    return [
+        "Agent stopped safely because protocol regeneration failed.",
+        `Error code: ${providerErrorCode(providerFailure)} (${failureKind})`,
+        `Error message: ${providerFailure}`,
+        guidance
+    ].join("\n");
 }
 
 module.exports = { DefaultAgentRunner };

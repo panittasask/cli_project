@@ -1,10 +1,10 @@
 import z = require("zod");
-const { ActionMetadataSchema } = require("./shared.schema");
+const { ActionMetadataSchema, NonBlankPreservedStringSchema, NonEmptyStringSchema } = require("./shared.schema");
 
 const EditFileActionSchema = z.object({
     action: z.literal("edit_file"),
-    path: z.string(),
-    old_text: z.string(),
+    path: NonEmptyStringSchema,
+    old_text: NonBlankPreservedStringSchema,
     new_text: z.string(),
     ...ActionMetadataSchema
 }).strict();

@@ -1,5 +1,6 @@
 import z = require("zod");
 const { AgentTaskContractSchema } = require("../taskContract.schema");
+const { NonEmptyStringSchema, NonBlankPreservedStringSchema } = require("../nonEmptyString.schema");
 
 const OptionalActionMetadataSchema = {
     reason: z.string().optional(),
@@ -15,4 +16,10 @@ const ActionReasonSchema = {
     reason: z.string().optional()
 };
 
-module.exports = { OptionalActionMetadataSchema, ActionMetadataSchema, ActionReasonSchema };
+module.exports = {
+    NonEmptyStringSchema,
+    NonBlankPreservedStringSchema,
+    OptionalActionMetadataSchema,
+    ActionMetadataSchema,
+    ActionReasonSchema
+};

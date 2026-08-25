@@ -1,5 +1,5 @@
 import z = require("zod");
-const { ActionMetadataSchema } = require("./shared.schema");
+const { ActionMetadataSchema, NonEmptyStringSchema } = require("./shared.schema");
 
 const CommandExpectationSchema = z.object({
     exit_code: z.literal(0).optional(),
@@ -11,7 +11,7 @@ export type CommandExpectation = z.infer<typeof CommandExpectationSchema>;
 
 const RunCommandActionSchema = z.object({
     action: z.literal("run_command"),
-    command: z.string(),
+    command: NonEmptyStringSchema,
     workdir: z.string().optional(),
     mode: z.enum(["normal", "probe"]).optional(),
     timeout_ms: z.number().int().min(1000).max(30000).optional(),

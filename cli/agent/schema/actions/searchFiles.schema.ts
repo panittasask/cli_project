@@ -1,9 +1,9 @@
 import z = require("zod");
-const { ActionMetadataSchema } = require("./shared.schema");
+const { ActionMetadataSchema, NonEmptyStringSchema } = require("./shared.schema");
 
 const SearchFilesActionSchema = z.object({
     action: z.literal("search_files"),
-    query: z.string(),
+    query: NonEmptyStringSchema,
     path: z.string().optional(),
     ...ActionMetadataSchema
 }).strict();

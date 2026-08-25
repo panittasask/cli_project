@@ -6,6 +6,7 @@ node_modules/
 .cli/log-viewer.html
 .cli/checkpoints.json
 .cli/settings.json
+.cli/api-endpoints.json
 .cli/router-models.ini
 .cli/cache/
 .cli/runtime/

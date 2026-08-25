@@ -1,0 +1,20 @@
+{
+  "provider": "openrouter",
+  "apiUrl": "https://openrouter.ai/api/v1/chat/completions",
+  "bearerToken": "<PUT_OPENROUTER_KEY_HERE>",
+  "httpReferer": "<YOUR_SITE_URL>",
+  "xTitle": "<YOUR_SITE_NAME>",
+  "model": "openai/gpt-4o",
+  "requestDelayMs": 1000,
+  "reasoning": {
+    "effort": "low"
+  },
+  "capabilities": {
+    "nativeTools": false,
+    "toolChoice": false,
+    "structuredOutput": true,
+    "strictSchema": false,
+    "constrainedGeneration": false,
+    "responseHealing": true
+  }
+}

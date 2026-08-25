@@ -73,12 +73,49 @@ Settings are machine-local and ignored by Git. The tracked prototype is
 `.cli/settings.json` without overwriting an existing file, or copy the prototype
 manually before starting llama.cpp.
 
+### OpenRouter
+
+The same CLI can use OpenRouter's OpenAI-compatible chat endpoint. The endpoint
+file has two parts: `.cli/api-endpoints.template.json` is tracked and defines
+the allowed structure; `.cli/api-endpoints.json` is local-only and is ignored
+by Git. Edit only the local file with your real values:
+
+```json
+{
+  "provider": "openrouter",
+  "apiUrl": "https://openrouter.ai/api/v1/chat/completions",
+  "bearerToken": "ใส่ OpenRouter key ที่นี่",
+  "httpReferer": "https://your-site.example",
+  "xTitle": "CLI Project",
+  "model": "openai/gpt-4o",
+  "requestDelayMs": 1000,
+  "reasoning": {
+    "effort": "low"
+  }
+}
+```
+
+The CLI reads the local file at runtime, validates its fields against the
+template, and turns `bearerToken` into `Authorization: Bearer ...`.
+`httpReferer` and `xTitle` become OpenRouter's `HTTP-Referer` and `X-Title`.
+`reasoning.effort` controls the model's thinking budget; `low` is the default
+for OpenRouter so reasoning models leave room for the final answer. You can
+override it with `minimal`, `medium`, `high`, or `none` when the selected model
+supports that level.
+`requestDelayMs` spaces request starts by the configured number of milliseconds;
+use `1000` for approximately one request per second, or `0` to disable the
+delay. The default remains `0` when the field is omitted.
+The local file is never committed. You can still use the safer environment
+override with `OPENROUTER_API_KEY`; do not place a real key in the tracked
+template, source code, or logs.
+
 Prototype contents:
 
 ```json
 {
   "llamaCppPath": "D:\\llama.cpp\\llama-b10012-bin-win-sycl-x64",
   "modelPath": "D:\\Model",
+  "provider": "llama.cpp",
   "defaultModel": "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.gguf",
   "serverHost": "127.0.0.1",
   "serverPort": 8080,

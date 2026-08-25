@@ -1,7 +1,9 @@
 import type { AgentAction, AgentToolResult } from "../agentSchema";
+import type { ActionAdmissionInput, ActionAdmissionResult } from "./actionAdmissionGate";
 
 export type ActionToolPort = {
     parseAction: (content: string | undefined | null) => AgentAction | undefined;
+    admitAction: (input: ActionAdmissionInput) => ActionAdmissionResult;
     explainParseFailure: (content: string | undefined | null) => string;
     execute: (action: AgentAction) => Promise<AgentToolResult>;
     formatActionStatus: (action: AgentAction, turn: number, maxTurns: number) => string;
@@ -10,6 +12,7 @@ export type ActionToolPort = {
 
 export interface ActionCoordinator {
     parse(content: string | undefined | null): AgentAction | undefined;
+    admit(input: ActionAdmissionInput): ActionAdmissionResult;
     explainParseFailure(content: string | undefined | null): string;
     execute(action: AgentAction): Promise<AgentToolResult>;
     formatStatus(action: AgentAction, turn: number, maxTurns: number): string;
@@ -21,6 +24,10 @@ class DefaultActionCoordinator implements ActionCoordinator {
 
     parse(content: string | undefined | null): AgentAction | undefined {
         return this.tools.parseAction(content);
+    }
+
+    admit(input: ActionAdmissionInput): ActionAdmissionResult {
+        return this.tools.admitAction(input);
     }
 
     explainParseFailure(content: string | undefined | null): string {

@@ -6,6 +6,17 @@ import path = require("node:path");
 import streamPromises = require("node:stream/promises");
 
 const { pipeline } = streamPromises;
+const { loadApiEndpointSettings } = require("../cli/config") as {
+    loadApiEndpointSettings: (appRoot?: string) => {
+        provider?: "llama.cpp" | "openrouter";
+        apiUrl?: string;
+        bearerToken?: string;
+        apiKeyEnv?: string;
+        httpReferer?: string;
+        xTitle?: string;
+        model?: string;
+    } | undefined;
+};
 
 type Backend = "cuda" | "sycl" | "vulkan" | "metal" | "cpu";
 type LaunchMode = { kind: "external"; apiUrl: string } | { kind: "local"; apiUrl: string };
@@ -13,7 +24,17 @@ type LaunchMode = { kind: "external"; apiUrl: string } | { kind: "local"; apiUrl
 type LauncherSettings = {
     llamaCppPath?: string;
     modelPath?: string;
+    provider?: "llama.cpp" | "openrouter";
     apiUrl?: string;
+    apiEndpoint?: {
+        provider?: "llama.cpp" | "openrouter";
+        apiUrl?: string;
+        bearerToken?: string;
+        apiKeyEnv?: string;
+        httpReferer?: string;
+        xTitle?: string;
+        model?: string;
+    };
     defaultModel?: string;
     contextLength?: number;
     serverHost?: string;
@@ -21,6 +42,8 @@ type LauncherSettings = {
     device?: string;
     hardwareProfile?: string;
 };
+
+const DEFAULT_OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 type ReleaseAsset = {
     name: string;
@@ -57,7 +80,9 @@ function loadSettings(root = appRoot): LauncherSettings {
     const selected = fs.existsSync(personal) ? personal : example;
     if (!fs.existsSync(selected)) return {};
     const parsed = JSON.parse(fs.readFileSync(selected, "utf8")) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as LauncherSettings : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const apiEndpoint = loadApiEndpointSettings(root);
+    return apiEndpoint ? { ...(parsed as LauncherSettings), apiEndpoint } : parsed as LauncherSettings;
 }
 
 function localApiUrl(settings: LauncherSettings): string {
@@ -65,14 +90,20 @@ function localApiUrl(settings: LauncherSettings): string {
     return `http://127.0.0.1:${port}/v1/chat/completions`;
 }
 
+function isOpenRouter(settings: LauncherSettings, environment: NodeJS.ProcessEnv = process.env): boolean {
+    return (environment.LLM_PROVIDER?.trim().toLowerCase() || settings.apiEndpoint?.provider || settings.provider) === "openrouter";
+}
+
 function resolveLaunchMode(settings: LauncherSettings, environment: NodeJS.ProcessEnv = process.env): LaunchMode {
-    const explicit = environment.LLAMA_API_URL?.trim();
+    const explicit = environment.LLM_API_URL?.trim() || environment.LLAMA_API_URL?.trim();
     if (explicit) {
         const parsed = new URL(explicit);
         if (!/^https?:$/.test(parsed.protocol)) throw new Error("LLAMA_API_URL must use http or https.");
         return { kind: "external", apiUrl: parsed.toString() };
     }
-    const configured = settings.apiUrl?.trim();
+    const configured = settings.apiEndpoint?.apiUrl?.trim()
+        || settings.apiUrl?.trim()
+        || (isOpenRouter(settings, environment) ? DEFAULT_OPENROUTER_API_URL : undefined);
     if (configured) {
         const parsed = new URL(configured);
         if (!/^https?:$/.test(parsed.protocol)) throw new Error("apiUrl must use http or https.");
@@ -357,7 +388,7 @@ function startCli(apiUrl: string): Promise<number> {
         const child = childProcess.spawn(process.execPath, [tsx, terminal, ...process.argv.slice(2)], {
             cwd: appRoot,
             stdio: "inherit",
-            env: { ...process.env, LLAMA_API_URL: apiUrl },
+            env: { ...process.env, LLM_API_URL: apiUrl, LLAMA_API_URL: apiUrl },
             windowsHide: true
         });
         child.once("error", reject);
@@ -384,8 +415,8 @@ async function main(): Promise<void> {
     process.once("SIGTERM", terminate);
     try {
         if (mode.kind === "external") {
-            console.log(`Using configured llama.cpp API: ${mode.apiUrl}`);
-            await requireExternalEndpoint(mode.apiUrl);
+            console.log(`Using configured ${isOpenRouter(settings) ? "OpenRouter" : "llama.cpp"} API: ${mode.apiUrl}`);
+            if (!isOpenRouter(settings)) await requireExternalEndpoint(mode.apiUrl);
         } else if (await endpointReady(mode.apiUrl)) {
             console.log(`Reusing llama.cpp API: ${mode.apiUrl}`);
         } else {

@@ -121,7 +121,8 @@ function commandSatisfiesVerification(
         return /invoke-webrequest|invoke-restmethod|\bcurl(?:\.exe)?\b|\bwget(?:\.exe)?\b|https?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)/i.test(clean)
             || /\b(playwright|cypress|selenium|test:e2e|e2e:test)\b/i.test(clean)
             || (options.probe === true
-                && /\b(?:npm(?:\.cmd)?\s+(?:start|run\s+(?:start|dev|serve))|pnpm\s+(?:start|dev|serve)|yarn\s+(?:start|dev|serve)|bun\s+(?:start|dev|serve)|go\s+run|cargo\s+run|dotnet\s+run)\b/i.test(clean));
+                && /\b(?:npm(?:\.cmd)?\s+(?:start|run\s+(?:start|dev|serve))|pnpm\s+(?:start|dev|serve)|yarn\s+(?:start|dev|serve)|bun\s+(?:start|dev|serve)|go\s+run|cargo\s+run|dotnet\s+run)\b/i.test(clean)
+                || options.probe === true && /(?:^|[\s"';&|])(?:\.?[\\/])?[\w.-]+\.exe(?:$|[\s"';&|])/i.test(clean));
     }
     return /\b(test|check|verify|lint|typecheck|tsc|build|compile|go\s+test|go\s+build|cargo\s+test|pytest|unittest|dotnet\s+test|mvn\s+test|gradle\s+test)\b/i.test(clean);
 }

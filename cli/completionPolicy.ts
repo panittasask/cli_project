@@ -52,8 +52,14 @@ function continuationNoWriteCompletionAllowed(input: ContinuationCompletionInput
     if (!input.continuation || input.hasUnresolvedFailures) return false;
     if (input.verificationRequired && !input.verificationSatisfied) return false;
     const citedSuccessfulEvidence = input.evidence.some((reference) => input.successfulEvidenceRefs.has(reference));
-    const citedWorkspaceEvidence = input.evidence.some((reference) => input.successfulWorkspaceEvidenceRefs.has(reference));
-    return citedSuccessfulEvidence && citedWorkspaceEvidence;
+    // Workspace evidence is host-owned state. A model may cite only the
+    // latest verification evidence after inspecting the workspace earlier in
+    // the same continuation; requiring it to repeat every inspection ID can
+    // turn an already-satisfied continuation into a write loop. Keep the
+    // evidence itself mandatory, but accept any successful workspace
+    // inspection retained by the host context.
+    const hasWorkspaceEvidence = input.successfulWorkspaceEvidenceRefs.size > 0;
+    return citedSuccessfulEvidence && hasWorkspaceEvidence;
 }
 
 module.exports = {

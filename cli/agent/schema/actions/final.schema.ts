@@ -1,11 +1,11 @@
 import z = require("zod");
-const { OptionalActionMetadataSchema } = require("./shared.schema");
+const { NonEmptyStringSchema, NonBlankPreservedStringSchema, OptionalActionMetadataSchema } = require("./shared.schema");
 
 const FinalActionSchema = z.object({
     action: z.literal("final"),
-    answer: z.string(),
+    answer: NonBlankPreservedStringSchema,
     completion_status: z.enum(["completed", "already_satisfied", "no_change_needed", "incomplete"]).default("completed"),
-    evidence: z.array(z.string()).max(8).default([]),
+    evidence: z.array(NonEmptyStringSchema).max(8).default([]),
     ...OptionalActionMetadataSchema
 }).strict();
 

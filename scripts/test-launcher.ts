@@ -18,6 +18,12 @@ assert.deepEqual(configuredRemote, { kind: "external", apiUrl: "http://model-ser
 const prototypeLoopback = resolveLaunchMode({ apiUrl: "http://127.0.0.1:8080/v1/chat/completions" }, {});
 assert.equal(prototypeLoopback.kind, "local");
 
+const openRouter = resolveLaunchMode({ provider: "openrouter" }, {});
+assert.deepEqual(openRouter, { kind: "external", apiUrl: "https://openrouter.ai/api/v1/chat/completions" });
+
+const openRouterEnvironment = resolveLaunchMode({}, { LLM_PROVIDER: "openrouter" });
+assert.deepEqual(openRouterEnvironment, { kind: "external", apiUrl: "https://openrouter.ai/api/v1/chat/completions" });
+
 assert.equal(selectBackend("NVIDIA GeForce RTX 4070 SUPER", "win32", "x64"), "cuda");
 assert.equal(selectBackend("Intel(R) Arc(TM) A770 Graphics", "win32", "x64"), "sycl");
 assert.equal(selectBackend("AMD Radeon RX 7900 XTX", "win32", "x64"), "vulkan");

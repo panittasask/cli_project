@@ -15,11 +15,41 @@ type SamplingSettings = {
 };
 
 type SamplingProfile = Partial<SamplingSettings>;
+type ReasoningEffort = "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
+
+type ApiEndpointSettings = {
+    provider?: "llama.cpp" | "openrouter";
+    apiUrl?: string;
+    bearerToken?: string;
+    apiKeyEnv?: string;
+    httpReferer?: string;
+    xTitle?: string;
+    model?: string;
+    requestDelayMs?: number;
+    reasoning?: {
+        effort?: ReasoningEffort;
+        max_tokens?: number;
+        exclude?: boolean;
+    };
+    capabilities?: {
+        nativeTools?: boolean;
+        toolChoice?: boolean;
+        structuredOutput?: boolean;
+        strictSchema?: boolean;
+        constrainedGeneration?: boolean;
+        responseHealing?: boolean;
+    };
+};
 
 type CliSettings = {
     llamaCppPath?: string;
     modelPath?: string;
+    provider?: "llama.cpp" | "openrouter";
     apiUrl?: string;
+    apiKeyEnv?: string;
+    httpReferer?: string;
+    xTitle?: string;
+    apiEndpoint?: ApiEndpointSettings;
     routerMode?: boolean;
     modelsMax?: number;
     defaultModel?: string;
@@ -70,6 +100,20 @@ type AgentBudgetSettings = {
     maxCompletionTokens: number;
     repeatLimit: number;
 };
+
+type LlmConnectionSettings = {
+    provider: "llama.cpp" | "openrouter";
+    apiUrl: string;
+    headers: Record<string, string>;
+    apiKeyEnv?: string;
+    model?: string;
+    requestDelayMs: number;
+    reasoning?: Record<string, unknown>;
+    capabilities?: ApiEndpointSettings["capabilities"];
+};
+
+const DEFAULT_LLAMA_API_URL = "http://127.0.0.1:8080/v1/chat/completions";
+const DEFAULT_OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, "profile">> = {
     quick: {
@@ -141,7 +185,140 @@ function loadCliSettings(appRoot = process.cwd()): CliSettings {
     }
 
     const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as CliSettings;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object") return {};
+    const apiEndpoint = loadApiEndpointSettings(appRoot);
+    return apiEndpoint ? { ...parsed, apiEndpoint } : parsed;
+}
+
+function readJsonObject(filePath: string, label: string): Record<string, unknown> {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+    } catch (error) {
+        throw new Error(`${label} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`${label} must contain one JSON object.`);
+    }
+    return parsed as Record<string, unknown>;
+}
+
+function loadApiEndpointSettings(appRoot = process.cwd()): ApiEndpointSettings | undefined {
+    const templatePath = path.resolve(appRoot, ".cli", "api-endpoints.template.json");
+    const actualPath = path.resolve(appRoot, ".cli", "api-endpoints.json");
+    if (!fs.existsSync(actualPath)) return undefined;
+    if (!fs.existsSync(templatePath)) {
+        throw new Error(`API endpoint template not found: ${templatePath}`);
+    }
+
+    const template = readJsonObject(templatePath, "api-endpoints.template.json");
+    const actual = readJsonObject(actualPath, "api-endpoints.json");
+    const allowedFields = new Set(Object.keys(template));
+    const unknownFields = Object.keys(actual).filter((field) => !allowedFields.has(field));
+    if (unknownFields.length > 0) {
+        throw new Error(`api-endpoints.json contains fields not defined by api-endpoints.template.json: ${unknownFields.join(", ")}`);
+    }
+
+    const readOptionalString = (field: string): string | undefined => {
+        if (actual[field] === undefined) return undefined;
+        if (typeof actual[field] !== "string") throw new Error(`api-endpoints.json field '${field}' must be a string.`);
+        const value = actual[field].trim();
+        return value || undefined;
+    };
+    const provider = readOptionalString("provider");
+    if (provider !== undefined && provider !== "llama.cpp" && provider !== "openrouter") {
+        throw new Error("api-endpoints.json field 'provider' must be llama.cpp or openrouter.");
+    }
+
+    const apiUrl = readOptionalString("apiUrl");
+    if (apiUrl) {
+        try {
+            const parsed = new URL(apiUrl);
+            if (!/^https?:$/.test(parsed.protocol)) throw new Error("unsupported protocol");
+        } catch {
+            throw new Error("api-endpoints.json field 'apiUrl' must use http or https.");
+        }
+    }
+
+    let requestDelayMs: number | undefined;
+    if (actual.requestDelayMs !== undefined) {
+        if (typeof actual.requestDelayMs !== "number" || !Number.isInteger(actual.requestDelayMs) || actual.requestDelayMs < 0 || actual.requestDelayMs > 300_000) {
+            throw new Error("api-endpoints.json field 'requestDelayMs' must be an integer from 0 to 300000.");
+        }
+        requestDelayMs = actual.requestDelayMs;
+    }
+
+    let reasoning: ApiEndpointSettings["reasoning"];
+    if (actual.reasoning !== undefined) {
+        if (!actual.reasoning || typeof actual.reasoning !== "object" || Array.isArray(actual.reasoning)) {
+            throw new Error("api-endpoints.json field 'reasoning' must be an object.");
+        }
+        const configuredReasoning = actual.reasoning as Record<string, unknown>;
+        const effort = configuredReasoning.effort;
+        if (effort !== undefined && (typeof effort !== "string" || !["max", "xhigh", "high", "medium", "low", "minimal", "none"].includes(effort))) {
+            throw new Error("api-endpoints.json field 'reasoning.effort' is invalid.");
+        }
+        const maxTokens = configuredReasoning.max_tokens;
+        if (maxTokens !== undefined && (typeof maxTokens !== "number" || !Number.isInteger(maxTokens) || maxTokens < 1)) {
+            throw new Error("api-endpoints.json field 'reasoning.max_tokens' must be a positive integer.");
+        }
+        const exclude = configuredReasoning.exclude;
+        if (exclude !== undefined && typeof exclude !== "boolean") {
+            throw new Error("api-endpoints.json field 'reasoning.exclude' must be boolean.");
+        }
+        const unknownReasoningFields = Object.keys(configuredReasoning).filter((field) => !["effort", "max_tokens", "exclude"].includes(field));
+        if (unknownReasoningFields.length > 0) {
+            throw new Error(`api-endpoints.json reasoning contains unsupported fields: ${unknownReasoningFields.join(", ")}`);
+        }
+        const parsedReasoning: NonNullable<ApiEndpointSettings["reasoning"]> = {};
+        if (typeof effort === "string") parsedReasoning.effort = effort as ReasoningEffort;
+        if (typeof maxTokens === "number") parsedReasoning.max_tokens = maxTokens;
+        if (typeof exclude === "boolean") parsedReasoning.exclude = exclude;
+        reasoning = parsedReasoning;
+    }
+
+    let capabilities: ApiEndpointSettings["capabilities"];
+    if (actual.capabilities !== undefined) {
+        if (!actual.capabilities || typeof actual.capabilities !== "object" || Array.isArray(actual.capabilities)) {
+            throw new Error("api-endpoints.json field 'capabilities' must be an object.");
+        }
+        const configuredCapabilities = actual.capabilities as Record<string, unknown>;
+        const supportedCapabilityFields = [
+            "nativeTools",
+            "toolChoice",
+            "structuredOutput",
+            "strictSchema",
+            "constrainedGeneration",
+            "responseHealing"
+        ] as const;
+        const unknownCapabilityFields = Object.keys(configuredCapabilities)
+            .filter((field) => !supportedCapabilityFields.includes(field as typeof supportedCapabilityFields[number]));
+        if (unknownCapabilityFields.length > 0) {
+            throw new Error(`api-endpoints.json capabilities contains unsupported fields: ${unknownCapabilityFields.join(", ")}`);
+        }
+        const parsedCapabilities: NonNullable<ApiEndpointSettings["capabilities"]> = {};
+        for (const field of supportedCapabilityFields) {
+            const value = configuredCapabilities[field];
+            if (value !== undefined && typeof value !== "boolean") {
+                throw new Error(`api-endpoints.json field 'capabilities.${field}' must be boolean.`);
+            }
+            if (typeof value === "boolean") parsedCapabilities[field] = value;
+        }
+        capabilities = parsedCapabilities;
+    }
+
+    return {
+        ...(provider ? { provider } : {}),
+        ...(apiUrl ? { apiUrl } : {}),
+        ...(["bearerToken", "apiKeyEnv", "httpReferer", "xTitle", "model"].reduce<Record<string, string>>((result, field) => {
+            const value = readOptionalString(field);
+            if (value) result[field] = value;
+            return result;
+        }, {}) as Pick<ApiEndpointSettings, "bearerToken" | "apiKeyEnv" | "httpReferer" | "xTitle" | "model">),
+        ...(requestDelayMs !== undefined ? { requestDelayMs } : {}),
+        ...(reasoning ? { reasoning } : {}),
+        ...(capabilities ? { capabilities } : {})
+    };
 }
 
 function readNumber(name: string, fallback: number): number {
@@ -201,6 +378,15 @@ function validateCliSettings(input: unknown): string[] {
     booleanField(settings, "routerMode");
     for (const field of ["llamaCppPath", "modelPath", "defaultModel", "device"]) {
         if (settings[field] !== undefined && (typeof settings[field] !== "string" || !String(settings[field]).trim())) errors.push(`${field} must be a non-empty string`);
+    }
+    if (settings.provider !== undefined && (typeof settings.provider !== "string" || !["llama.cpp", "openrouter"].includes(settings.provider))) {
+        errors.push("provider must be llama.cpp or openrouter");
+    }
+    for (const field of ["apiUrl", "apiKeyEnv", "httpReferer", "xTitle"]) {
+        if (settings[field] !== undefined && (typeof settings[field] !== "string" || !String(settings[field]).trim())) errors.push(`${field} must be a non-empty string`);
+    }
+    if (settings.apiKeyEnv !== undefined && (typeof settings.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(settings.apiKeyEnv))) {
+        errors.push("apiKeyEnv must be a valid environment variable name");
     }
     if (settings.hardwareProfile !== undefined && (typeof settings.hardwareProfile !== "string"
         || !["auto", "intel-arc", "rtx-4070-super", "default"].includes(settings.hardwareProfile))) {
@@ -386,6 +572,71 @@ function getTerminalSettings(settings: CliSettings): { llmMessageColor: string }
     };
 }
 
+function getLlmConnectionSettings(settings: CliSettings, environment: NodeJS.ProcessEnv = process.env): LlmConnectionSettings {
+    const endpoint = settings.apiEndpoint;
+    const configuredProvider = environment.LLM_PROVIDER?.trim().toLowerCase()
+        || endpoint?.provider
+        || settings.provider
+        || "llama.cpp";
+    const provider = configuredProvider === "openrouter" ? "openrouter" : configuredProvider === "llama.cpp" ? "llama.cpp" : undefined;
+    if (!provider) {
+        throw new Error("LLM_PROVIDER or settings.provider must be llama.cpp or openrouter.");
+    }
+
+    const apiUrl = environment.LLM_API_URL?.trim()
+        || environment.LLAMA_API_URL?.trim()
+        || endpoint?.apiUrl?.trim()
+        || settings.apiUrl?.trim()
+        || (provider === "openrouter" ? DEFAULT_OPENROUTER_API_URL : DEFAULT_LLAMA_API_URL);
+    try {
+        const parsed = new URL(apiUrl);
+        if (!/^https?:$/.test(parsed.protocol)) throw new Error("unsupported protocol");
+    } catch {
+        throw new Error(`LLM API URL must use http or https: ${apiUrl}`);
+    }
+
+    if (provider === "llama.cpp") {
+        return {
+            provider,
+            apiUrl,
+            headers: {},
+            requestDelayMs: endpoint?.requestDelayMs ?? 0,
+            ...(endpoint?.capabilities ? { capabilities: endpoint.capabilities } : {})
+        };
+    }
+
+    const apiKeyEnv = environment.LLM_API_KEY_ENV?.trim()
+        || endpoint?.apiKeyEnv?.trim()
+        || settings.apiKeyEnv?.trim()
+        || "OPENROUTER_API_KEY";
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
+        throw new Error("apiKeyEnv must be a valid environment variable name.");
+    }
+    const bearerToken = endpoint?.bearerToken?.trim();
+    const configuredBearerToken = bearerToken && !/^<[^>]+>$/.test(bearerToken) ? bearerToken : undefined;
+    const apiKey = configuredBearerToken || environment[apiKeyEnv]?.trim();
+    if (!apiKey) {
+        throw new Error(`OpenRouter is selected, but ${apiKeyEnv} is not set. Put the key in the environment; do not save it in settings.json.`);
+    }
+
+    const httpReferer = environment.OPENROUTER_HTTP_REFERER?.trim() || settings.httpReferer?.trim();
+    const xTitle = environment.OPENROUTER_X_TITLE?.trim() || settings.xTitle?.trim();
+    return {
+        provider,
+        apiUrl,
+        apiKeyEnv,
+        requestDelayMs: endpoint?.requestDelayMs ?? 0,
+        ...(endpoint?.model?.trim() ? { model: endpoint.model.trim() } : {}),
+        reasoning: endpoint?.reasoning ?? { effort: "low" },
+        ...(endpoint?.capabilities ? { capabilities: endpoint.capabilities } : {}),
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            ...(httpReferer ? { "HTTP-Referer": httpReferer } : {}),
+            ...(xTitle ? { "X-Title": xTitle } : {})
+        }
+    };
+}
+
 module.exports = {
     getClarificationSettings,
     getProjectCheckProviders,
@@ -394,6 +645,8 @@ module.exports = {
     validateCliSettings,
     validateCliSettingsFile,
     loadCliSettings,
+    loadApiEndpointSettings,
     getSamplingSettings,
-    getAgentGuardSettings
+    getAgentGuardSettings,
+    getLlmConnectionSettings
 };

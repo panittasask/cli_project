@@ -21,6 +21,8 @@
     "logs:view": "tsx scripts/generate-log-viewer.ts",
     "benchmark:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark-hardware.ps1",
     "test:agent": "tsx scripts/test-agent.ts",
+    "test:coordinators": "tsx scripts/test-agent-coordinators.ts",
+    "test:openrouter": "tsx scripts/test-openrouter.ts",
     "test:mcp": "tsx scripts/test-mcp.ts",
     "test:hardware": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-hardware-profiles.ps1",
     "test:launcher": "tsx scripts/test-launcher.ts",
@@ -30,7 +32,7 @@
     "test:e2e": "tsx scripts/test-agent-e2e.ts",
     "test:live-agent": "tsx scripts/test-live-agent.ts",
     "test:live-behavior": "tsx scripts/test-live-behavior.ts",
-    "test": "npm run test:launcher && npm run test:agent && npm run test:regression && npm run test:mcp",
+    "test": "npm run test:launcher && npm run test:agent && npm run test:coordinators && npm run test:openrouter && npm run test:regression && npm run test:mcp",
     "run test": "npm test"
   },
   "keywords": [],
@@ -41,6 +43,7 @@
     "axios": "^1.18.0",
     "dotenv": "^17.4.2",
     "duck-duck-scrape": "^2.2.7",
+    "jsonrepair": "^3.15.0",
     "openai": "^6.44.0",
     "zod": "^3.25.76",
     "zod-to-json-schema": "^3.25.2"

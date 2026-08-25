@@ -108,7 +108,68 @@ async function runScenario(
     }
 }
 
+function readResponseRecords(root: string): Array<Record<string, any>> {
+    const responseLogDirectory = path.join(root, ".cli", "logs", "agent");
+    if (!fs.existsSync(responseLogDirectory)) return [];
+    return fs.readdirSync(responseLogDirectory)
+        .filter((name) => name.startsWith("agent-model-responses") && name.endsWith(".jsonl"))
+        .flatMap((name) => fs.readFileSync(path.join(responseLogDirectory, name), "utf8")
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as Record<string, any>));
+}
+
 async function main(): Promise<void> {
+    const startupRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cli-agent-workspace-switch-"));
+    const restoredWorkspace = path.join(startupRoot, "restored-workspace");
+    fs.mkdirSync(restoredWorkspace, { recursive: true });
+    const workspaceSwitchModel = await mockModel([
+        {
+            action: "write_file",
+            path: "result.txt",
+            content: "written in restored workspace\n",
+            reason: "Write the requested result in the restored session workspace.",
+            task: {
+                intent: "Write a result in the active restored workspace",
+                task_type: "coding",
+                continuation: false,
+                requires_workspace_changes: true,
+                verification: "none",
+                evidence_requirements: ["source"],
+                success_criteria: ["result.txt exists in the restored workspace"]
+            }
+        },
+        {
+            action: "final",
+            answer: "The result was written in the restored workspace.",
+            reason: "The write and read-back validation succeeded."
+        }
+    ]);
+    try {
+        const switched = await runAgentCliHarness({
+            appRoot: startupRoot,
+            workspace: restoredWorkspace,
+            apiUrl: workspaceSwitchModel.url,
+            prompt: "สร้าง result.txt ใน workspace ปัจจุบัน",
+            passWorkspaceArgument: false,
+            timeoutMs: 15_000
+        });
+        assert.equal(switched.exitCode, 0, switched.stderr);
+        assert.equal(
+            fs.readFileSync(path.join(restoredWorkspace, "result.txt"), "utf8"),
+            "written in restored workspace\n"
+        );
+        assert.equal(fs.existsSync(path.join(startupRoot, "result.txt")), false);
+        assert.match(switched.output, /AI:\s+The result was written in the restored workspace/);
+        const writeExecution = readResponseRecords(startupRoot).find((record) => (
+            record.kind === "action_execution" && record.parsedAction === "write_file"
+        ));
+        assert.equal(writeExecution?.toolExecutionStatus, "ok");
+    } finally {
+        await workspaceSwitchModel.close();
+        fs.rmSync(startupRoot, { recursive: true, force: true });
+    }
+
     const reasoningOnlyRecovery = await runScenario([
         {
             __modelResponse: {
@@ -124,9 +185,9 @@ async function main(): Promise<void> {
         fs.writeFileSync(path.join(root, "README.md"), "Recovery evidence.\n", "utf8");
     });
     try {
-        assert.match(reasoningOnlyRecovery.output, /reasoning-only model response reached completion limit before action JSON/);
+        assert.match(reasoningOnlyRecovery.output, /Regenerating clean action \(attempt 1\/2\) after truncated/);
         assert.match(reasoningOnlyRecovery.output, /AI:\s+Recovered after reasoning-only truncation/);
-        assert.deepEqual(reasoningOnlyRecovery.requestedMaxTokens, [4096, 8192, 4096]);
+        assert.deepEqual(reasoningOnlyRecovery.requestedMaxTokens, [4096, 4096, 4096]);
     } finally {
         fs.rmSync(reasoningOnlyRecovery.root, { recursive: true, force: true });
     }
@@ -140,10 +201,105 @@ async function main(): Promise<void> {
         }
     })), "ตรวจ workspace แล้วตอบผล", () => undefined);
     try {
-        assert.match(repeatedReasoningOnly.output, /stopped safely after 2 reasoning-only recovery retries/);
-        assert.deepEqual(repeatedReasoningOnly.requestedMaxTokens, [4096, 8192, 8192]);
+        assert.match(repeatedReasoningOnly.output, /repeatedly returned invalid tool\/action output/);
+        assert.deepEqual(repeatedReasoningOnly.requestedMaxTokens, [4096, 4096, 4096]);
     } finally {
         fs.rmSync(repeatedReasoningOnly.root, { recursive: true, force: true });
+    }
+
+    const repeatedProtocolFailure = await runScenario(Array.from({ length: 8 }, () => ({
+        __modelResponse: {
+            content: JSON.stringify({ action: "list_files", path: ".", reason: "Inspect the workspace." }),
+            finish_reason: "stop"
+        }
+    })), "ตรวจ workspace แล้วทำงานต่อ", () => undefined);
+    try {
+        assert.match(repeatedProtocolFailure.output, /repeatedly returned invalid tool\/action output/);
+        assert.equal(repeatedProtocolFailure.requestedMaxTokens.length, 3);
+        assert.doesNotMatch(repeatedProtocolFailure.output, /Unexpected extra turn/);
+    } finally {
+        fs.rmSync(repeatedProtocolFailure.root, { recursive: true, force: true });
+    }
+
+    const invalidEditNeverExecutes = await runScenario([
+        {
+            __modelResponse: {
+                content: JSON.stringify({ action: "edit_file", path: "", old_text: "", new_text: "corrupted" }),
+                finish_reason: "stop"
+            }
+        },
+        {
+            __modelResponse: {
+                content: JSON.stringify({ action: "edit_file", path: "", old_text: "", new_text: "corrupted" }),
+                finish_reason: "stop"
+            }
+        },
+        {
+            __modelResponse: {
+                content: JSON.stringify({ action: "edit_file", path: "", old_text: "", new_text: "corrupted" }),
+                finish_reason: "stop"
+            }
+        }
+    ], "แก้ไฟล์ตามโครงสร้างเดิม", (root) => {
+        fs.writeFileSync(path.join(root, "status.txt"), "original\n", "utf8");
+    });
+    try {
+        assert.match(invalidEditNeverExecutes.output, /repeatedly returned invalid tool\/action output/);
+        assert.equal(fs.readFileSync(path.join(invalidEditNeverExecutes.root, "status.txt"), "utf8"), "original\n");
+        assert.deepEqual(invalidEditNeverExecutes.requestedMaxTokens, [4096, 4096, 4096]);
+        assert.equal(readResponseRecords(invalidEditNeverExecutes.root)
+            .filter((record) => record.kind === "action_execution" && record.parsedAction === "edit_file").length, 0);
+    } finally {
+        fs.rmSync(invalidEditNeverExecutes.root, { recursive: true, force: true });
+    }
+
+    const cleanRegeneration = await runScenario([
+        {
+            __modelResponse: {
+                content: JSON.stringify({ action: "read_file", reason: "Inspect the requested file." }),
+                finish_reason: "stop"
+            }
+        },
+        { action: "read_file", path: "README.md", reason: "Inspect the requested file with a complete action." },
+        { action: "final", answer: "Recovered with one clean protocol regeneration.", reason: "The requested file was inspected." }
+    ], "อ่าน README.md แล้วสรุป", (root) => {
+        fs.writeFileSync(path.join(root, "README.md"), "Reliable regeneration fixture.\n", "utf8");
+    });
+    try {
+        assert.match(cleanRegeneration.output, /Protocol regeneration produced a valid action/);
+        assert.match(cleanRegeneration.output, /AI:\s+Recovered with one clean protocol regeneration/);
+        assert.deepEqual(cleanRegeneration.requestedMaxTokens, [4096, 4096, 4096]);
+    } finally {
+        fs.rmSync(cleanRegeneration.root, { recursive: true, force: true });
+    }
+
+    const incidentRegression = await runScenario([
+        { action: "list_files", path: ".", reason: "Inspect the workspace." },
+        { action: "read_file", path: "main.go", reason: "Inspect the target source." },
+        { action: "run_command", command: "node -e \"process.exit(0)\"", reason: "Run the build-equivalent check." },
+        { action: "run_command", command: "node -e \"console.error('RUNTIME_FAILURE');process.exit(1)\"", reason: "Run the runtime-equivalent check." },
+        {
+            __modelResponse: {
+                content: "{\"action\":\"edit_file\",\"path\":\"main.go\",\"new_text\":\"fixed\\n\",}",
+                finish_reason: "stop"
+            }
+        },
+        { action: "edit_file", path: "main.go", old_text: "broken\n", new_text: "fixed\n", reason: "Apply one complete regenerated edit." },
+        { action: "final", answer: "The malformed edit was rejected and one regenerated edit completed.", reason: "The admitted edit changed the target once." }
+    ], "ตรวจโครงสร้าง รันเช็ก แล้วแก้ main.go", (root) => {
+        fs.writeFileSync(path.join(root, "main.go"), "broken\n", "utf8");
+    });
+    try {
+        assert.equal(fs.readFileSync(path.join(incidentRegression.root, "main.go"), "utf8"), "fixed\n");
+        assert.match(incidentRegression.output, /Protocol regeneration produced a valid action/);
+        assert.doesNotMatch(incidentRegression.output, /Missing file path/);
+        const responseRecords = readResponseRecords(incidentRegression.root);
+        assert.ok(responseRecords.some((record) => record.admission?.localRepairUsed === true && record.admission?.schemaValid === false));
+        assert.equal(responseRecords.filter((record) => record.kind === "protocol_regeneration").length, 1);
+        assert.equal(responseRecords.filter((record) => record.kind === "action_execution" && record.parsedAction === "edit_file").length, 1);
+        assert.ok(responseRecords.some((record) => record.parseError && /schema_invalid/.test(String(record.parseError))));
+    } finally {
+        fs.rmSync(incidentRegression.root, { recursive: true, force: true });
     }
 
     const repeatedFailedCommand = await runScenario([
@@ -169,7 +325,9 @@ async function main(): Promise<void> {
         }
     ], "ตรวจด้วย command แล้วแก้คำสั่งถ้ารันไม่ผ่าน", () => undefined);
     try {
-        assert.match(repeatedFailedCommand.output, /Blocked repeated failed command: this exact command already failed/);
+        if (!/Blocked repeated failed command: this exact command already failed/.test(repeatedFailedCommand.output)) {
+            throw new Error(`Repeated-command scenario tail:\n${repeatedFailedCommand.output.slice(-8000)}`);
+        }
         assert.match(repeatedFailedCommand.output, /Original failure from the first attempt:/);
         assert.match(repeatedFailedCommand.output, /ORIGINAL_FAILURE_E2E_7/);
         assert.doesNotMatch(repeatedFailedCommand.output, /Agent stopped/);
@@ -509,6 +667,49 @@ async function main(): Promise<void> {
         assert.equal(fs.readFileSync(path.join(satisfiedContinuation.root, "src", "index.ts"), "utf8"), "export const ready = true;\n");
     } finally {
         fs.rmSync(satisfiedContinuation.root, { recursive: true, force: true });
+    }
+
+    const verifierOnlyContinuationEvidence = await runScenario([
+        { action: "read_file", path: "src/index.ts", reason: "Inspect the implementation left by the previous task." },
+        {
+            action: "run_command",
+            command: "npm start",
+            mode: "probe",
+            timeout_ms: 10000,
+            expect: { exit_code: 0, output_includes: ["verification-ready"] },
+            reason: "Exercise the self-contained runtime entrypoint."
+        },
+        {
+            action: "final",
+            answer: "The existing implementation is complete and the runtime check passes.",
+            completion_status: "completed",
+            // The host already has the successful read evidence in context;
+            // the final response only needs to cite successful evidence.
+            evidence: ["evidence_2_run_command"],
+            reason: "The current workspace and runtime verification prove no edit is needed."
+        }
+    ], "Resume the existing implementation and finish its verification.", (root) => {
+        fs.mkdirSync(path.join(root, "src"), { recursive: true });
+        fs.writeFileSync(path.join(root, "src", "index.ts"), "export const ready = true;\n", "utf8");
+        fs.writeFileSync(path.join(root, "verify.js"), "console.log('verification-ready');\n", "utf8");
+        fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({
+            name: "continuation-verifier-only-evidence",
+            scripts: { start: "node verify.js" }
+        }), "utf8");
+    }, [], {
+        intent: "Continue and verify the existing implementation",
+        task_type: "coding",
+        continuation: true,
+        requires_workspace_changes: true,
+        verification: "runtime",
+        evidence_requirements: ["source", "runtime"],
+        success_criteria: ["The self-contained runtime entrypoint completes successfully"]
+    });
+    try {
+        assert.match(verifierOnlyContinuationEvidence.output, /The existing implementation is complete/);
+        assert.doesNotMatch(verifierOnlyContinuationEvidence.output, /requires a successful file write/);
+    } finally {
+        fs.rmSync(verifierOnlyContinuationEvidence.root, { recursive: true, force: true });
     }
 
     const continuationBuildIsNotRuntime = await runScenario([

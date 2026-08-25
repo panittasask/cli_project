@@ -62,15 +62,31 @@ const { AgentActionExecutor } = require("./agentActionExecutor") as { AgentActio
 type CommandExpectation = import("../agent/agentSchema").CommandExpectation;
 type AgentAction = import("../agent/agentSchema").AgentAction;
 type AgentToolResult = import("../agent/agentSchema").AgentToolResult;
-const { AgentActionParser } = require("../agent/agentActionParser") as { AgentActionParser: new (mcpTool: InstanceType<typeof McpTool>) => {
+type ActionAdmissionInput = import("../agent/action/actionAdmissionGate").ActionAdmissionInput;
+type ActionAdmissionResult = import("../agent/action/actionAdmissionGate").ActionAdmissionResult;
+type AgentToolOptions = {
+    tolerateUnescapedControlCharacters?: boolean;
+    repairMalformedJson?: boolean;
+};
+const { AgentActionParser } = require("../agent/agentActionParser") as { AgentActionParser: new (
+    mcpTool: InstanceType<typeof McpTool>,
+    options?: AgentToolOptions
+) => {
     parseAction: (content: string | undefined | null) => AgentAction | undefined;
+    admitContent: (content: string | undefined | null) => import("../agent/agentActionParser").AgentActionParserResult;
     explainParseFailure: (content: string | undefined | null) => string;
 } };
+const { ActionAdmissionGate } = require("../agent/action/actionAdmissionGate") as {
+    ActionAdmissionGate: new (parser: InstanceType<typeof AgentActionParser>) => {
+        admit: (input: ActionAdmissionInput) => ActionAdmissionResult;
+    };
+};
 
 class AgentTool {
     private readonly maxObservationChars = 12000;
     private readonly mcpTool: InstanceType<typeof McpTool>;
     private readonly actionParser: InstanceType<typeof AgentActionParser>;
+    private readonly actionAdmissionGate: InstanceType<typeof ActionAdmissionGate>;
     private readonly toolRegistry: InstanceType<typeof ToolRegistry>;
     private readonly fileTools: InstanceType<typeof WorkspaceFileTools>;
     private readonly commandTool: InstanceType<typeof CommandTool>;
@@ -81,10 +97,12 @@ class AgentTool {
     constructor(
         configRoot = process.cwd(),
         private readonly commandTimeoutOverrideMs?: number,
-        private readonly inferenceApiUrl?: string
+        private readonly inferenceApiUrl?: string,
+        options: AgentToolOptions = {}
     ) {
         this.mcpTool = new McpTool(configRoot);
-        this.actionParser = new AgentActionParser(this.mcpTool);
+        this.actionParser = new AgentActionParser(this.mcpTool, options);
+        this.actionAdmissionGate = new ActionAdmissionGate(this.actionParser);
         this.toolRegistry = new ToolRegistry();
         const workspaceGuard = new WorkspaceGuard();
         this.fileTools = new WorkspaceFileTools(workspaceGuard, resolveCommandWorkdir);
@@ -219,7 +237,12 @@ ${mcpSection}`;
     }
 
     parseAction(content: string | undefined | null): AgentAction | undefined {
-        return this.actionParser.parseAction(content);
+        const result = this.admitAction({ content });
+        return result.ok ? result.action : undefined;
+    }
+
+    admitAction(input: ActionAdmissionInput): ActionAdmissionResult {
+        return this.actionAdmissionGate.admit(input);
     }
 
     explainParseFailure(content: string | undefined | null): string {

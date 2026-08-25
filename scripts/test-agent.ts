@@ -22,11 +22,17 @@ const { loadCliSettings, getSamplingSettings, getAgentGuardSettings, getClarific
     validateCliSettings: (settings: unknown) => string[];
     validateCliSettingsFile: (root?: string) => { ok: boolean; source: string; errors: string[] };
 };
-const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (configRoot?: string, commandTimeoutOverrideMs?: number, inferenceApiUrl?: string) => {
+const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (
+    configRoot?: string,
+    commandTimeoutOverrideMs?: number,
+    inferenceApiUrl?: string,
+    options?: { tolerateUnescapedControlCharacters?: boolean; repairMalformedJson?: boolean }
+) => {
     parseAction: (content: string) => {
         action?: string;
         reason?: string;
         path?: string;
+        content?: string;
         old_text?: string;
         new_text?: string;
         workdir?: string;
@@ -37,12 +43,38 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (con
         task?: Record<string, unknown>;
         evidence?: string[];
     } | undefined;
+    admitAction: (input: {
+        content: string | undefined | null;
+        finishReason?: unknown;
+        hasToolCall?: boolean;
+        requireTaskContract?: boolean;
+        allowedActions?: string[];
+    }) => {
+        ok: boolean;
+        action?: { action: string; path?: string; content?: string; old_text?: string; new_text?: string; command?: string };
+        kind?: string;
+        issues?: string[];
+        localRepairUsed: boolean;
+    };
     explainParseFailure: (content: string) => string;
     formatActionStatus: (action: unknown, turn: number, maxTurns: number) => string;
     execute: (action: unknown) => Promise<{ ok: boolean; output: string; changed?: boolean; assertionPassed?: boolean; probeTimedOut?: boolean; failureKind?: string }>;
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     close: () => Promise<void>;
 } };
+const { buildProtocolRegenerationPrompt, getProtocolRegenerationSampling } = require("../cli/model/jsonResponseRepair") as {
+    buildProtocolRegenerationPrompt: (failure: { kind: string; issues: string[]; toolCallName?: string }) => string;
+    getProtocolRegenerationSampling: (sampling: Record<string, unknown>) => Record<string, unknown>;
+};
+const { ModelProtocolHealth } = require("../cli/model/modelProtocolHealth") as {
+    ModelProtocolHealth: new (protocolThreshold?: number, transportThreshold?: number) => {
+        recordProtocolFailure: () => { circuitBreakerTripped: boolean; protocolFailures: number };
+        recordTransportFailure: () => { circuitBreakerTripped: boolean };
+        recordToolExecutionFailure: () => { circuitBreakerTripped: boolean; toolExecutionFailures: number };
+        recordVerificationFailure: () => { circuitBreakerTripped: boolean; verificationFailures: number };
+        recordValidAction: () => { circuitBreakerTripped: boolean; protocolFailures: number; transportFailures: number };
+    };
+};
 const { ProjectIndex } = require("../cli/projectIndex") as { ProjectIndex: new (workspace: string) => {
     markDirty: () => void;
     refresh: (force?: boolean) => void;
@@ -794,8 +826,97 @@ async function main(): Promise<void> {
     assert.equal(refinedAction?.action, "refine_task");
     assert.deepEqual(refinedAction?.evidence, ["evidence_2_read_file"]);
     assert.equal(agent.parseAction('{"action":"unknown_action"}'), undefined);
-    assert.equal(agent.explainParseFailure("plain text summary"), "no valid JSON object found in model content");
-    assert.equal(agent.explainParseFailure('{"action":"unknown_action"}'), "unsupported action: unknown_action");
+    assert.equal(agent.parseAction('{"action":"write_file","content":"hello"}'), undefined);
+    assert.equal(agent.parseAction('{"action":"write_file","path":"","content":"hello"}'), undefined);
+    assert.equal(agent.parseAction('{"action":"write_file","path":"   ","content":"hello"}'), undefined);
+    assert.equal(agent.parseAction('{"action":"read_file","path":"   "}'), undefined);
+    assert.equal(agent.parseAction('{"action":"edit_file","path":"main.go","new_text":"x"}'), undefined);
+    assert.equal(agent.parseAction('{"action":"edit_file","path":"main.go","old_text":"   ","new_text":"x"}'), undefined);
+    assert.equal(agent.parseAction('{"action":"run_command"}'), undefined);
+    assert.equal(agent.parseAction('{"action":"run_command","command":"   "}'), undefined);
+    assert.equal(agent.parseAction('{"action":"read_file","path":42}'), undefined);
+    assert.equal(agent.parseAction(JSON.stringify({
+        action: "edit_file",
+        path: "main.go",
+        new_text: "replacement",
+        'CreateSolidBrush\")\"': "old_text"
+    })), undefined);
+    assert.equal(agent.parseAction('{"action":"write_file","path":"empty.txt","content":""}')?.content, "");
+    assert.equal(agent.parseAction('{"action":"edit_file","path":"main.go","old_text":"x","new_text":""}')?.new_text, "");
+    assert.equal(agent.explainParseFailure("plain text summary"), "syntax_invalid: no valid JSON object found in model content");
+    assert.match(agent.explainParseFailure('{"action":"unknown_action"}'), /^schema_invalid:/);
+    const malformedMultilineWrite = `{"action":"write_file","path":"go.mod","content":"module claude-monitor
+
+go 1.21
+","reason":"Create the Go module file."}`;
+    assert.equal(agent.parseAction(malformedMultilineWrite)?.content, "module claude-monitor\n\ngo 1.21\n");
+    const openRouterAgent = new AgentTool(process.cwd(), undefined, undefined, {
+        tolerateUnescapedControlCharacters: true,
+        repairMalformedJson: true
+    });
+    const repairedMultilineWrite = openRouterAgent.parseAction(malformedMultilineWrite);
+    assert.equal(repairedMultilineWrite?.action, "write_file");
+    assert.equal(repairedMultilineWrite?.content, "module claude-monitor\n\ngo 1.21\n");
+    const fencedAction = openRouterAgent.parseAction("```json\n{\"action\":\"final\",\"answer\":\"ok\",}\n```");
+    assert.equal(fencedAction?.action, "final");
+    const repairedMissingPath = openRouterAgent.admitAction({ content: '{"action":"write_file","content":"hello",}' });
+    assert.equal(repairedMissingPath.ok, false);
+    assert.equal(repairedMissingPath.kind, "schema_invalid");
+    assert.equal(repairedMissingPath.localRepairUsed, true);
+    const truncatedAdmission = openRouterAgent.admitAction({
+        content: '{"action":"write_file","path":"main.go","content":"partial',
+        finishReason: "length"
+    });
+    assert.equal(truncatedAdmission.ok, false);
+    assert.equal(truncatedAdmission.kind, "truncated");
+    assert.equal(truncatedAdmission.localRepairUsed, false);
+    const emptyAdmission = openRouterAgent.admitAction({ content: "", finishReason: "stop" });
+    assert.equal(emptyAdmission.ok, false);
+    assert.equal(emptyAdmission.kind, "empty_response");
+    const toolOnlyAdmission = openRouterAgent.admitAction({
+        content: '{"action":"read_file","path":"main.go"}',
+        hasToolCall: true,
+        finishReason: "tool_calls"
+    });
+    assert.equal(toolOnlyAdmission.ok, true);
+    const disallowedAdmission = openRouterAgent.admitAction({
+        content: '{"action":"write_file","path":"main.go","content":"x"}',
+        allowedActions: ["read_file"]
+    });
+    assert.equal(disallowedAdmission.ok, false);
+    assert.equal(disallowedAdmission.kind, "semantic_invalid");
+    const escapedJsonAction = openRouterAgent.parseAction("{\"action\":\"write_file\",\"path\":\"main.go\",\"content\":\"package main\\n\\nimport \\\"testing\\\"\\n\"}");
+    assert.equal(escapedJsonAction?.content, "package main\n\nimport \"testing\"\n");
+    const repairedQuoteAction = openRouterAgent.parseAction("{\"action\":\"write_file\",\"path\":\"main.go\",\"content\":\"import \"testing\"\"}");
+    assert.equal(repairedQuoteAction?.action, "write_file");
+    assert.equal(repairedQuoteAction?.content, "import \"testing\"");
+    await openRouterAgent.close();
+    const regenerationPrompt = buildProtocolRegenerationPrompt({
+        kind: "schema_invalid",
+        issues: ["path is required"],
+        toolCallName: "write_file"
+    });
+    assert.match(regenerationPrompt, /Generate one new action/);
+    assert.match(regenerationPrompt, /Do not quote, copy, explain, or repair/);
+    assert.doesNotMatch(regenerationPrompt, /\{broken/);
+    assert.match(regenerationPrompt, /attempted action write_file/);
+    assert.equal(getProtocolRegenerationSampling({ max_tokens: 8192, reasoning: { effort: "high" } }).max_tokens, 4096);
+    assert.equal(getProtocolRegenerationSampling({ max_tokens: 8192, reasoning: { effort: "high" } }).reasoning, undefined);
+    const protocolHealth = new ModelProtocolHealth(3, 2);
+    assert.equal(protocolHealth.recordProtocolFailure().circuitBreakerTripped, false);
+    assert.equal(protocolHealth.recordProtocolFailure().circuitBreakerTripped, false);
+    assert.equal(protocolHealth.recordProtocolFailure().circuitBreakerTripped, true);
+    assert.deepEqual(protocolHealth.recordValidAction(), {
+        protocolFailures: 0,
+        transportFailures: 0,
+        toolExecutionFailures: 0,
+        verificationFailures: 0,
+        circuitBreakerTripped: false
+    });
+    assert.equal(protocolHealth.recordToolExecutionFailure().circuitBreakerTripped, false);
+    assert.equal(protocolHealth.recordVerificationFailure().circuitBreakerTripped, false);
+    assert.equal(protocolHealth.recordTransportFailure().circuitBreakerTripped, false);
+    assert.equal(protocolHealth.recordTransportFailure().circuitBreakerTripped, true);
 
     const indexWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-project-index-"));
     try {

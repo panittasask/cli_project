@@ -96,7 +96,7 @@ const {
     relevantClarificationInspections: (input: { decision: string; question: string; inspections: Array<Record<string, unknown>> }) => Array<Record<string, unknown>>;
     resolveClarificationAnswer: (request: Record<string, any>, input: string) => Record<string, any> | undefined;
 };
-const { buildInitialAgentMessages, getAgentActionJsonSchema, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat, withoutMcpActions } = require("../cli/agentProtocol") as {
+const { buildInitialAgentMessages, getAgentActionJsonSchema, getAgentResponseFormat, getAgentRecoveryResponseFormat, getAgentMutationResponseFormat, getAgentLocalResponseFormat, getAgentReadOnlyResponseFormat, getInitialAgentResponseFormat, getAllowedActionNames, withoutMcpActions } = require("../cli/agentProtocol") as {
     buildInitialAgentMessages: (systemPrompt: string, contextSummary: string, userMessage: string) => Array<{ role: string; content: string }>;
     getAgentActionJsonSchema: () => { oneOf: Array<{ properties?: Record<string, unknown>; required?: string[] }> };
     getAgentResponseFormat: (workflow: string) => {
@@ -119,6 +119,7 @@ const { buildInitialAgentMessages, getAgentActionJsonSchema, getAgentResponseFor
     getInitialAgentResponseFormat: () => {
         schema: { oneOf: Array<{ properties: { action: { const: string }; task: Record<string, any> }; required: string[] }> };
     };
+    getAllowedActionNames: (format: Record<string, unknown>) => string[];
     withoutMcpActions: (format: Record<string, unknown>) => {
         schema: { oneOf: Array<{ properties: { action: { const: string } } }> };
     };
@@ -356,7 +357,9 @@ async function main(): Promise<void> {
     assert.match(startScript, /-ContextLength \$parsedContextLength/);
     assert.match(standaloneStartScript, /-ContextLength \$parsedContextLength/);
     assert.match(terminalScript, /Current model: unavailable \(configured fallback:/);
-    assert.match(terminalScript, /model: serverModelSynced \? model : "server unavailable"/);
+    assert.match(terminalScript, /state:\s*\{[\s\S]*get workspace\(\) \{ return activeWorkspace; \}/);
+    assert.match(terminalScript, /model: serverModelSynced \|\| isOpenRouter \? model : "server unavailable"/);
+    assert.match(terminalScript, /if \(isOpenRouter\) \{[\s\S]*serverModelSynced = model\.trim\(\)\.length > 0/);
     assert.match(terminalScript, /\{ command: "\/log", description: "refresh the HTML log viewer" \}/);
     assert.match(terminalScript, /trimmed\.toLowerCase\(\) === "\/log"/);
     assert.match(terminalScript, /generateLogViewer\(appRoot\)/);
@@ -442,6 +445,8 @@ async function main(): Promise<void> {
     };
     assert.equal(commandSatisfiesAcceptance("npm start", boundedRuntimeProgram, { probe: true }), true);
     assert.equal(commandSatisfiesAcceptance("npm start", boundedRuntimeProgram), false);
+    assert.equal(commandSatisfiesAcceptance("./claude-sticky.exe", boundedRuntimeProgram, { probe: true }), true);
+    assert.equal(commandSatisfiesAcceptance("./claude-sticky.exe", boundedRuntimeProgram), false);
     assert.equal(commandSatisfiesAcceptance("npm test", boundedRuntimeProgram, { probe: true }), false);
     assert.equal(acceptanceContract("ปรับชื่อหัวข้อใน README").evidence, "source");
     assert.equal(acceptanceContractWithHistory("ทำงานต่อให้เสร็จ", [
@@ -787,6 +792,7 @@ async function main(): Promise<void> {
     const codingActions = getAgentResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(codingActions, generalActions);
     const readOnlyActions = getAgentReadOnlyResponseFormat("coding").schema.oneOf.map((variant) => variant.properties.action.const);
+    assert.deepEqual(getAllowedActionNames(getAgentReadOnlyResponseFormat("coding")), readOnlyActions);
     assert.ok(readOnlyActions.includes("read_file"));
     assert.ok(!readOnlyActions.includes("run_command"));
     assert.ok(readOnlyActions.includes("final"));
@@ -834,6 +840,11 @@ async function main(): Promise<void> {
     assert.ok(!forcedDiagnosticActions.includes("ask_user"));
     const forcedMutationActions = getAgentMutationResponseFormat("edit_file").schema.oneOf.map((variant) => variant.properties.action.const);
     assert.deepEqual(forcedMutationActions, ["write_file", "delete_file"]);
+    assert.deepEqual(getAllowedActionNames(getAgentMutationResponseFormat("edit_file")), ["write_file", "delete_file"]);
+    assert.deepEqual(
+        getAllowedActionNames(getAgentRecoveryResponseFormat("coding", ["run_command", "final"])),
+        forcedDiagnosticActions
+    );
     const askUserSchema = getAgentResponseFormat("coding").schema.oneOf.find((variant) => variant.properties.action.const === "ask_user");
     assert.equal(askUserSchema?.properties.options.minItems, 2);
     assert.equal(askUserSchema?.properties.options.maxItems, 6);
@@ -1053,6 +1064,17 @@ async function main(): Promise<void> {
         hasUnresolvedFailures: false
     }), true);
     assert.equal(continuationNoWriteCompletionAllowed({
+        continuation: true,
+        // The model cites the latest verifier only. The host still retains a
+        // successful workspace inspection from earlier in this continuation.
+        evidence: ["evidence_3_run_command"],
+        successfulEvidenceRefs: successfulRefs,
+        successfulWorkspaceEvidenceRefs: workspaceRefs,
+        verificationRequired: true,
+        verificationSatisfied: true,
+        hasUnresolvedFailures: false
+    }), true);
+    assert.equal(continuationNoWriteCompletionAllowed({
         continuation: false,
         evidence: ["evidence_2_read_file", "evidence_3_run_command"],
         successfulEvidenceRefs: successfulRefs,
@@ -1136,6 +1158,15 @@ async function main(): Promise<void> {
         evidence_requirements: ["source"],
         success_criteria: ["Explain the inspected files"]
     }).success, true);
+    assert.equal(AgentTaskContractSchema.safeParse({
+        intent: "   ",
+        task_type: "coding",
+        continuation: false,
+        requires_workspace_changes: false,
+        verification: "none",
+        evidence_requirements: ["source"],
+        success_criteria: ["Explain the inspected files"]
+    }).success, false);
     assert.equal(AgentActionSchema.safeParse({ action: "read_file", path: "package.json" }).success, true);
     assert.equal(AgentActionSchema.safeParse({ action: "read_file" }).success, false);
     assert.equal(AgentActionSchema.safeParse({ action: "run_command", command: "npm test", timeout_ms: 999 }).success, false);
@@ -1146,6 +1177,12 @@ async function main(): Promise<void> {
     assert.ok(generatedReadSchema);
     assert.ok((generatedReadSchema?.required ?? []).includes("path"));
     assert.equal((generatedReadSchema?.required ?? []).includes("reason"), false);
+    assert.equal(((generatedReadSchema?.properties?.path as Record<string, unknown>)?.minLength), 1);
+    const generatedWriteSchema = getAgentActionJsonSchema().oneOf.find((variant) => (
+        (variant.properties?.action as { const?: string } | undefined)?.const === "write_file"
+    ));
+    assert.equal(((generatedWriteSchema?.properties?.path as Record<string, unknown>)?.minLength), 1);
+    assert.equal(((generatedWriteSchema?.properties?.content as Record<string, unknown>)?.minLength), undefined);
     const registry = new ToolRegistry();
     registry.register({
         name: "echo",
@@ -1164,8 +1201,7 @@ async function main(): Promise<void> {
         action: "final",
         answer: "hello",
         completion_status: "completed",
-        evidence: [],
-        reason: undefined
+        evidence: []
     });
     await finalParser.close();
     const compacted = buildCompactedAgentMessages("system", "แก้ login.html", {
