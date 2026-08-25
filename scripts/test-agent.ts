@@ -68,11 +68,11 @@ const { buildProtocolRegenerationPrompt, getProtocolRegenerationSampling } = req
 };
 const { ModelProtocolHealth } = require("../cli/model/modelProtocolHealth") as {
     ModelProtocolHealth: new (protocolThreshold?: number, transportThreshold?: number) => {
-        recordProtocolFailure: () => { circuitBreakerTripped: boolean; protocolFailures: number };
-        recordTransportFailure: () => { circuitBreakerTripped: boolean };
-        recordToolExecutionFailure: () => { circuitBreakerTripped: boolean; toolExecutionFailures: number };
-        recordVerificationFailure: () => { circuitBreakerTripped: boolean; verificationFailures: number };
-        recordValidAction: () => { circuitBreakerTripped: boolean; protocolFailures: number; transportFailures: number };
+        recordProtocolFailure: () => { failureThresholdReached: boolean; protocolFailures: number };
+        recordTransportFailure: () => { failureThresholdReached: boolean };
+        recordToolExecutionFailure: () => { failureThresholdReached: boolean; toolExecutionFailures: number };
+        recordVerificationFailure: () => { failureThresholdReached: boolean; verificationFailures: number };
+        recordValidAction: () => { failureThresholdReached: boolean; protocolFailures: number; transportFailures: number };
     };
 };
 const { ProjectIndex } = require("../cli/projectIndex") as { ProjectIndex: new (workspace: string) => {
@@ -885,6 +885,11 @@ go 1.21
     });
     assert.equal(disallowedAdmission.ok, false);
     assert.equal(disallowedAdmission.kind, "semantic_invalid");
+    const allowedAdmission = openRouterAgent.admitAction({
+        content: '{"action":"read_file","path":"main.go"}',
+        allowedActions: ["read_file"]
+    });
+    assert.equal(allowedAdmission.ok, true);
     const escapedJsonAction = openRouterAgent.parseAction("{\"action\":\"write_file\",\"path\":\"main.go\",\"content\":\"package main\\n\\nimport \\\"testing\\\"\\n\"}");
     assert.equal(escapedJsonAction?.content, "package main\n\nimport \"testing\"\n");
     const repairedQuoteAction = openRouterAgent.parseAction("{\"action\":\"write_file\",\"path\":\"main.go\",\"content\":\"import \"testing\"\"}");
@@ -903,20 +908,20 @@ go 1.21
     assert.equal(getProtocolRegenerationSampling({ max_tokens: 8192, reasoning: { effort: "high" } }).max_tokens, 4096);
     assert.equal(getProtocolRegenerationSampling({ max_tokens: 8192, reasoning: { effort: "high" } }).reasoning, undefined);
     const protocolHealth = new ModelProtocolHealth(3, 2);
-    assert.equal(protocolHealth.recordProtocolFailure().circuitBreakerTripped, false);
-    assert.equal(protocolHealth.recordProtocolFailure().circuitBreakerTripped, false);
-    assert.equal(protocolHealth.recordProtocolFailure().circuitBreakerTripped, true);
+    assert.equal(protocolHealth.recordProtocolFailure().failureThresholdReached, false);
+    assert.equal(protocolHealth.recordProtocolFailure().failureThresholdReached, false);
+    assert.equal(protocolHealth.recordProtocolFailure().failureThresholdReached, true);
     assert.deepEqual(protocolHealth.recordValidAction(), {
         protocolFailures: 0,
         transportFailures: 0,
         toolExecutionFailures: 0,
         verificationFailures: 0,
-        circuitBreakerTripped: false
+        failureThresholdReached: false
     });
-    assert.equal(protocolHealth.recordToolExecutionFailure().circuitBreakerTripped, false);
-    assert.equal(protocolHealth.recordVerificationFailure().circuitBreakerTripped, false);
-    assert.equal(protocolHealth.recordTransportFailure().circuitBreakerTripped, false);
-    assert.equal(protocolHealth.recordTransportFailure().circuitBreakerTripped, true);
+    assert.equal(protocolHealth.recordToolExecutionFailure().failureThresholdReached, false);
+    assert.equal(protocolHealth.recordVerificationFailure().failureThresholdReached, false);
+    assert.equal(protocolHealth.recordTransportFailure().failureThresholdReached, false);
+    assert.equal(protocolHealth.recordTransportFailure().failureThresholdReached, true);
 
     const indexWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "cli-project-index-"));
     try {

@@ -3,15 +3,17 @@ export type ModelProtocolHealthSnapshot = {
     transportFailures: number;
     toolExecutionFailures: number;
     verificationFailures: number;
-    circuitBreakerTripped: boolean;
+    failureThresholdReached: boolean;
 };
 
 class ModelProtocolHealth {
+    // Telemetry only: bounded protocol regeneration is the actual stop mechanism.
+    // Tool and verification failures remain separate counters and do not affect this threshold.
     private protocolFailures = 0;
     private transportFailures = 0;
     private toolExecutionFailures = 0;
     private verificationFailures = 0;
-    private circuitBreakerTripped = false;
+    private failureThresholdReached = false;
 
     constructor(
         private readonly protocolFailureThreshold = 2,
@@ -20,14 +22,14 @@ class ModelProtocolHealth {
 
     recordProtocolFailure(): ModelProtocolHealthSnapshot {
         this.protocolFailures += 1;
-        this.circuitBreakerTripped = this.protocolFailures >= this.protocolFailureThreshold
+        this.failureThresholdReached = this.protocolFailures >= this.protocolFailureThreshold
             || this.transportFailures >= this.transportFailureThreshold;
         return this.snapshot();
     }
 
     recordTransportFailure(): ModelProtocolHealthSnapshot {
         this.transportFailures += 1;
-        this.circuitBreakerTripped = this.protocolFailures >= this.protocolFailureThreshold
+        this.failureThresholdReached = this.protocolFailures >= this.protocolFailureThreshold
             || this.transportFailures >= this.transportFailureThreshold;
         return this.snapshot();
     }
@@ -45,7 +47,7 @@ class ModelProtocolHealth {
     recordValidAction(): ModelProtocolHealthSnapshot {
         this.protocolFailures = 0;
         this.transportFailures = 0;
-        this.circuitBreakerTripped = false;
+        this.failureThresholdReached = false;
         return this.snapshot();
     }
 
@@ -55,7 +57,7 @@ class ModelProtocolHealth {
             transportFailures: this.transportFailures,
             toolExecutionFailures: this.toolExecutionFailures,
             verificationFailures: this.verificationFailures,
-            circuitBreakerTripped: this.circuitBreakerTripped
+            failureThresholdReached: this.failureThresholdReached
         };
     }
 }

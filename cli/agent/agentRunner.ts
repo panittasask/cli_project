@@ -294,6 +294,7 @@ class DefaultAgentRunner {
                 const requestFormat = context.research.mcpCallsDisabled
                     ? withoutMcpActions(selectedResponseFormat)
                     : selectedResponseFormat;
+                const allowedActions = getAllowedActionNames(requestFormat);
                 recoveryResponseFormat = undefined;
                 progress.update(turn === 1
                     ? `Planning next step (step ${turn}, ${guard.formatRemaining()})...`
@@ -351,7 +352,8 @@ class DefaultAgentRunner {
                     content: assistantContent,
                     finishReason: response.finishReason ?? choice.finish_reason,
                     hasToolCall: Boolean(currentToolCall),
-                    requireTaskContract: !context.task
+                    requireTaskContract: !context.task,
+                    allowedActions
                 });
                 let action: AgentAction | undefined = admission.ok ? admission.action : undefined;
                 let parseError = admission.ok ? undefined : `${admission.kind}: ${admission.issues.join(" | ")}`;
@@ -363,6 +365,7 @@ class DefaultAgentRunner {
                     rawContent: rawAssistantContent,
                     normalizedContent: assistantContent,
                     toolCall: currentToolCall,
+                    allowedActions,
                     reasoningContent: response.reasoningContent ?? choice.message.reasoning_content,
                     finishReason: response.finishReason ?? choice.finish_reason,
                     usage: response.data.usage,
@@ -395,7 +398,7 @@ class DefaultAgentRunner {
                     protocolRegenerationAttempt: 0,
                     protocolFailureKind: admission.ok ? undefined : admission.kind,
                     protocolHealth: protocolHealthSnapshot,
-                    circuitBreakerTripped: protocolHealthSnapshot.circuitBreakerTripped,
+                    failureThresholdReached: protocolHealthSnapshot.failureThresholdReached,
                     transport: (response as { transportMeta?: unknown }).transportMeta,
                     executorCalled: false
                 });
@@ -458,7 +461,8 @@ class DefaultAgentRunner {
                             content: regeneratedContent,
                             finishReason: regenerationFinishReason,
                             hasToolCall: Boolean(regenerationResponse.toolCall),
-                            requireTaskContract: !context.task
+                            requireTaskContract: !context.task,
+                            allowedActions
                         });
                         const regenerationParseError = regeneratedAdmission.ok
                             ? undefined
@@ -475,6 +479,7 @@ class DefaultAgentRunner {
                             rawContent: regeneratedRawContent,
                             normalizedContent: regeneratedContent,
                             toolCall: regenerationResponse.toolCall,
+                            allowedActions,
                             finishReason: regenerationFinishReason,
                             parsedAction: regeneratedAdmission.ok ? regeneratedAdmission.action.action : undefined,
                             parseError: regenerationParseError,
@@ -489,7 +494,7 @@ class DefaultAgentRunner {
                             protocolRegenerationAttempt: regenerationAttempt,
                             protocolFailureKind: regeneratedAdmission.ok ? undefined : regeneratedAdmission.kind,
                             protocolHealth: protocolHealthSnapshot,
-                            circuitBreakerTripped: protocolHealthSnapshot.circuitBreakerTripped,
+                            failureThresholdReached: protocolHealthSnapshot.failureThresholdReached,
                             transport: (regenerationResponse as { transportMeta?: unknown }).transportMeta,
                             executorCalled: false
                         });
@@ -1416,11 +1421,12 @@ class DefaultAgentRunner {
                 const choice = response.data?.choices?.[0] ?? { message: {}, finish_reason: response.finishReason };
                 const rawAssistantContent = response.rawProviderContent ?? response.content;
                 const assistantContent = typeof response.content === "string" ? response.content.trim() : "";
+                const finalAllowedActions = getAllowedActionNames(finalResponseFormat);
                 const finalAdmission = tools.actionCoordinator.admit({
                     content: assistantContent,
                     finishReason: response.finishReason ?? choice.finish_reason,
                     hasToolCall: Boolean(response.toolCall),
-                    allowedActions: getAllowedActionNames(finalResponseFormat)
+                    allowedActions: finalAllowedActions
                 });
                 const finalAction = finalAdmission.ok ? finalAdmission.action : undefined;
                 debugLog("LLM final-summary response", {
@@ -1441,6 +1447,7 @@ class DefaultAgentRunner {
                     reasoningContent: choice.message.reasoning_content,
                     finishReason: choice.finish_reason,
                     parsedAction: finalAction?.action,
+                    allowedActions: finalAllowedActions,
                     parseError: finalAdmission.ok ? undefined : `${finalAdmission.kind}: ${finalAdmission.issues.join(" | ")}`,
                     durationMs: Date.now() - modelStartedAt,
                     usage: response.data.usage,
@@ -1453,6 +1460,8 @@ class DefaultAgentRunner {
                     protocolRegenerationAttempt: 0,
                     protocolFailureKind: finalAdmission.ok ? undefined : finalAdmission.kind,
                     transport: (response as { transportMeta?: unknown }).transportMeta,
+                    protocolHealth: protocolHealth.snapshot(),
+                    failureThresholdReached: protocolHealth.snapshot().failureThresholdReached,
                     executorCalled: false
                 });
 

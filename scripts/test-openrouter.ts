@@ -53,6 +53,9 @@ const { normalizeOpenRouterResponseFormat } = require("../cli/model/openRouterCo
 const { buildOpenRouterTools } = require("../cli/model/openRouterTools") as {
     buildOpenRouterTools: (format: Record<string, unknown>) => Array<{ function?: { name?: string } }>;
 };
+const { getAllowedActionNames } = require("../cli/agentProtocol") as {
+    getAllowedActionNames: (format: Record<string, unknown>) => string[];
+};
 const { AgentActionParser } = require("../cli/agent/agentActionParser") as {
     AgentActionParser: new (mcpTool: { resolveDirectCall: () => undefined }) => {
         admitContent: (content: string) => { ok: boolean; kind?: string };
@@ -60,7 +63,7 @@ const { AgentActionParser } = require("../cli/agent/agentActionParser") as {
 };
 const { ActionAdmissionGate } = require("../cli/agent/action/actionAdmissionGate") as {
     ActionAdmissionGate: new (parser: { admitContent: (content: string) => { ok: boolean; kind?: string } }) => {
-        admit: (input: { content: string; hasToolCall: boolean; finishReason: string }) => { ok: boolean; kind?: string };
+        admit: (input: { content: string; hasToolCall: boolean; finishReason: string; allowedActions?: string[] }) => { ok: boolean; kind?: string };
     };
 };
 
@@ -205,7 +208,13 @@ const server = http.createServer((request, response) => {
             assert.equal(payload.top_p, undefined);
             assert.equal(payload.max_tokens, 256);
             response.setHeader("Content-Type", "application/json");
-            response.end(JSON.stringify({ choices: [{ message: { content: "ok" } }] }));
+            response.end(JSON.stringify({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({ action: "write_file", path: "main.go", content: "bad" })
+                    }
+                }]
+            }));
             return;
         }
         if (requestCount === 5) {
@@ -262,27 +271,43 @@ try {
         capabilities: { nativeTools: true, toolChoice: true, structuredOutput: true }
     });
     try {
+        const fallbackResponseFormat = {
+            type: "json_object",
+            schema: {
+                oneOf: [
+                    {
+                        type: "object",
+                        properties: {
+                            action: { const: "read_file" },
+                            path: { type: "string" }
+                        },
+                        required: ["action", "path"],
+                        additionalProperties: false
+                    },
+                    {
+                        type: "object",
+                        properties: {
+                            action: { const: "search_project" },
+                            query: { type: "string" }
+                        },
+                        required: ["action", "query"],
+                        additionalProperties: false
+                    }
+                ]
+            }
+        };
         const response = await provider.chat({
             model: "openai/gpt-4o",
             messages: [{ role: "user", content: "hello" }],
-            responseFormat: {
-                type: "json_object",
-                schema: {
-                    oneOf: [{
-                        type: "object",
-                        properties: {
-                            action: { const: "write_file" },
-                            task: { type: "object" }
-                        },
-                        required: ["action", "task"],
-                        additionalProperties: false
-                    }]
-                }
-            },
+            responseFormat: fallbackResponseFormat,
             allowNativeTools: false,
             sampling: { temperature: 0.1, top_k: 40, repeat_penalty: 1.08, max_tokens: 256 }
         });
-        assert.equal(response.content, "ok");
+        assert.deepEqual(JSON.parse(response.content), {
+            action: "write_file",
+            path: "main.go",
+            content: "bad"
+        });
         assert.equal(response.transportMeta?.requestProtocol, "structured_output");
         assert.equal(response.transportMeta?.finalProtocol, "plain_json");
         assert.equal(response.transportMeta?.initialHttpStatus, 400);
@@ -290,6 +315,22 @@ try {
         assert.equal(response.transportMeta?.usedFallback, true);
         assert.equal(response.transportMeta?.usedResponseHealing, true);
         assert.doesNotMatch(JSON.stringify(response.transportMeta), /unit-test-key/);
+
+        const allowedFallbackActions = getAllowedActionNames(fallbackResponseFormat);
+        assert.deepEqual(allowedFallbackActions, ["read_file", "search_project"]);
+        let fallbackExecutorCalled = false;
+        const fallbackAdmission = new ActionAdmissionGate(
+            new AgentActionParser({ resolveDirectCall: () => undefined })
+        ).admit({
+            content: response.content,
+            hasToolCall: false,
+            finishReason: "stop",
+            allowedActions: allowedFallbackActions
+        });
+        if (fallbackAdmission.ok) fallbackExecutorCalled = true;
+        assert.equal(fallbackAdmission.ok, false);
+        assert.equal(fallbackAdmission.kind, "semantic_invalid");
+        assert.equal(fallbackExecutorCalled, false);
 
         const toolResponse = await provider.chat({
             model: "openai/gpt-4o",
