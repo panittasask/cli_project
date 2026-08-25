@@ -17,8 +17,9 @@ function reasoningOnlyRetryMaxTokens(configuredMaxTokens: number): number {
     const configured = Number.isFinite(configuredMaxTokens) && configuredMaxTokens > 0
         ? Math.floor(configuredMaxTokens)
         : 2048;
-    const expanded = Math.max(4096, configured * 2);
-    return Math.max(configured, Math.min(8192, expanded));
+    // A retry should force a compact action, not grant the model a larger
+    // reasoning allowance after it already consumed the original one.
+    return Math.min(4096, Math.max(1024, configured));
 }
 
 function formatReasoningOnlyRecoveryPrompt(attempt: number): string {

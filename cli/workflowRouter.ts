@@ -8,6 +8,8 @@ type AcceptanceContract = {
     reason: string;
 };
 
+type TaskVerification = "none" | "command" | "runtime" | "interaction";
+
 const workspaceMutationPatterns = [
     /\b(create|build|make|generate|scaffold|add|edit|update|modify|configure|fix|refactor|implement|write|replace|switch|organize|rearrange|polish|improve|style|try another (?:way|method))\b[\s\S]*\b(file|folder|code|project|html|css|web\s?page|website|login\s?page|modal|component|button|form|register|ui|ux|layout|spacing|style|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)\b/i,
     /(สร้าง|เพิ่ม|เขียน|แก้|ปรับ|ตั้งค่า|อัปเดต|ทำ|เปลี่ยน|แทนที่|ลบ|ใช้\s*วิธี(?:แก้|อื่น)|ลอง\s*วิธีอื่น|จัด(?:ระเบียบ)?|ตกแต่ง|ขยับ|เว้นระยะ)[\s\S]*(ไฟล์|โฟลเดอร์|โค้ด|โปรเจกต์|หน้าเว็บ|เว็บไซต์|หน้า\s*(?:login|ล็อกอิน)|โมดัล|ปุ่ม|ฟอร์ม|ลงทะเบียน|รีจิสเตอร์|ยูไอ|\bUI\b|เลย์เอาต์|ระยะห่าง|frontend|dashboard|react|angular|swagger|openapi|api|endpoint|router|server|framework)/i,
@@ -23,6 +25,8 @@ const readOnlyPatterns = [
 ];
 
 const runtimeVerificationPatterns = [
+    /\b(?:runtime|live|production)\b/i,
+    /(?:ล้มเหลว|พัง|ผิดพลาด|ไม่ทำงาน)[\s\S]*(?:runtime|live|production)/i,
     /\b(swagger|openapi|api|endpoint|server|localhost|url|web\s?page|website)\b[\s\S]*\b(open|opens|run|runs|work|works|working|reachable|responds?)\b/i,
     /\b(open|opens|run|runs|work|works|working|reachable|responds?)\b[\s\S]*\b(swagger|openapi|api|endpoint|server|localhost|url|web\s?page|website)\b/i,
     /(swagger|openapi|api|endpoint|server|localhost|หน้าเว็บ|เว็บไซต์)[\s\S]*(เปิด|รัน|ทำงาน|ใช้งาน|เข้า|ตอบกลับ)[\s\S]*(ได้|สำเร็จ|ผ่าน)/i,
@@ -41,6 +45,8 @@ const scaffoldRuntimeVerificationPatterns = [
     /\b(swagger|openapi)\b[\s\S]*\b(create|build|generate|implement|add|fix)\b/i,
     /(สร้าง|เพิ่ม|ทำ|แก้)[\s\S]*(swagger|openapi)/i
 ];
+
+const packageVerifyCommandPattern = /\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?verify(?::[\w.-]+)?\b/i;
 
 function matchesAny(message: string, patterns: RegExp[]): boolean {
     return patterns.some((pattern) => pattern.test(message));
@@ -120,6 +126,7 @@ function commandSatisfiesVerification(
     if (requirement === "runtime") {
         return /invoke-webrequest|invoke-restmethod|\bcurl(?:\.exe)?\b|\bwget(?:\.exe)?\b|https?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)/i.test(clean)
             || /\b(playwright|cypress|selenium|test:e2e|e2e:test)\b/i.test(clean)
+            || packageVerifyCommandPattern.test(clean)
             || (options.probe === true
                 && /\b(?:npm(?:\.cmd)?\s+(?:start|run\s+(?:start|dev|serve))|pnpm\s+(?:start|dev|serve)|yarn\s+(?:start|dev|serve)|bun\s+(?:start|dev|serve)|go\s+run|cargo\s+run|dotnet\s+run)\b/i.test(clean)
                 || options.probe === true && /(?:^|[\s"';&|])(?:\.?[\\/])?[\w.-]+\.exe(?:$|[\s"';&|])/i.test(clean));
@@ -175,9 +182,20 @@ function commandSatisfiesAcceptance(
 ): boolean {
     if (contract.evidence === "source") return true;
     if (contract.evidence === "interaction") {
-        return /\b(playwright|cypress|selenium|webdriver|test:e2e|e2e:test|e2e)\b/i.test(command);
+        return /\b(playwright|cypress|selenium|webdriver|test:e2e|e2e:test|e2e)\b/i.test(command)
+            || packageVerifyCommandPattern.test(command);
     }
     return commandSatisfiesVerification(command, contract.verification, options);
+}
+
+function reconcileTaskVerification(candidate: TaskVerification, inferred: AcceptanceContract): TaskVerification {
+    // A model may over-specify a plain test/check request as runtime work while
+    // creating its task contract. Keep the host's finite command evidence in
+    // that narrow case; genuine runtime or interaction requests remain runtime.
+    if (candidate === "runtime" && inferred.verification === "command" && inferred.evidence === "command") {
+        return "command";
+    }
+    return candidate;
 }
 
 function workflowInstructions(kind: WorkflowKind): string {
@@ -222,5 +240,6 @@ module.exports = {
     acceptanceContract,
     acceptanceContractWithHistory,
     commandSatisfiesAcceptance,
+    reconcileTaskVerification,
     workflowInstructions
 };

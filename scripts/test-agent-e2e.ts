@@ -71,7 +71,8 @@ async function runScenario(
     prompt: string,
     setup: (root: string) => void,
     answers: string[] = [],
-    task?: Record<string, unknown>
+    task?: Record<string, unknown>,
+    environment: Record<string, string> = {}
 ): Promise<{ root: string; output: string; requestedMaxTokens: number[] }> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cli-agent-e2e-"));
     setup(root);
@@ -100,7 +101,15 @@ async function runScenario(
     });
     const mock = await mockModel(scriptedActions);
     try {
-        const result = await runAgentCliHarness({ appRoot: root, workspace: root, apiUrl: mock.url, prompt, clarificationAnswers: answers, timeoutMs: 15_000 });
+        const result = await runAgentCliHarness({
+            appRoot: root,
+            workspace: root,
+            apiUrl: mock.url,
+            prompt,
+            clarificationAnswers: answers,
+            timeoutMs: 15_000,
+            environment
+        });
         assert.equal(result.exitCode, 0, result.stderr);
         return { root, output: result.output, requestedMaxTokens: mock.requestedMaxTokens };
     } finally {
@@ -188,6 +197,7 @@ async function main(): Promise<void> {
         assert.match(reasoningOnlyRecovery.output, /Regenerating clean action \(attempt 1\/1\) after truncated/);
         assert.match(reasoningOnlyRecovery.output, /AI:\s+Recovered after reasoning-only truncation/);
         assert.deepEqual(reasoningOnlyRecovery.requestedMaxTokens, [4096, 4096, 4096]);
+        assert.deepEqual(reasoningOnlyRecovery.requestedMaxTokens, [4096, 4096, 4096]);
     } finally {
         fs.rmSync(reasoningOnlyRecovery.root, { recursive: true, force: true });
     }
@@ -199,7 +209,7 @@ async function main(): Promise<void> {
             finish_reason: "length",
             completion_tokens: 4096
         }
-    })), "ตรวจ workspace แล้วตอบผล", () => undefined);
+    })), "ตรวจ workspace แล้วตอบผล", () => undefined, [], undefined, { CLI_AGENT_MAX_COMPLETION_TOKENS: "20000" });
     try {
         assert.match(repeatedReasoningOnly.output, /repeatedly returned invalid tool\/action output/);
         assert.deepEqual(repeatedReasoningOnly.requestedMaxTokens, [4096, 4096]);

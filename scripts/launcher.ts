@@ -41,6 +41,9 @@ type LauncherSettings = {
     serverPort?: number;
     device?: string;
     hardwareProfile?: string;
+    llamaRuntime?: {
+        reasoningBudget?: number;
+    };
 };
 
 const DEFAULT_OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
@@ -363,7 +366,15 @@ function startLocalServer(executable: string, model: string, backend: Backend, s
     const context = integer(process.env.LLAMA_CONTEXT_LENGTH ?? settings.contextLength, 16_384, 512, 10_000_000, "context length");
     const host = process.env.LLAMA_ARG_HOST?.trim() || settings.serverHost?.trim() || "127.0.0.1";
     const { batch, ubatch } = runtimeBatch(backend, settings);
-    const args = ["-m", model, "-c", String(context), "-b", String(batch), "-ub", String(ubatch), "-np", "1", "-fa", "auto", "--host", host, "--port", String(port), ...deviceArguments(executable, process.env.LLAMA_DEVICE ?? settings.device)];
+    const reasoningBudget = integer(
+        process.env.LLAMA_ARG_THINK_BUDGET ?? settings.llamaRuntime?.reasoningBudget,
+        -1,
+        -1,
+        1_000_000,
+        "reasoning budget"
+    );
+    const reasoningArguments = reasoningBudget >= 0 ? ["--reasoning-budget", String(reasoningBudget)] : [];
+    const args = ["-m", model, "-c", String(context), "-b", String(batch), "-ub", String(ubatch), "-np", "1", "-fa", "auto", "--host", host, "--port", String(port), ...reasoningArguments, ...deviceArguments(executable, process.env.LLAMA_DEVICE ?? settings.device)];
     const logDirectory = path.join(appRoot, ".cli", "logs", "server");
     fs.mkdirSync(logDirectory, { recursive: true });
     const stdout = fs.openSync(path.join(logDirectory, "llama-server.log"), "w");

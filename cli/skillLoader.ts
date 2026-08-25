@@ -76,7 +76,9 @@ function parseSkill(content: string, filePath: string): ProjectSkill | undefined
 }
 
 function tokens(value: string): string[] {
-    return value.toLowerCase().match(/[a-z0-9-]{3,}|[\u0E00-\u0E7F]{3,}/g) ?? [];
+    // Keep short, meaningful interface acronyms discoverable for skills such as
+    // UX/UI while still ignoring one-character noise and punctuation.
+    return value.toLowerCase().match(/[a-z0-9-]{3,}|\b[a-z]{2}\b|[\u0E00-\u0E7F]{3,}/g) ?? [];
 }
 
 module.exports = { SkillLoader, parseSkill };

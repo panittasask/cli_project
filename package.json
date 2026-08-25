@@ -7,7 +7,7 @@
     "start": "tsx scripts/launcher.ts",
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1",
     "dev:cli": "tsx cli/terminal.ts",
-    "llama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-llama.ps1",
+    "llama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-llama.ps1",
     "serve:tailscale": "tailscale serve --bg --tcp=8080 tcp://127.0.0.1:8080",
     "server:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-llama-autostart.ps1",
     "server:restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart-llama-autostart.ps1",
@@ -32,6 +32,7 @@
     "test:e2e": "tsx scripts/test-agent-e2e.ts",
     "test:live-agent": "tsx scripts/test-live-agent.ts",
     "test:live-behavior": "tsx scripts/test-live-behavior.ts",
+    "test:live-full-stack": "tsx scripts/test-live-full-stack.ts",
     "test": "npm run test:launcher && npm run test:agent && npm run test:coordinators && npm run test:openrouter && npm run test:regression && npm run test:mcp",
     "run test": "npm test"
   },
@@ -44,7 +45,10 @@
     "dotenv": "^17.4.2",
     "duck-duck-scrape": "^2.2.7",
     "jsonrepair": "^3.15.0",
+    "mammoth": "^1.12.0",
     "openai": "^6.44.0",
+    "word-extractor": "^1.0.4",
+    "xlsx": "^0.18.5",
     "zod": "^3.25.76",
     "zod-to-json-schema": "^3.25.2"
   },

@@ -1,11 +1,27 @@
 import crypto = require("node:crypto");
-const { normalizeCommandSignature } = require("./commandNormalizer") as {
-    normalizeCommandSignature: (command: string) => string;
-};
 
 type GuardSettings = { maxTurns: number; maxSegments?: number; maxDurationMs: number; maxCompletionTokens: number; repeatLimit: number };
-type GuardDecision = { status: "allow" | "replan" | "stop"; message?: string };
+type GuardDecision = { status: "allow" | "replan" | "stop"; message?: string; blockActions?: string[] };
 type ToolObservation = { ok: boolean; output: string; changed?: boolean };
+
+const inspectionActions = new Set(["list_files", "search_project", "search_files", "read_file"]);
+const inspectionRecoveryBlockedActions = [...inspectionActions, "run_command"];
+const inspectionStreakLimit = 6;
+
+function isInspectionAction(action: Record<string, unknown>): boolean {
+    const actionName = String(action.action ?? "");
+    if (inspectionActions.has(actionName)) return true;
+    if (actionName !== "run_command" || typeof action.command !== "string") return false;
+
+    // Models sometimes use the shell as a larger read_file call. Treat a
+    // command made only of workspace inspection operations as inspection too,
+    // while leaving build/test and mutation commands available for recovery.
+    const command = action.command;
+    const readsWorkspace = /\b(?:Get-Content|gc|type|cat|Get-ChildItem|gci|dir|ls|rg|Select-String|git\s+(?:status|diff|log|show))\b/i.test(command);
+    const mutatesWorkspace = /\b(?:Set-Content|sc|Out-File|Add-Content|ac|Copy-Item|cp|Move-Item|mv|Remove-Item|rm|del|Rename-Item|ri|New-Item|ni|npm\s+(?:install|uninstall|update)|pnpm\s+(?:add|remove|update)|yarn\s+(?:add|remove|upgrade)|bun\s+(?:add|remove|update)|git\s+(?:add|commit|checkout|restore|reset|apply))\b/i.test(command);
+    const verifiesWorkspace = /\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:build|test|verify|lint|check|typecheck)\b/i.test(command);
+    return readsWorkspace && !mutatesWorkspace && !verifiesWorkspace;
+}
 
 class AgentGuard {
     private readonly startedAt = Date.now();
@@ -13,7 +29,7 @@ class AgentGuard {
     private readonly seenEvidencePairs = new Set<string>();
     private readonly repeatedEvidenceCounts = new Map<string, number>();
     private readonly quarantinedActions = new Set<string>();
-    private readonly quarantineViolationCounts = new Map<string, number>();
+    private inspectionStreak = 0;
     private pausedAt: number | undefined;
     private pausedDurationMs = 0;
 
@@ -31,28 +47,49 @@ class AgentGuard {
     }
 
     registerAction(action: Record<string, unknown>): GuardDecision {
-        const signature = this.signature(action);
-        if (this.quarantinedActions.has(signature)) {
-            const violations = (this.quarantineViolationCounts.get(signature) ?? 0) + 1;
-            this.quarantineViolationCounts.set(signature, violations);
-            if (violations >= this.settings.repeatLimit) {
-                return {
-                    status: "stop",
-                    message: `Stopped after the model ignored the quarantine for this exact action ${violations} times.`
-                };
-            }
+        if (this.inspectionStreak >= inspectionStreakLimit && isInspectionAction(action)) {
             return {
                 status: "replan",
-                message: "This exact action is quarantined because it returned an identical observation repeatedly. Choose different arguments, another evidence-producing action, or return final."
+                message: "Inspection has stalled after several unchanged reads. Stop rereading the same workspace; make the required edit/write, run a finite verification, or return an evidence-backed final.",
+                blockActions: [...inspectionRecoveryBlockedActions]
             };
+        }
+        const signature = this.signature(action);
+        if (this.quarantinedActions.has(signature)) {
+            // A command that has already produced the same failure is never
+            // run again verbatim. Other tools remain available: a failed edit
+            // often needs another read or a corrected replacement, and must
+            // not terminate the task merely because the model made a mistake.
+            if (action.action === "run_command") {
+                return {
+                    status: "replan",
+                    message: "This exact command string is quarantined because it returned an identical observation repeatedly. Use a different command text or another corrective action; spacing, quotes, flags, and ports are part of command identity."
+                };
+            }
         }
         return { status: "allow" };
     }
 
     recordObservation(action: Record<string, unknown>, observation: ToolObservation): GuardDecision {
+        if (isInspectionAction(action) && observation.ok && observation.changed !== true) {
+            this.inspectionStreak += 1;
+        } else if (observation.changed === true) {
+            // A build/test can provide verification evidence, but it does not
+            // make rereading the same unchanged workspace useful again. Only a
+            // real workspace mutation releases an inspection stall.
+            this.inspectionStreak = 0;
+        }
         const signature = this.signature(action);
         const fingerprint = this.observationFingerprint(observation);
         const evidencePair = `${signature}:${fingerprint}`;
+
+        if (this.inspectionStreak >= inspectionStreakLimit && isInspectionAction(action)) {
+            return {
+                status: "replan",
+                message: "Inspection has stalled after several unchanged reads. Stop rereading the same workspace; make the required edit/write, run a finite verification, or return an evidence-backed final.",
+                blockActions: [...inspectionRecoveryBlockedActions]
+            };
+        }
 
         if (!this.seenEvidencePairs.has(evidencePair)) {
             // Any genuinely new observation, including a new failure, gives the
@@ -61,7 +98,6 @@ class AgentGuard {
             // old A/B observations cannot masquerade as perpetual progress.
             this.seenEvidencePairs.add(evidencePair);
             this.quarantinedActions.clear();
-            this.quarantineViolationCounts.clear();
             this.repeatedEvidenceCounts.set(evidencePair, 1);
             return { status: "allow" };
         }
@@ -69,10 +105,19 @@ class AgentGuard {
         const count = (this.repeatedEvidenceCounts.get(evidencePair) ?? 0) + 1;
         this.repeatedEvidenceCounts.set(evidencePair, count);
         if (count >= this.settings.repeatLimit) {
-            this.quarantinedActions.add(signature);
+            if (action.action === "run_command") {
+                this.quarantinedActions.add(signature);
+                return {
+                    status: "replan",
+                    message: `The exact command string returned an identical observation ${count} times and is now quarantined. Choose a different command text or correct the workspace before retrying.`
+                };
+            }
             return {
                 status: "replan",
-                message: `The exact action returned an identical observation ${count} times and is now quarantined. Choose different arguments, another evidence-producing action, or return final.`
+                message: this.inspectionStreak >= inspectionStreakLimit
+                    ? "Inspection has stalled after several unchanged reads. Stop rereading the same workspace; make the required edit/write, run a finite verification, or return an evidence-backed final."
+                    : `The action returned an identical observation ${count} times. Re-check the error and change the requested file operation; the task remains active for recovery.`,
+                ...(this.inspectionStreak >= inspectionStreakLimit ? { blockActions: [...inspectionRecoveryBlockedActions] } : {})
             };
         }
         return { status: "allow" };
@@ -82,7 +127,7 @@ class AgentGuard {
         this.seenEvidencePairs.clear();
         this.repeatedEvidenceCounts.clear();
         this.quarantinedActions.clear();
-        this.quarantineViolationCounts.clear();
+        this.inspectionStreak = 0;
     }
 
     recordFileProgress(): void {
@@ -117,6 +162,13 @@ class AgentGuard {
     }
 
     private signature(action: Record<string, unknown>): string {
+        if (action.action === "run_command" && typeof action.command === "string") {
+            // Command quarantine intentionally keys on the raw command text
+            // alone. A different working directory, probe mode, or assertion
+            // must not silently rerun a command that has already failed in
+            // exactly the same form.
+            return JSON.stringify({ action: "run_command", command: action.command });
+        }
         const canonicalAction = { ...action };
         if (action.action === "run_command" && typeof action.workdir !== "string") {
             canonicalAction.workdir = ".";
@@ -131,9 +183,6 @@ class AgentGuard {
             .map(([key, value]) => {
                 if (key === "content" && typeof value === "string") {
                     return [key, crypto.createHash("sha256").update(value).digest("hex")];
-                }
-                if (key === "command" && typeof value === "string") {
-                    return [key, normalizeCommandSignature(value)];
                 }
                 if ((key === "path" || key === "workdir") && typeof value === "string") {
                     return [key, value.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()];

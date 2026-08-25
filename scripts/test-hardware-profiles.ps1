@@ -13,6 +13,8 @@ $env:LLAMA_UBATCH_SIZE = $null
 $env:LLAMA_FIT_TARGET_MIB = $null
 $env:LLAMA_FIT_CONTEXT = $null
 $env:LLAMA_KV_CACHE_TYPE = $null
+$env:LLAMA_ARG_FIT = $null
+$env:LLAMA_ARG_N_GPU_LAYERS = $null
 
 $arcName = Resolve-LlamaHardwareProfile -RequestedProfile "auto" -Device "SYCL0" -DeviceDescription "Intel(R) Arc(TM) A770 Graphics"
 Assert-Equal $arcName "intel-arc" "Arc auto-detection"
@@ -26,10 +28,12 @@ Assert-Equal $arcMemory.FitTargetMiB 1024 "Arc fit margin"
 $rtxName = Resolve-LlamaHardwareProfile -RequestedProfile "auto" -Device "CUDA0" -DeviceDescription "NVIDIA GeForce RTX 4070 SUPER"
 Assert-Equal $rtxName "rtx-4070-super" "RTX auto-detection"
 $rtx = Get-LlamaRuntimeProfile -Device "CUDA0" -HardwareProfile $rtxName -DeviceDescription "NVIDIA GeForce RTX 4070 SUPER"
-Assert-Equal $rtx.BatchSize 1024 "RTX batch"
-Assert-Equal $rtx.UBatchSize 512 "RTX ubatch"
+Assert-Equal $rtx.BatchSize 256 "RTX batch"
+Assert-Equal $rtx.UBatchSize 128 "RTX ubatch"
 $rtxMemory = Get-LlamaMemoryProfile -Device "CUDA0" -HardwareProfile $rtxName
 Assert-Equal $rtxMemory.CacheType "q8_0" "RTX KV cache"
+if (-not ($rtxMemory.Arguments -contains "--fit" -and $rtxMemory.Arguments -contains "off")) { throw "RTX memory profile must disable llama.cpp fit." }
+if (-not ($rtxMemory.Arguments -contains "--gpu-layers" -and $rtxMemory.Arguments -contains "all")) { throw "RTX memory profile must request all GPU layers." }
 
 $generic = Get-LlamaRuntimeProfile -Device "Vulkan0" -HardwareProfile "default"
 Assert-Equal $generic.BatchSize 512 "Generic Vulkan batch"

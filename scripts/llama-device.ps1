@@ -102,12 +102,12 @@ function Get-LlamaRuntimeProfile {
         # Measured on the local Arc 140T 16 GB: 512/256 improved pp512 from
         # 86.02 to 116.65 t/s while tg128 remained stable (7.63 -> 7.74 t/s).
         "intel-arc" { @{ BatchSize = 512; UBatchSize = 256 } }
-        # RTX 4070 SUPER has 12 GB VRAM. This keeps the proven CUDA physical
-        # batch while avoiding the larger memory spike of a 1024 ubatch.
-        "rtx-4070-super" { @{ BatchSize = 1024; UBatchSize = 512 } }
+        # RTX 4070 SUPER has 12 GB VRAM. Keep the physical batch conservative
+        # because fit is disabled and all model layers are requested on GPU.
+        "rtx-4070-super" { @{ BatchSize = 256; UBatchSize = 128 } }
         default {
             switch ($backend) {
-                "CUDA" { @{ BatchSize = 1024; UBatchSize = 512 } }
+                "CUDA" { @{ BatchSize = 256; UBatchSize = 128 } }
                 "SYCL" { @{ BatchSize = 256; UBatchSize = 128 } }
                 "Vulkan" { @{ BatchSize = 512; UBatchSize = 256 } }
                 default { @{ BatchSize = 256; UBatchSize = 128 } }
@@ -118,6 +118,35 @@ function Get-LlamaRuntimeProfile {
     $uBatchSize = if ($env:LLAMA_UBATCH_SIZE) { [int]$env:LLAMA_UBATCH_SIZE } else { $defaults.UBatchSize }
     if ($batchSize -lt 1 -or $uBatchSize -lt 1 -or $uBatchSize -gt $batchSize) { throw "Invalid runtime batch profile: batch=$batchSize ubatch=$uBatchSize" }
     return [pscustomobject]@{ Name = $profileName; Backend = $backend; Device = $Device; DeviceDescription = $DeviceDescription; BatchSize = $batchSize; UBatchSize = $uBatchSize }
+}
+
+function Set-LlamaRuntimeEnvironment {
+    param(
+        [AllowNull()]
+        [object]$Settings
+    )
+
+    $runtime = if ($Settings -and $Settings.llamaRuntime) { $Settings.llamaRuntime } else { $null }
+    if (-not $runtime) { return }
+
+    $mappings = @(
+        @("LLAMA_BATCH_SIZE", "batchSize"),
+        @("LLAMA_UBATCH_SIZE", "ubatchSize"),
+        @("LLAMA_KV_CACHE_TYPE", "kvCacheType"),
+        @("LLAMA_ARG_FIT", "fit"),
+        @("LLAMA_ARG_N_GPU_LAYERS", "gpuLayers"),
+        # llama.cpp exposes --reasoning-budget through LLAMA_ARG_THINK_BUDGET.
+        @("LLAMA_ARG_THINK_BUDGET", "reasoningBudget")
+    )
+    foreach ($mapping in $mappings) {
+        $environmentName = $mapping[0]
+        $settingName = $mapping[1]
+        $current = [Environment]::GetEnvironmentVariable($environmentName, "Process")
+        $configured = $runtime.$settingName
+        if ([string]::IsNullOrWhiteSpace($current) -and $null -ne $configured) {
+            Set-Item -Path "Env:$environmentName" -Value ([string]$configured)
+        }
+    }
 }
 
 function Get-LlamaMemoryProfile {
@@ -136,12 +165,16 @@ function Get-LlamaMemoryProfile {
     $cacheType = if ($env:LLAMA_KV_CACHE_TYPE) { $env:LLAMA_KV_CACHE_TYPE.Trim().ToLowerInvariant() } else { $defaultCacheType }
     $allowedCacheTypes = @("f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1")
     if ($cacheType -notin $allowedCacheTypes) { throw "Invalid KV cache type '$cacheType'." }
+    $fitMode = if ($env:LLAMA_ARG_FIT) { $env:LLAMA_ARG_FIT.Trim().ToLowerInvariant() } else { "off" }
+    if ($fitMode -notin @("on", "off")) { throw "Invalid llama.cpp fit mode '$fitMode'. Use on or off." }
+    $gpuLayers = if ($env:LLAMA_ARG_N_GPU_LAYERS) { $env:LLAMA_ARG_N_GPU_LAYERS.Trim().ToLowerInvariant() } else { "all" }
+    if ($gpuLayers -notmatch '^(?:all|auto|\d+)$') { throw "Invalid llama.cpp GPU layer setting '$gpuLayers'. Use all, auto, or a non-negative integer." }
     $arguments = @()
     if (-not [string]::IsNullOrWhiteSpace($Device)) {
-        # Do not force -ngl all. llama.cpp defaults to automatic layer fitting;
-        # an explicit full offload prevents --fit from recovering when the
-        # model, KV cache, and compute buffers exceed accelerator memory.
-        $arguments += @("--device", $Device, "--fit", "on", "-fitc", $fitContext.ToString(), "-fitt", $fitTarget.ToString())
+        # The configured runtime profile controls whether llama.cpp may fit or
+        # spill layers. With fit off and all layers requested, an over-sized
+        # model should fail with CUDA OOM instead of silently spilling to RAM.
+        $arguments += @("--device", $Device, "--fit", $fitMode, "--gpu-layers", $gpuLayers)
     }
     if (-not [string]::IsNullOrWhiteSpace($Device) -and $cacheType -ne "f16") {
         # Quantized KV protects accelerator memory at longer contexts. It is
@@ -156,7 +189,7 @@ function Get-LlamaMemoryProfile {
         FitTargetMiB = $fitTarget
         FitContext = $fitContext
         Arguments = $arguments
-        Description = if ($Device) { "automatic GPU layers, fit target $fitTarget MiB, minimum context $fitContext, KV $cacheType" } else { "CPU defaults" }
+        Description = if ($Device) { "GPU layers $gpuLayers, fit $fitMode, KV $cacheType" } else { "CPU defaults" }
     }
 }
 

@@ -24,6 +24,12 @@ function deriveTaskEvidencePolicy(
 ): TaskEvidencePolicy {
     const required = new Set(requirements);
     const visualPresentation = required.has("visual");
+    // Interaction is a stronger contract than the model's commonly emitted
+    // source+runtime shorthand. Preserve it so a finite interaction verifier
+    // is not downgraded to a generic runtime probe.
+    if (declaredVerification === "interaction") {
+        return { evidence: "interaction", verification: "runtime", visualPresentation };
+    }
     if (required.has("interaction") || visualPresentation) {
         return { evidence: "interaction", verification: "runtime", visualPresentation };
     }
@@ -37,9 +43,6 @@ function deriveTaskEvidencePolicy(
     // the outcome, so it is authoritative when the redundant scalar
     // verification field disagrees. Retain the scalar only as a defensive
     // fallback for callers outside the schema that provide no requirements.
-    if (required.size === 0 && declaredVerification === "interaction") {
-        return { evidence: "interaction", verification: "runtime", visualPresentation };
-    }
     if (required.size === 0 && declaredVerification === "runtime") {
         return { evidence: "runtime", verification: "runtime", visualPresentation };
     }

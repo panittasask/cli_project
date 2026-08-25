@@ -56,6 +56,14 @@ type CliSettings = {
     contextLength?: number;
     device?: string;
     hardwareProfile?: "auto" | "intel-arc" | "rtx-4070-super" | "default";
+    llamaRuntime?: {
+        fit?: "on" | "off";
+        gpuLayers?: string;
+        batchSize?: number;
+        ubatchSize?: number;
+        kvCacheType?: string;
+        reasoningBudget?: number;
+    };
     debug?: boolean;
     historyMessages?: number;
     terminal?: {
@@ -117,24 +125,24 @@ const DEFAULT_OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completion
 
 const agentBudgetProfiles: Record<AgentBudgetProfile, Omit<AgentBudgetSettings, "profile">> = {
     quick: {
-        maxTurns: 0,
-        maxSegments: 0,
-        maxDurationMs: 0,
-        maxCompletionTokens: 0,
+        maxTurns: 6,
+        maxSegments: 1,
+        maxDurationMs: 4 * 60_000,
+        maxCompletionTokens: 4_000,
         repeatLimit: 2
     },
     standard: {
-        maxTurns: 0,
-        maxSegments: 0,
-        maxDurationMs: 0,
-        maxCompletionTokens: 0,
+        maxTurns: 12,
+        maxSegments: 1,
+        maxDurationMs: 8 * 60_000,
+        maxCompletionTokens: 8_000,
         repeatLimit: 2
     },
     deep: {
-        maxTurns: 0,
-        maxSegments: 0,
-        maxDurationMs: 0,
-        maxCompletionTokens: 0,
+        maxTurns: 12,
+        maxSegments: 2,
+        maxDurationMs: 20 * 60_000,
+        maxCompletionTokens: 12_000,
         repeatLimit: 2
     }
 };
@@ -391,6 +399,27 @@ function validateCliSettings(input: unknown): string[] {
     if (settings.hardwareProfile !== undefined && (typeof settings.hardwareProfile !== "string"
         || !["auto", "intel-arc", "rtx-4070-super", "default"].includes(settings.hardwareProfile))) {
         errors.push("hardwareProfile must be auto, intel-arc, rtx-4070-super, or default");
+    }
+    if (settings.llamaRuntime !== undefined && (!settings.llamaRuntime || typeof settings.llamaRuntime !== "object" || Array.isArray(settings.llamaRuntime))) {
+        errors.push("llamaRuntime must be an object");
+    } else if (settings.llamaRuntime) {
+        const runtime = settings.llamaRuntime as Record<string, unknown>;
+        if (runtime.fit !== undefined && (typeof runtime.fit !== "string" || !["on", "off"].includes(runtime.fit))) {
+            errors.push("llamaRuntime.fit must be on or off");
+        }
+        if (runtime.gpuLayers !== undefined && (typeof runtime.gpuLayers !== "string" || !/^(?:all|auto|\d+)$/i.test(runtime.gpuLayers.trim()))) {
+            errors.push("llamaRuntime.gpuLayers must be all, auto, or a non-negative integer");
+        }
+        numberField(runtime, "batchSize", "llamaRuntime.batchSize", 1);
+        numberField(runtime, "ubatchSize", "llamaRuntime.ubatchSize", 1);
+        if (typeof runtime.batchSize === "number" && typeof runtime.ubatchSize === "number" && runtime.ubatchSize > runtime.batchSize) {
+            errors.push("llamaRuntime.ubatchSize must not exceed llamaRuntime.batchSize");
+        }
+        const allowedCacheTypes = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"];
+        if (runtime.kvCacheType !== undefined && (typeof runtime.kvCacheType !== "string" || !allowedCacheTypes.includes(runtime.kvCacheType.trim().toLowerCase()))) {
+            errors.push("llamaRuntime.kvCacheType is not a supported KV cache type");
+        }
+        numberField(runtime, "reasoningBudget", "llamaRuntime.reasoningBudget", -1);
     }
 
     if (settings.terminal !== undefined && (!settings.terminal || typeof settings.terminal !== "object" || Array.isArray(settings.terminal))) {

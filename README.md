@@ -49,6 +49,26 @@ session whose directory is unavailable, prompt for a valid workspace first.
 The separate two-terminal workflow below remains available when server logs
 need to stay visible.
 
+## File attachments
+
+In the interactive CLI, drag one or more files from Windows Explorer into the
+`You:` prompt and press Enter. The pasted path(s) are attached automatically.
+The attachment reader supports text files such as `.txt`, `.md`, `.csv`, and
+`.json`, Word `.doc`/`.docx`, and Excel `.xls`/`.xlsx` (including `.xlsm` and
+`.xlsb`). Word and Excel content is converted to text before it is sent to the
+model. Large files are truncated to a bounded excerpt per file.
+
+For a typed request, use:
+
+```text
+/attach "C:\Reports\sales report.xlsx" | summarize the numbers
+/readfile "C:\Notes\meeting.docx" | list the action items
+```
+
+The CLI receives file paths from the terminal; it does not upload files to a
+separate server. The files must remain readable at the path when Enter is
+pressed.
+
 For a server that starts automatically with Windows and does not require a
 logged-in terminal, run `npm run server:install` once as described in
 `วิธีการใช้งาน.md`. Use `npm run server:status` to inspect the scheduled task,
@@ -60,6 +80,12 @@ code updates.
    ```powershell
    npm run llama
    ```
+
+   The launcher reads the GPU-only IQ2 runtime values from `llamaRuntime` in
+   `.cli/settings.json`: 8,192 context tokens, batch/ubatch 128/64, q4_0 KV
+   cache, `fit: off`, and `gpuLayers: all`. Set the corresponding `LLAMA_*`
+   environment variable in the same PowerShell session before `npm run llama`
+   to override one value for a one-off run.
 
 2. After the server reports that it is listening on port `8080`, open another
    terminal and start the CLI:
@@ -122,9 +148,17 @@ Prototype contents:
   "apiUrl": "http://127.0.0.1:8080/v1/chat/completions",
   "routerMode": false,
   "modelsMax": 1,
-  "contextLength": 16384,
+  "contextLength": 8192,
   "device": "auto",
   "hardwareProfile": "auto",
+  "llamaRuntime": {
+    "fit": "off",
+    "gpuLayers": "all",
+    "batchSize": 128,
+    "ubatchSize": 64,
+    "kvCacheType": "q4_0",
+    "reasoningBudget": 2048
+  },
   "debug": true,
   "historyMessages": 6,
   "terminal": {
@@ -245,6 +279,11 @@ for Intel Arc or a CUDA build for the RTX 4070 SUPER, and point
 Sampling values can be overridden per profile with variables such as
 `LLAMA_CHAT_TEMPERATURE`, `LLAMA_PLANNER_MAX_TOKENS`, and
 `LLAMA_ACTION_TOP_K`. Set `CLI_DEBUG=1` to show the concise agent trace.
+For Qwen reasoning models, `llamaRuntime.reasoningBudget` maps to llama.cpp's
+thinking-token budget (`LLAMA_ARG_THINK_BUDGET`). A value such as `2048` keeps
+tool-call reasoning enabled while preventing a single action from spending
+thousands of tokens thinking without emitting JSON; use `-1` for unrestricted
+reasoning.
 Agent budgets use `quick`, `standard`, and `deep` profiles. `standard` is the
 normal 12-turn, 8-minute profile; `deep` is explicit and bounded to two
 12-turn segments and 20 minutes. Values above the selected profile's ceiling
@@ -264,22 +303,21 @@ starting values are:
 | Hardware preset | Backend | Context | Batch / ubatch | KV cache |
 | --- | --- | ---: | ---: | --- |
 | Intel Arc | SYCL | 16,384 | 512 / 256 | q8_0 |
-| RTX 4070 SUPER | CUDA | 16,384 | 1024 / 512 | q8_0 |
+| RTX 4070 SUPER | CUDA | 8,192 | 128 / 64 | q4_0 |
 | Generic Vulkan | Vulkan | measured per device | 512 / 256 | f16 |
 
 The Arc value was measured on the local Arc 140T 16 GB: changing ubatch from
 128 to 256 raised pp512 from 86.02 to 116.65 tokens/second while tg128 remained
-stable at 7.63–7.74 tokens/second. The RTX preset uses q8 KV because the card has
-12 GB VRAM and the selected 14B-class Q4 model plus a long f16 KV cache can leave
+stable at 7.63–7.74 tokens/second. The local RTX IQ2 profile uses q4_0 KV
+because the card has 12 GB VRAM and the model plus a long KV cache can leave
 little room for compute buffers. Intel Arc desktop cards vary between 8 GB and
 16 GB; on an 8 GB model, prefer a 7B-class Q4 model or expect partial CPU offload.
 
-Accelerator launches leave GPU layers on llama.cpp's automatic setting, enable
-memory fitting with a 1024 MiB margin, and allow context fitting down to 4,096
-tokens. The launchers never force full `-ngl all` offload because that
-prevents recovery when model weights, KV cache, and compute buffers do not fit.
-`LLAMA_BATCH_SIZE`, `LLAMA_UBATCH_SIZE`, `LLAMA_KV_CACHE_TYPE`,
-`LLAMA_FIT_TARGET_MIB`, and `LLAMA_FIT_CONTEXT` override these values. Run
+Accelerator launches now request `--fit off` and `--gpu-layers all` so llama.cpp
+does not silently spill model layers to CPU/RAM. This is an intentional
+GPU-only attempt: if model weights, KV cache, and compute buffers do not fit,
+startup can fail with CUDA OOM. `LLAMA_BATCH_SIZE`, `LLAMA_UBATCH_SIZE`, and
+`LLAMA_KV_CACHE_TYPE` override the runtime profile. Run
 `npm run benchmark:hardware` for an opt-in llama-bench run; startup never
 benchmarks automatically.
 
@@ -298,8 +336,9 @@ the server whether it was newly started or reused.
 `contextLength` is the context requested from llama.cpp with `-c`; it is not
 automatically inferred from text such as `1M` in a model filename. The startup
 screen shows the configured value, and `/model` shows both that value and the
-active per-slot context reported by llama.cpp. The server may lower the active
-value when automatic VRAM fitting requires it.
+active per-slot context reported by llama.cpp. With the current GPU-only
+configuration, startup can fail with CUDA OOM instead of lowering the value
+through automatic fitting.
 
 Inside the CLI, `/debug on` displays each agent action, its short decision
 summary, and whether the tool succeeded. The full redacted trace is rotated

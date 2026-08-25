@@ -11,6 +11,14 @@
   "contextLength": 16384,
   "device": "auto",
   "hardwareProfile": "auto",
+  "llamaRuntime": {
+    "fit": "off",
+    "gpuLayers": "all",
+    "batchSize": 128,
+    "ubatchSize": 64,
+    "kvCacheType": "q4_0",
+    "reasoningBudget": 2048
+  },
   "debug": false,
   "historyMessages": 6,
   "terminal": {
@@ -18,10 +26,10 @@
   },
   "agent": {
     "profile": "standard",
-    "maxTurns": 0,
-    "maxSegments": 0,
-    "maxDurationMinutes": 0,
-    "maxCompletionTokens": 0,
+    "maxTurns": 12,
+    "maxSegments": 1,
+    "maxDurationMinutes": 8,
+    "maxCompletionTokens": 8000,
     "repeatLimit": 2,
     "maxClarifications": 2,
     "requireInspectionBeforeClarification": true,

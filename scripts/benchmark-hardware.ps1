@@ -7,6 +7,7 @@ if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
     $settingsPath = Join-Path $root ".cli\settings.example.json"
 }
 $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+Set-LlamaRuntimeEnvironment -Settings $settings
 $llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } else { $settings.llamaCppPath }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } else { $settings.modelPath }
 $modelName = if ($env:LLAMA_MODEL) { $env:LLAMA_MODEL } else { $settings.defaultModel }

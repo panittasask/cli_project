@@ -16,6 +16,7 @@ function Get-CliSettings {
 }
 
 $settings = Get-CliSettings
+Set-LlamaRuntimeEnvironment -Settings $settings
 $llamaDirectory = if ($env:LLAMA_CPP_DIR) { $env:LLAMA_CPP_DIR } elseif ($settings.llamaCppPath) { $settings.llamaCppPath } else { "D:\llama.cpp\llama-b10012-bin-win-sycl-x64" }
 $modelDirectory = if ($env:LLAMA_MODEL_DIR) { $env:LLAMA_MODEL_DIR } elseif ($settings.modelPath) { $settings.modelPath } else { "D:\Model" }
 $requestedLlamaDevice = if ($env:LLAMA_DEVICE) { $env:LLAMA_DEVICE } elseif ($settings.device) { $settings.device } else { "auto" }
@@ -100,6 +101,7 @@ Write-Host "Runtime profile: $($runtimeProfile.Name) / $($runtimeProfile.Backend
 Write-Host "Memory profile: $($memoryProfile.Description)"
 Write-Host "Speculative decoding: $($speculativeProfile.Description)"
 Write-Host ("Configured context: {0:N0} tokens" -f $parsedContextLength)
+Write-Host ("Reasoning budget: {0}" -f $(if ($env:LLAMA_ARG_THINK_BUDGET) { "$($env:LLAMA_ARG_THINK_BUDGET) tokens" } else { "unrestricted" }))
 Write-Host "Listening on: http://${serverHost}:$parsedServerPort"
 Write-Host "Local health check: http://127.0.0.1:$parsedServerPort/health"
 Write-Host ""

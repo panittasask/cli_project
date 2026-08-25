@@ -529,10 +529,10 @@ async function main(): Promise<void> {
         const prototypeSettings = loadCliSettings(settingsInitRoot);
         assert.deepEqual(getAgentGuardSettings(prototypeSettings), {
             profile: "standard",
-            maxTurns: 0,
-            maxSegments: 0,
-            maxDurationMs: 0,
-            maxCompletionTokens: 0,
+            maxTurns: 12,
+            maxSegments: 1,
+            maxDurationMs: 480_000,
+            maxCompletionTokens: 8000,
             repeatLimit: 2
         });
         assert.deepEqual(getClarificationSettings(prototypeSettings), {
@@ -546,7 +546,7 @@ async function main(): Promise<void> {
         assert.equal(validateCliSettingsFile(settingsInitRoot).source, "settings.example.json");
         const initialized = initializeCliSettings(settingsInitRoot);
         assert.equal(initialized.created, true);
-        assert.equal((loadCliSettings(settingsInitRoot).agent as Record<string, unknown>).maxSegments, 0);
+        assert.equal((loadCliSettings(settingsInitRoot).agent as Record<string, unknown>).maxSegments, 1);
         fs.writeFileSync(initialized.path, "{\"preserved\":true}\n", "utf8");
         const repeated = initializeCliSettings(settingsInitRoot);
         assert.equal(repeated.created, false);
@@ -606,7 +606,7 @@ async function main(): Promise<void> {
         maxTurns: 25,
         maxSegments: 3,
         maxDurationMs: 7_200_000,
-        maxCompletionTokens: 0,
+        maxCompletionTokens: 8000,
         repeatLimit: 2
     });
     const unboundedGuard = new AgentGuard({ maxTurns: 0, maxDurationMs: 0, maxCompletionTokens: 0, repeatLimit: 2 });
@@ -627,10 +627,10 @@ async function main(): Promise<void> {
     });
     assert.deepEqual(getAgentGuardSettings({ agent: { profile: "deep" } }), {
         profile: "deep",
-        maxTurns: 0,
-        maxSegments: 0,
-        maxDurationMs: 0,
-        maxCompletionTokens: 0,
+        maxTurns: 12,
+        maxSegments: 2,
+        maxDurationMs: 1_200_000,
+        maxCompletionTokens: 12000,
         repeatLimit: 2
     });
     assert.deepEqual(getClarificationSettings({ agent: {
@@ -675,9 +675,9 @@ async function main(): Promise<void> {
         reasoningContent: "reasoning",
         finishReason: "stop"
     }), false);
-    assert.equal(reasoningOnlyRetryMaxTokens(2048), 4096);
-    assert.equal(reasoningOnlyRetryMaxTokens(4096), 8192);
-    assert.equal(reasoningOnlyRetryMaxTokens(10_000), 10_000);
+    assert.equal(reasoningOnlyRetryMaxTokens(2048), 2048);
+    assert.equal(reasoningOnlyRetryMaxTokens(4096), 4096);
+    assert.equal(reasoningOnlyRetryMaxTokens(10_000), 4096);
     assert.equal(MAX_REASONING_ONLY_RETRIES, 2);
     assert.match(REASONING_ONLY_PARSE_ERROR, /reasoning-only/);
     assert.match(formatReasoningOnlyRecoveryPrompt(1), /exactly one compact JSON action immediately/);

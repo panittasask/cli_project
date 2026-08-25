@@ -9,10 +9,22 @@ const { runAgentCliHarness } = require("./agent-cli-harness") as {
 
 async function slotAvailable(apiUrl: string): Promise<boolean> {
     return new Promise((resolve) => {
+        const checkHealth = (): void => {
+            const healthRequest = http.get(new URL("/health", apiUrl), { timeout: 3_000 }, (healthResponse) => {
+                healthResponse.resume();
+                healthResponse.on("end", () => resolve(healthResponse.statusCode === 200));
+            });
+            healthRequest.on("timeout", () => { healthRequest.destroy(); resolve(false); });
+            healthRequest.on("error", () => resolve(false));
+        };
         const request = http.get(new URL("/slots", apiUrl), { timeout: 3_000 }, (response) => {
             let body = "";
             response.on("data", (chunk) => { body += chunk; });
             response.on("end", () => {
+                if (response.statusCode !== 200) {
+                    checkHealth();
+                    return;
+                }
                 try {
                     const slots = JSON.parse(body) as Array<{ is_processing?: boolean }>;
                     resolve(Array.isArray(slots) && slots.some((slot) => slot.is_processing !== true));
@@ -20,7 +32,7 @@ async function slotAvailable(apiUrl: string): Promise<boolean> {
             });
         });
         request.on("timeout", () => { request.destroy(); resolve(false); });
-        request.on("error", () => resolve(false));
+        request.on("error", () => checkHealth());
     });
 }
 
