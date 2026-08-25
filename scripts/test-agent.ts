@@ -895,6 +895,21 @@ go 1.21
     const repairedQuoteAction = openRouterAgent.parseAction("{\"action\":\"write_file\",\"path\":\"main.go\",\"content\":\"import \"testing\"\"}");
     assert.equal(repairedQuoteAction?.action, "write_file");
     assert.equal(repairedQuoteAction?.content, "import \"testing\"");
+    const unreportedTruncation = openRouterAgent.admitAction({
+        content: '{"action":"write_file","path":"main.go","content":"partial'
+    });
+    assert.equal(unreportedTruncation.ok, false);
+    assert.equal(unreportedTruncation.kind, "syntax_invalid");
+    const ambiguousActions = openRouterAgent.admitAction({
+        content: '{"action":"read_file","path":"README.md"}\n{"action":"read_file","path":"package.json"}'
+    });
+    assert.equal(ambiguousActions.ok, false);
+    assert.equal(ambiguousActions.kind, "semantic_invalid");
+    const nearbyWorkspaceAction = openRouterAgent.admitAction({
+        content: '{"action":"read_file","path":"README.md"}'
+    });
+    assert.equal(nearbyWorkspaceAction.ok, true);
+    assert.equal(nearbyWorkspaceAction.action?.action, "read_file");
     await openRouterAgent.close();
     const regenerationPrompt = buildProtocolRegenerationPrompt({
         kind: "schema_invalid",

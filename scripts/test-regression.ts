@@ -787,7 +787,7 @@ async function main(): Promise<void> {
   );
   assert.match(
     terminalScript,
-    /state:\s*\{[\s\S]*get workspace\(\) \{ return activeWorkspace; \}/,
+    /state:\s*\{[\s\S]*get workspace\(\)\s*\{\s*return activeWorkspace;\s*\}/,
   );
   assert.match(
     terminalScript,

@@ -48,6 +48,7 @@ export type LLMResponse = {
         usedFallback: boolean;
         fallbackReason?: string;
         usedResponseHealing: boolean;
+        requiredParameterRouting: boolean;
         finishReason?: unknown;
         latencyMs: number;
         rawContentLength: number;

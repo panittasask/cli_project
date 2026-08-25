@@ -80,11 +80,18 @@ class LlamaCppProvider implements LLMProvider {
             && !useOpenRouterTools
             && Boolean(responseFormat)
             && this.capabilities.responseHealing;
+        const requiredParameterRouting = this.isOpenRouter
+            && (Boolean(responseFormat) || useOpenRouterTools);
         const payload = {
             model: request.model,
             messages: request.messages,
             ...(responseFormat ? { response_format: responseFormat } : {}),
-            ...(useOpenRouterTools ? { tools: openRouterTools, tool_choice: toolChoice } : {}),
+            ...(useOpenRouterTools ? {
+                tools: openRouterTools,
+                tool_choice: toolChoice,
+                parallel_tool_calls: false
+            } : {}),
+            ...(requiredParameterRouting ? { provider: { require_parameters: true } } : {}),
             ...(usedResponseHealing ? { plugins: [{ id: "response-healing" }] } : {}),
             ...(sampling ?? {})
         };
@@ -110,6 +117,7 @@ class LlamaCppProvider implements LLMProvider {
                     finalHttpStatus: initialHttpStatus,
                     usedFallback: false,
                     usedResponseHealing,
+                    requiredParameterRouting,
                     latencyMs: Date.now() - startedAt
                 });
                 throw error;
@@ -142,6 +150,7 @@ class LlamaCppProvider implements LLMProvider {
                     usedFallback: true,
                     fallbackReason: this.client.formatError(error),
                     usedResponseHealing: false,
+                    requiredParameterRouting: false,
                     latencyMs: Date.now() - startedAt
                 });
                 throw fallbackError;
@@ -150,7 +159,8 @@ class LlamaCppProvider implements LLMProvider {
         const choice = response.data?.choices?.[0];
         const message = choice?.message;
         const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
-        const toolCallCandidate = toolCalls[0];
+        const hasAmbiguousToolCalls = toolCalls.length > 1;
+        const toolCallCandidate = hasAmbiguousToolCalls ? undefined : toolCalls[0];
         const toolCall = toolCallCandidate?.function && typeof toolCallCandidate.function.name === "string"
             ? {
                 id: typeof toolCallCandidate.id === "string" ? toolCallCandidate.id : `tool_call_${Date.now()}`,
@@ -161,8 +171,10 @@ class LlamaCppProvider implements LLMProvider {
         const providerContent = typeof message?.content === "string"
             ? message.content
             : toolCall?.arguments ?? "";
-        let normalizedContent = providerContent;
-        if (toolCall) {
+        let normalizedContent = hasAmbiguousToolCalls
+            ? JSON.stringify({ protocol_error: "multiple_tool_calls", tool_call_count: toolCalls.length })
+            : providerContent;
+        if (toolCall && !hasAmbiguousToolCalls) {
             try {
                 const parsedArguments = JSON.parse(toolCall.arguments) as unknown;
                 normalizedContent = JSON.stringify({
@@ -200,6 +212,7 @@ class LlamaCppProvider implements LLMProvider {
                 usedFallback,
                 ...(fallbackReason ? { fallbackReason } : {}),
                 usedResponseHealing,
+                requiredParameterRouting,
                 finishReason: choice?.finish_reason,
                 latencyMs: Date.now() - startedAt,
                 rawContentLength: providerContent.length,

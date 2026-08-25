@@ -77,6 +77,7 @@ class AgentActionParser {
         }
 
         const failures: Array<{ issues: string[]; semantic: boolean; repaired: boolean }> = [];
+        const admitted = new Map<string, { action: AgentAction; repaired: boolean }>();
         for (const candidate of candidates) {
             const normalizedCandidate = this.normalizeDirectMcpCandidate(candidate.value);
             const parsed = AgentActionSchema.safeParse(normalizedCandidate);
@@ -102,14 +103,35 @@ class AgentActionParser {
                 continue;
             }
 
+            const signature = JSON.stringify(action);
+            const existing = admitted.get(signature);
+            admitted.set(signature, {
+                action,
+                repaired: existing ? existing.repaired && candidate.repaired : candidate.repaired
+            });
+        }
+
+        if (admitted.size === 1) {
+            const result = admitted.values().next().value as { action: AgentAction; repaired: boolean };
             return {
                 ok: true,
-                action,
-                localRepairUsed: candidate.repaired,
+                action: result.action,
+                localRepairUsed: result.repaired,
                 syntaxValid: true,
                 schemaValid: true,
                 semanticValid: true
             };
+        }
+        if (admitted.size > 1) {
+            return this.failure(
+                "semantic_invalid",
+                ["model content contains multiple distinct schema-valid action objects"],
+                true,
+                true,
+                true,
+                false,
+                Array.from(admitted.values()).some((candidate) => candidate.repaired)
+            );
         }
 
         const semantic = failures.some((failure) => failure.semantic);
@@ -176,7 +198,8 @@ class AgentActionParser {
             if (this.options.tolerateUnescapedControlCharacters) repairs.push(this.escapeUnescapedControlCharacters(candidate));
             if (this.options.repairMalformedJson) {
                 try {
-                    repairs.push(jsonrepair(candidate));
+                    const repaired = jsonrepair(candidate);
+                    if (!this.repairOnlyCompletesTruncatedJson(candidate, repaired)) repairs.push(repaired);
                 } catch {
                     // Syntax remains invalid; semantic recovery belongs to protocol regeneration.
                 }
@@ -198,6 +221,16 @@ class AgentActionParser {
         return value && typeof value === "object" && !Array.isArray(value)
             ? { value: value as Record<string, unknown>, repaired }
             : undefined;
+    }
+
+    private repairOnlyCompletesTruncatedJson(candidate: string, repaired: string): boolean {
+        const original = candidate.trimEnd();
+        const normalized = repaired.trimEnd();
+        if (!normalized.startsWith(original) || normalized.length === original.length) return false;
+        const appended = normalized.slice(original.length);
+        // Appending only delimiters can turn a cut-off command or file body into an
+        // executable partial action. Leave that case to bounded model regeneration.
+        return /^[\s"'}\]]+$/.test(appended);
     }
 
     private stripOptionalMarkdownFence(value: string): { value: string; changed: boolean } {

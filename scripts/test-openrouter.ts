@@ -86,6 +86,10 @@ assert.deepEqual(normalizeOpenRouterResponseFormat({ type: "json_object", schema
     type: "json_schema",
     json_schema: { name: "agent_action", strict: true, schema: { type: "object" } }
 });
+assert.deepEqual(normalizeOpenRouterResponseFormat({ type: "json_object", schema: { type: "object" } }, false), {
+    type: "json_schema",
+    json_schema: { name: "agent_action", strict: false, schema: { type: "object" } }
+});
 const mixedActionTools = buildOpenRouterTools({
     type: "json_object",
     schema: {
@@ -184,7 +188,15 @@ const server = http.createServer((request, response) => {
         const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
         assert.equal(payload.model, "openai/gpt-4o");
         if (requestCount === 1) {
-            assert.deepEqual(payload.response_format, { type: "json_object" });
+            const responseFormat = payload.response_format as {
+                type?: string;
+                json_schema?: { name?: string; strict?: boolean; schema?: { oneOf?: unknown[] } };
+            };
+            assert.equal(responseFormat.type, "json_schema");
+            assert.equal(responseFormat.json_schema?.name, "agent_action");
+            assert.equal(responseFormat.json_schema?.strict, false);
+            assert.equal(responseFormat.json_schema?.schema?.oneOf?.length, 2);
+            assert.deepEqual(payload.provider, { require_parameters: true });
             assert.deepEqual(payload.plugins, [{ id: "response-healing" }]);
             assert.equal(payload.tools, undefined);
             assert.equal(payload.repeat_penalty, undefined);
@@ -201,6 +213,7 @@ const server = http.createServer((request, response) => {
         }
         if (requestCount === 2) {
             assert.equal(payload.response_format, undefined);
+            assert.equal(payload.provider, undefined);
             assert.equal(payload.plugins, undefined);
             assert.equal(payload.reasoning, undefined);
             assert.equal(payload.top_k, undefined);
@@ -217,7 +230,7 @@ const server = http.createServer((request, response) => {
             }));
             return;
         }
-        if (requestCount === 5) {
+        if (requestCount === 6) {
             response.statusCode = 429;
             response.end(JSON.stringify({
                 error: {
@@ -226,10 +239,12 @@ const server = http.createServer((request, response) => {
             }));
             return;
         }
-        assert.ok(requestCount === 3 || requestCount === 4);
+        assert.ok(requestCount === 3 || requestCount === 4 || requestCount === 5);
         assert.equal(payload.response_format, undefined);
         assert.equal(payload.plugins, undefined);
         assert.equal(payload.tool_choice, "required");
+        assert.equal(payload.parallel_tool_calls, false);
+        assert.deepEqual(payload.provider, { require_parameters: true });
         assert.ok(Array.isArray(payload.tools));
         const tools = payload.tools as Array<{ function?: { name?: string; parameters?: Record<string, unknown> } }>;
         const writeTool = tools.find((tool) => tool.function?.name === "write_file");
@@ -239,16 +254,30 @@ const server = http.createServer((request, response) => {
         const argumentsPayload = requestCount === 3
             ? JSON.stringify({ path: "main.go", content: "package main", reason: "create the file" })
             : '{"path":';
+        const toolCalls = requestCount === 5
+            ? [
+                {
+                    id: "call_write_parallel_1",
+                    type: "function",
+                    function: { name: "write_file", arguments: JSON.stringify({ path: "one.txt", content: "one" }) }
+                },
+                {
+                    id: "call_write_parallel_2",
+                    type: "function",
+                    function: { name: "write_file", arguments: JSON.stringify({ path: "two.txt", content: "two" }) }
+                }
+            ]
+            : [{
+                id: requestCount === 3 ? "call_write_1" : "call_write_malformed",
+                type: "function",
+                function: { name: "write_file", arguments: argumentsPayload }
+            }];
         response.setHeader("Content-Type", "application/json");
         response.end(JSON.stringify({
             choices: [{
                 message: {
                     content: null,
-                    tool_calls: [{
-                        id: requestCount === 3 ? "call_write_1" : "call_write_malformed",
-                        type: "function",
-                        function: { name: "write_file", arguments: argumentsPayload }
-                    }]
+                    tool_calls: toolCalls
                 },
                 finish_reason: "tool_calls"
             }]
@@ -314,6 +343,7 @@ try {
         assert.equal(response.transportMeta?.finalHttpStatus, 200);
         assert.equal(response.transportMeta?.usedFallback, true);
         assert.equal(response.transportMeta?.usedResponseHealing, true);
+        assert.equal(response.transportMeta?.requiredParameterRouting, true);
         assert.doesNotMatch(JSON.stringify(response.transportMeta), /unit-test-key/);
 
         const allowedFallbackActions = getAllowedActionNames(fallbackResponseFormat);
@@ -398,6 +428,42 @@ try {
         assert.equal(malformedToolAdmission.ok, false);
         assert.ok(["syntax_invalid", "schema_invalid"].includes(String(malformedToolAdmission.kind)));
 
+        const ambiguousToolResponse = await provider.chat({
+            model: "openai/gpt-4o",
+            messages: [{ role: "user", content: "create one file" }],
+            responseFormat: {
+                type: "json_object",
+                schema: {
+                    oneOf: [{
+                        type: "object",
+                        properties: {
+                            action: { const: "write_file" },
+                            path: { type: "string" },
+                            content: { type: "string" }
+                        },
+                        required: ["action", "path", "content"],
+                        additionalProperties: false
+                    }]
+                }
+            },
+            sampling: { temperature: 0.1, max_tokens: 256 }
+        });
+        assert.equal(ambiguousToolResponse.toolCall, undefined);
+        assert.deepEqual(JSON.parse(ambiguousToolResponse.content), {
+            protocol_error: "multiple_tool_calls",
+            tool_call_count: 2
+        });
+        assert.equal(ambiguousToolResponse.transportMeta?.toolCallCount, 2);
+        const ambiguousToolAdmission = new ActionAdmissionGate(
+            new AgentActionParser({ resolveDirectCall: () => undefined })
+        ).admit({
+            content: ambiguousToolResponse.content,
+            hasToolCall: false,
+            finishReason: "tool_calls"
+        });
+        assert.equal(ambiguousToolAdmission.ok, false);
+        assert.equal(ambiguousToolAdmission.kind, "schema_invalid");
+
         await assert.rejects(
             provider.chat({
                 model: "openai/gpt-4o",
@@ -410,11 +476,11 @@ try {
                 && error?.transportMeta?.finalHttpStatus === 429
                 && error?.transportMeta?.usedFallback === false
         );
-        assert.equal(requestCount, 5);
+        assert.equal(requestCount, 6);
     } finally {
         provider.close();
     }
-    assert.equal(requestCount, 5);
+    assert.equal(requestCount, 6);
 } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
 }

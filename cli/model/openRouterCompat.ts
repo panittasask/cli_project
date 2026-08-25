@@ -13,16 +13,16 @@ function normalizeOpenRouterResponseFormat(
     if (!responseFormat) return undefined;
 
     // The local llama.cpp endpoint accepts the schema alongside json_object,
-    // while OpenRouter expects either a bare json_object format or its
-    // separate json_schema envelope. Keep the action schema in the system
-    // prompt and let the host validate and repair responses locally.
+    // while OpenRouter expects the schema in a separate json_schema envelope.
+    // Send the schema even when strict mode is disabled so compatible endpoints
+    // can constrain generation; host-side admission remains authoritative.
     if (responseFormat.type === "json_object") {
-        if (strictSchema && responseFormat.schema && typeof responseFormat.schema === "object") {
+        if (responseFormat.schema && typeof responseFormat.schema === "object") {
             return {
                 type: "json_schema",
                 json_schema: {
                     name: "agent_action",
-                    strict: true,
+                    strict: strictSchema,
                     schema: responseFormat.schema
                 }
             };
