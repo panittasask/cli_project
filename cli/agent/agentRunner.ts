@@ -1410,6 +1410,7 @@ class DefaultAgentRunner {
                     model,
                     messages,
                     responseFormat: finalResponseFormat,
+                    allowNativeTools: false,
                     sampling: actionSampling,
                     signal,
                     onRetry: (_attempt: number, errorCode: string) => {
@@ -1428,7 +1429,10 @@ class DefaultAgentRunner {
                     hasToolCall: Boolean(response.toolCall),
                     allowedActions: finalAllowedActions
                 });
-                const finalAction = finalAdmission.ok ? finalAdmission.action : undefined;
+                let finalAction = finalAdmission.ok ? finalAdmission.action : undefined;
+                const finalProtocolHealthSnapshot = finalAdmission.ok
+                    ? protocolHealth.recordValidAction()
+                    : protocolHealth.recordProtocolFailure();
                 debugLog("LLM final-summary response", {
                     rawContent: rawAssistantContent,
                     reasoningContent: choice.message.reasoning_content,
@@ -1460,10 +1464,101 @@ class DefaultAgentRunner {
                     protocolRegenerationAttempt: 0,
                     protocolFailureKind: finalAdmission.ok ? undefined : finalAdmission.kind,
                     transport: (response as { transportMeta?: unknown }).transportMeta,
-                    protocolHealth: protocolHealth.snapshot(),
-                    failureThresholdReached: protocolHealth.snapshot().failureThresholdReached,
+                    protocolHealth: finalProtocolHealthSnapshot,
+                    failureThresholdReached: finalProtocolHealthSnapshot.failureThresholdReached,
                     executorCalled: false
                 });
+
+                if (!finalAdmission.ok && MAX_PROTOCOL_REGENERATION_ATTEMPTS > 0) {
+                    const regenerationStartedAt = Date.now();
+                    const recentHostEvents = segmentEvents.slice(-8)
+                        .map((event) => event.slice(0, 1000))
+                        .join("\n");
+                    progress.log("Regenerating clean final summary (attempt 1/1)...");
+                    const regenerationResponse = await llmProvider.chat({
+                        model,
+                        messages: [
+                            {
+                                role: "system",
+                                content: [
+                                    "You are in isolated final-summary regeneration mode.",
+                                    "Return exactly one final action object matching the supplied response schema and nothing else.",
+                                    "Summarize only completed work and validations supported by the host events. Do not call a tool or claim unverified success."
+                                ].join("\n")
+                            },
+                            {
+                                role: "user",
+                                content: [
+                                    `Original user request:\n${context.input.effectiveUserMessage}`,
+                                    context.task ? `Task contract:\n${JSON.stringify(context.task)}` : "",
+                                    recentHostEvents ? `Recent valid host events:\n${recentHostEvents}` : "",
+                                    `The previous final response was rejected as ${finalAdmission.kind}: ${finalAdmission.issues.slice(0, 4).join(" | ")}`
+                                ].filter(Boolean).join("\n\n")
+                            }
+                        ],
+                        responseFormat: finalResponseFormat,
+                        allowNativeTools: false,
+                        sampling: getProtocolRegenerationSampling(actionSampling),
+                        signal,
+                        onRetry: (_attempt: number, errorCode: string) => {
+                            events.emit({ type: "retrying", message: `Model final-summary regeneration connection ${errorCode}; retrying...` });
+                        }
+                    });
+                    const regenerationUsage = recordResponseUsage(sessionId, regenerationResponse.data);
+                    guard.recordCompletionTokens(regenerationUsage?.completionTokens ?? 0);
+                    const regenerationFinishReason = regenerationResponse.finishReason
+                        ?? regenerationResponse.data?.choices?.[0]?.finish_reason;
+                    const regenerationContent = typeof regenerationResponse.content === "string"
+                        ? regenerationResponse.content.trim()
+                        : "";
+                    const regeneratedAdmission = tools.actionCoordinator.admit({
+                        content: regenerationContent,
+                        finishReason: regenerationFinishReason,
+                        hasToolCall: Boolean(regenerationResponse.toolCall),
+                        allowedActions: finalAllowedActions
+                    });
+                    const regeneratedProtocolHealthSnapshot = regeneratedAdmission.ok
+                        ? protocolHealth.recordValidAction()
+                        : protocolHealth.recordProtocolFailure();
+                    responseLog.append({
+                        turn: lastExecutedTurn + 1,
+                        maxTurns: maxTurnsForLog,
+                        kind: "final_summary_protocol_regeneration",
+                        regenerationAttempt: 1,
+                        requestFormat: finalResponseFormat,
+                        rawContent: regenerationResponse.rawProviderContent ?? regenerationResponse.content,
+                        normalizedContent: regenerationContent,
+                        toolCall: regenerationResponse.toolCall,
+                        finishReason: regenerationFinishReason,
+                        parsedAction: regeneratedAdmission.ok ? regeneratedAdmission.action.action : undefined,
+                        allowedActions: finalAllowedActions,
+                        parseError: regeneratedAdmission.ok ? undefined : `${regeneratedAdmission.kind}: ${regeneratedAdmission.issues.join(" | ")}`,
+                        durationMs: Date.now() - regenerationStartedAt,
+                        usage: regenerationResponse.data?.usage,
+                        timings: regenerationResponse.data?.timings,
+                        admission: regeneratedAdmission,
+                        syntaxValid: regeneratedAdmission.syntaxValid,
+                        schemaValid: regeneratedAdmission.schemaValid,
+                        semanticValid: regeneratedAdmission.semanticValid,
+                        localRepairUsed: regeneratedAdmission.localRepairUsed,
+                        protocolRegenerationAttempt: 1,
+                        protocolFailureKind: regeneratedAdmission.ok ? undefined : regeneratedAdmission.kind,
+                        transport: (regenerationResponse as { transportMeta?: unknown }).transportMeta,
+                        protocolHealth: regeneratedProtocolHealthSnapshot,
+                        failureThresholdReached: regeneratedProtocolHealthSnapshot.failureThresholdReached,
+                        executorCalled: false
+                    });
+                    debugLog("LLM final-summary regeneration response", {
+                        rawContent: regenerationResponse.rawProviderContent ?? regenerationResponse.content,
+                        finishReason: regenerationFinishReason,
+                        admission: regeneratedAdmission,
+                        transport: (regenerationResponse as { transportMeta?: unknown }).transportMeta
+                    });
+                    if (regeneratedAdmission.ok && regeneratedAdmission.action.action === "final") {
+                        finalAction = regeneratedAdmission.action;
+                        progress.log("Final-summary regeneration produced a valid final action.");
+                    }
+                }
 
                 if (finalAction?.action === "final" && finalAction.answer.trim()) {
                     const answer = finalAction.answer.trim();

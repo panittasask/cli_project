@@ -584,24 +584,13 @@ type ProjectCheck = import("./projectTypes").ProjectCheck;
 type ProjectCompletionRequirement =
   import("./projectTypes").ProjectCompletionRequirement;
 const {
-  acceptanceContractWithHistory,
   commandSatisfiesAcceptance,
-  reconcileTaskVerification,
 } = require("./workflowRouter") as {
-  acceptanceContractWithHistory: (
-    message: string,
-    history: Array<{ role: "user" | "assistant"; content: string }>,
-    continuation: boolean,
-  ) => AcceptanceContract;
   commandSatisfiesAcceptance: (
     command: string,
     contract: AcceptanceContract,
     options?: { probe?: boolean },
   ) => boolean;
-  reconcileTaskVerification: (
-    candidate: "none" | "command" | "runtime" | "interaction",
-    inferred: AcceptanceContract,
-  ) => "none" | "command" | "runtime" | "interaction";
 };
 const {
   deriveTaskEvidencePolicy,
@@ -814,6 +803,14 @@ const { ToolRouter } = require("./tools/toolRouter") as {
           contextReason: string;
         }
       | undefined;
+    fallbackDecision: () => {
+      needsTool: false;
+      tool: "none";
+      filePath: string;
+      needsMoreContext: false;
+      contextFiles: string[];
+      contextReason: string;
+    };
   };
 };
 const { AgentTool } = require("./tools/agentTool") as {
@@ -2545,28 +2542,6 @@ function stripCodeFence(content: string): string {
   return lines.slice(1, -1).join("\n");
 }
 
-function detectEditIntent(input: string): boolean {
-  const lower = input.toLowerCase();
-  const keywords = [
-    "แก้",
-    "แก้ไข",
-    "แก้ให้",
-    "เพิ่มเติม",
-    "เพิ่ม",
-    "ปรับ",
-    "ปรับปรุง",
-    "เขียน",
-    "รีแฟคเตอร์",
-    "refactor",
-    "fix",
-    "edit",
-    "modify",
-    "update",
-  ];
-
-  return keywords.some((word) => lower.includes(word));
-}
-
 function findExistingPathByShrinking(segment: string): string | undefined {
   const tokens = segment.trim().split(/\s+/);
 
@@ -2647,20 +2622,6 @@ type ToolDecision = {
   contextFiles: string[];
   contextReason: string;
 };
-
-function keywordFallbackDecision(message: string): ToolDecision {
-  const filePath = resolveExistingFile(extractPathFromMessage(message));
-  if (!filePath) {
-    return { tool: "none", filePath: "", contextFiles: [], contextReason: "" };
-  }
-
-  return {
-    tool: detectEditIntent(message) ? "editfile" : "readfile",
-    filePath,
-    contextFiles: [],
-    contextReason: "",
-  };
-}
 
 function resolveContextFiles(candidates: string[]): string[] {
   const defaults = ["package.json", "tsconfig.json", "README.md"];
@@ -2760,10 +2721,16 @@ async function routeTool(
       }
     }
   } catch {
-    // Ignore and fall back to keyword detection below.
+    // A transport or response-shape failure has no trustworthy intent signal.
   }
 
-  return keywordFallbackDecision(message);
+  const fallback = toolRouter.fallbackDecision();
+  return {
+    tool: fallback.tool,
+    filePath: fallback.filePath,
+    contextFiles: fallback.contextFiles,
+    contextReason: fallback.contextReason,
+  };
 }
 
 function ask(activeSession: ChatSession, runMode: RunMode): void {

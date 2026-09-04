@@ -62,6 +62,24 @@ const { AgentTool } = require("../cli/tools/agentTool") as { AgentTool: new (
     prepareEdit: (path: string, oldText: string, newText: string) => { ok: boolean; output: string; content?: string; changed?: boolean };
     close: () => Promise<void>;
 } };
+const { ToolRouter } = require("../cli/tools/toolRouter") as { ToolRouter: new () => {
+    parseDecision: (content: string | undefined | null) => {
+        needsTool: boolean;
+        tool: "readfile" | "editfile" | "none";
+        filePath: string;
+        needsMoreContext: boolean;
+        contextFiles: string[];
+        contextReason: string;
+    } | undefined;
+    fallbackDecision: () => {
+        needsTool: boolean;
+        tool: "readfile" | "editfile" | "none";
+        filePath: string;
+        needsMoreContext: boolean;
+        contextFiles: string[];
+        contextReason: string;
+    };
+} };
 const { buildProtocolRegenerationPrompt, getProtocolRegenerationSampling } = require("../cli/model/jsonResponseRepair") as {
     buildProtocolRegenerationPrompt: (failure: { kind: string; issues: string[]; toolCallName?: string }) => string;
     getProtocolRegenerationSampling: (sampling: Record<string, unknown>) => Record<string, unknown>;
@@ -900,17 +918,65 @@ go 1.21
     });
     assert.equal(unreportedTruncation.ok, false);
     assert.equal(unreportedTruncation.kind, "syntax_invalid");
+    for (const incompleteExecutableAction of [
+        '{"action":"run_command","command":"npm test",',
+        '{"action":"write_file","path":"main.go","content":"partial",',
+        '{"action":"edit_file","path":"main.go","old_text":"before","new_text":"after",'
+    ]) {
+        const incompleteAdmission = openRouterAgent.admitAction({ content: incompleteExecutableAction });
+        assert.equal(incompleteAdmission.ok, false);
+        assert.equal(incompleteAdmission.kind, "syntax_invalid");
+        assert.equal(incompleteAdmission.localRepairUsed, false);
+    }
+    const balancedTrailingComma = openRouterAgent.admitAction({
+        content: '{"action":"read_file","path":"README.md",}'
+    });
+    assert.equal(balancedTrailingComma.ok, true);
+    assert.equal(balancedTrailingComma.localRepairUsed, true);
     const ambiguousActions = openRouterAgent.admitAction({
         content: '{"action":"read_file","path":"README.md"}\n{"action":"read_file","path":"package.json"}'
     });
     assert.equal(ambiguousActions.ok, false);
     assert.equal(ambiguousActions.kind, "semantic_invalid");
+    for (const nestedActionEnvelope of [
+        '{"wrapper":{"action":"write_file","path":"main.go","content":"partial"}}',
+        '{"wrapper":{"action":"run_command","command":"npm test"}',
+        '[{"action":"write_file","path":"main.go","content":"partial"}]'
+    ]) {
+        const nestedAdmission = openRouterAgent.admitAction({ content: nestedActionEnvelope });
+        assert.equal(nestedAdmission.ok, false);
+    }
     const nearbyWorkspaceAction = openRouterAgent.admitAction({
         content: '{"action":"read_file","path":"README.md"}'
     });
     assert.equal(nearbyWorkspaceAction.ok, true);
     assert.equal(nearbyWorkspaceAction.action?.action, "read_file");
     await openRouterAgent.close();
+    const toolRouter = new ToolRouter();
+    assert.equal(toolRouter.parseDecision("malformed router output"), undefined);
+    assert.deepEqual(toolRouter.fallbackDecision(), {
+        needsTool: false,
+        tool: "none",
+        filePath: "",
+        needsMoreContext: false,
+        contextFiles: [],
+        contextReason: ""
+    });
+    assert.deepEqual(toolRouter.parseDecision(JSON.stringify({
+        needs_tool: true,
+        tool: "editfile",
+        file_path: "src/app.ts",
+        needs_more_context: false,
+        context_files: [],
+        context_reason: "The requested workspace change targets this file."
+    })), {
+        needsTool: true,
+        tool: "editfile",
+        filePath: "src/app.ts",
+        needsMoreContext: false,
+        contextFiles: [],
+        contextReason: "The requested workspace change targets this file."
+    });
     const regenerationPrompt = buildProtocolRegenerationPrompt({
         kind: "schema_invalid",
         issues: ["path is required"],

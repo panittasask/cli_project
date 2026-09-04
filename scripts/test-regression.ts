@@ -4,46 +4,15 @@ import os = require("node:os");
 import path = require("node:path");
 
 const {
-  forbidsWorkspaceWrite,
-  requiresWorkspaceWrite,
-  requiresWorkspaceWriteWithHistory,
-  verificationRequirement,
-  verificationRequirementWithHistory,
   commandSatisfiesVerification,
-  acceptanceContract,
-  acceptanceContractWithHistory,
   commandSatisfiesAcceptance,
-  reconcileTaskVerification,
   workflowInstructions,
 } = require("../cli/workflowRouter") as {
-  forbidsWorkspaceWrite: (message: string) => boolean;
-  requiresWorkspaceWrite: (message: string) => boolean;
-  requiresWorkspaceWriteWithHistory: (
-    message: string,
-    history: Array<{ role: "user" | "assistant"; content: string }>,
-    continuation: boolean,
-  ) => boolean;
-  verificationRequirement: (message: string) => "none" | "command" | "runtime";
-  verificationRequirementWithHistory: (
-    message: string,
-    history: Array<{ role: "user" | "assistant"; content: string }>,
-    continuation: boolean,
-  ) => "none" | "command" | "runtime";
   commandSatisfiesVerification: (
     command: string,
     requirement: "none" | "command" | "runtime",
     options?: { probe?: boolean },
   ) => boolean;
-  acceptanceContract: (message: string) => {
-    evidence: "source" | "command" | "runtime" | "interaction";
-    verification: "none" | "command" | "runtime";
-    reason: string;
-  };
-  acceptanceContractWithHistory: (
-    message: string,
-    history: Array<{ role: "user" | "assistant"; content: string }>,
-    continuation: boolean,
-  ) => { evidence: string; verification: string; reason: string };
   commandSatisfiesAcceptance: (
     command: string,
     contract: {
@@ -53,14 +22,6 @@ const {
     },
     options?: { probe?: boolean },
   ) => boolean;
-  reconcileTaskVerification: (
-    candidate: "none" | "command" | "runtime" | "interaction",
-    inferred: {
-      evidence: "source" | "command" | "runtime" | "interaction";
-      verification: "none" | "command" | "runtime";
-      reason: string;
-    },
-  ) => "none" | "command" | "runtime" | "interaction";
   workflowInstructions: (kind: string) => string;
 };
 const { isContinuationRequest, selectTaskContext } =
@@ -891,81 +852,10 @@ async function main(): Promise<void> {
     false,
   );
   const swaggerUntilWorking = "ใช้วิธีแก้อื่นจนกว่ามันจะสามารถเปิด swagger ได้";
-  const uiSpacingRequest =
-    "จัดระเบียบ ui ให้มันสวยกว่านี้หน่อยซิ ตัว ยกเลิก กับลงทะเบียนมันติดกันจัดๆเลย";
-  assert.equal(
-    requiresWorkspaceWrite("install package ของ react ให้หน่อย"),
-    true,
-  );
-  assert.equal(requiresWorkspaceWrite("install zod ให้หน่อย"), true);
-  assert.equal(
-    requiresWorkspaceWrite("ติดตั้งแพ็กเกจของ react ให้หน่อย"),
-    true,
-  );
-  assert.equal(
-    requiresWorkspaceWrite("แก้ไฟล์ package.json โดยตั้งค่า packageMode"),
-    true,
-  );
-  assert.equal(
-    forbidsWorkspaceWrite("อ่าน README.md แล้วสรุป ห้ามแก้ไฟล์"),
-    true,
-  );
-  assert.equal(
-    forbidsWorkspaceWrite("Read README.md without editing files"),
-    true,
-  );
-  assert.equal(forbidsWorkspaceWrite("แก้ README.md ให้ชัดขึ้น"), false);
-  assert.equal(
-    requiresWorkspaceWrite("สร้างหน้า login พร้อม privacy policy modal"),
-    true,
-  );
-  assert.equal(
-    requiresWorkspaceWrite("ทำเลยเพิ่มปุ่มตัว register ได้เลย"),
-    true,
-  );
-  assert.equal(requiresWorkspaceWrite(uiSpacingRequest), true);
-  assert.equal(requiresWorkspaceWrite(swaggerUntilWorking), true);
-  assert.equal(
-    requiresWorkspaceWriteWithHistory(
-      "ทำงานต่อจากเดิมหน่อย",
-      [
-        { role: "user", content: "แก้ไฟล์ login.html ให้มี register" },
-        { role: "assistant", content: "ยังแก้ไม่เสร็จ" },
-      ],
-      true,
-    ),
-    true,
-  );
-  assert.equal(requiresWorkspaceWrite("file ถูกสร้างไว้ที่ไหน"), false);
-  assert.equal(verificationRequirement(swaggerUntilWorking), "runtime");
   const fullStackPrompt =
     "create a golang restfull api with react website show dashboard about employee";
-  assert.equal(requiresWorkspaceWrite(fullStackPrompt), true);
-  assert.equal(verificationRequirement(fullStackPrompt), "command");
-  assert.equal(
-    verificationRequirement("create a Go API with Swagger UI"),
-    "runtime",
-  );
   const angularSwitchPrompt =
     "เปลี่ยนเป็นไปใช้ angular แทนได้ไหมถ้างั้น ลบ react ทิ้งไปก่อนแล้วสร้าง dashboard โดยใช้ angular แทน";
-  assert.equal(requiresWorkspaceWrite(angularSwitchPrompt), true);
-  assert.equal(verificationRequirement(angularSwitchPrompt), "command");
-  assert.equal(
-    verificationRequirement("แก้ TypeScript จนกว่า npm test จะผ่าน"),
-    "command",
-  );
-  assert.equal(verificationRequirement("อธิบายว่า Swagger คืออะไร"), "none");
-  assert.equal(
-    verificationRequirementWithHistory(
-      "ทำงานต่อให้เสร็จ",
-      [
-        { role: "user", content: swaggerUntilWorking },
-        { role: "assistant", content: "ยังเปิดไม่ได้" },
-      ],
-      true,
-    ),
-    "runtime",
-  );
   assert.equal(
     commandSatisfiesVerification("go build -o app.exe main.go", "runtime"),
     false,
@@ -978,37 +868,11 @@ async function main(): Promise<void> {
     true,
   );
   assert.equal(commandSatisfiesVerification("npm test", "command"), true);
-  assert.equal(
-    reconcileTaskVerification(
-      "runtime",
-      acceptanceContract("run the test suite and fix failures"),
-    ),
-    "command",
-  );
-  assert.equal(
-    reconcileTaskVerification(
-      "runtime",
-      acceptanceContract("make the API work at localhost:3000"),
-    ),
-    "runtime",
-  );
-  assert.equal(
-    acceptanceContract("repair the runtime behavior and verify it")
-      .verification,
-    "runtime",
-  );
-  assert.equal(
-    reconcileTaskVerification(
-      "runtime",
-      acceptanceContract("repair the runtime behavior and verify it"),
-    ),
-    "runtime",
-  );
-  const failedInteraction = acceptanceContract(
-    "กด Employee List แล้วหน้ายังค้างอยู่ที่ Dashboard",
-  );
-  assert.equal(failedInteraction.evidence, "interaction");
-  assert.equal(failedInteraction.verification, "runtime");
+  const failedInteraction = {
+    evidence: "interaction" as const,
+    verification: "runtime" as const,
+    reason: "The model-owned task contract requires interaction evidence.",
+  };
   assert.equal(
     commandSatisfiesAcceptance("npm run build", failedInteraction),
     false,
@@ -1053,24 +917,6 @@ async function main(): Promise<void> {
       probe: true,
     }),
     false,
-  );
-  assert.equal(
-    acceptanceContract("ปรับชื่อหัวข้อใน README").evidence,
-    "source",
-  );
-  assert.equal(
-    acceptanceContractWithHistory(
-      "ทำงานต่อให้เสร็จ",
-      [
-        {
-          role: "user",
-          content: "When I submit the form it still stays on the same screen",
-        },
-        { role: "assistant", content: "I will fix it" },
-      ],
-      true,
-    ).evidence,
-    "interaction",
   );
   assert.match(workflowInstructions("web_research"), /Never use search_files/);
   const fullStackRequirement =

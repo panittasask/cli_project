@@ -294,6 +294,29 @@ async function main(): Promise<void> {
         fs.rmSync(cleanRegeneration.root, { recursive: true, force: true });
     }
 
+    const finalSummaryRegeneration = await runScenario([
+        { action: "read_file", path: "README.md", reason: "Inspect the requested file before summarizing." },
+        {
+            __modelResponse: {
+                content: '{"action":"final","answer":',
+                finish_reason: "stop"
+            }
+        },
+        { action: "final", answer: "Recovered the final summary after the malformed response.", reason: "The file inspection completed successfully." }
+    ], "อ่าน README.md แล้วสรุป", (root) => {
+        fs.writeFileSync(path.join(root, "README.md"), "Final summary regeneration fixture.\n", "utf8");
+    }, [], undefined, { CLI_AGENT_MAX_TURNS: "1" });
+    try {
+        assert.match(finalSummaryRegeneration.output, /Regenerating clean final summary \(attempt 1\/1\)/);
+        assert.match(finalSummaryRegeneration.output, /Final-summary regeneration produced a valid final action/);
+        assert.match(finalSummaryRegeneration.output, /AI:\s+Recovered the final summary after the malformed response/);
+        const finalRecords = readResponseRecords(finalSummaryRegeneration.root);
+        assert.equal(finalRecords.filter((record) => record.kind === "final_summary_protocol_regeneration").length, 1);
+        assert.equal(finalRecords.filter((record) => record.kind === "action_execution" && record.parsedAction !== "read_file").length, 0);
+    } finally {
+        fs.rmSync(finalSummaryRegeneration.root, { recursive: true, force: true });
+    }
+
     const disallowedRegeneration = await runScenario([
         {
             action: "read_file",

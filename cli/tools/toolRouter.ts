@@ -121,6 +121,20 @@ JSON Schema:
             contextReason
         };
     }
+
+    fallbackDecision(): RouterDecision {
+        // A malformed model response contains no trustworthy semantic intent.
+        // Keep the request in normal chat instead of guessing read/edit intent
+        // from user-language keywords. Explicit slash commands remain separate.
+        return {
+            needsTool: false,
+            tool: "none",
+            filePath: "",
+            needsMoreContext: false,
+            contextFiles: [],
+            contextReason: ""
+        };
+    }
 }
 
 module.exports = {

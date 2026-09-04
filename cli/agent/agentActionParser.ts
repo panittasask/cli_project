@@ -156,28 +156,40 @@ class AgentActionParser {
         const objects: JsonCandidate[] = [];
         const fenced = this.stripOptionalMarkdownFence(raw);
         this.pushCandidate(objects, this.parseJsonCandidate(fenced.value, fenced.changed));
+        const normalizedEnvelope = fenced.value.trim();
+        if (normalizedEnvelope.startsWith("[") && normalizedEnvelope.endsWith("]")) {
+            return objects;
+        }
 
-        for (let start = raw.indexOf("{"); start !== -1; start = raw.indexOf("{", start + 1)) {
-            let depth = 0;
-            let inString = false;
-            let escaped = false;
-            for (let index = start; index < raw.length; index += 1) {
-                const character = raw[index];
-                if (inString) {
-                    if (escaped) escaped = false;
-                    else if (character === "\\") escaped = true;
-                    else if (character === '"') inString = false;
-                    continue;
+        let start = -1;
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+        for (let index = 0; index < raw.length; index += 1) {
+            const character = raw[index];
+            if (depth === 0) {
+                if (character === "{") {
+                    start = index;
+                    depth = 1;
+                    inString = false;
+                    escaped = false;
                 }
-                if (character === '"') inString = true;
-                else if (character === "{") depth += 1;
-                else if (character === "}") {
-                    depth -= 1;
-                    if (depth === 0) {
-                        const isolated = raw.slice(start, index + 1);
-                        this.pushCandidate(objects, this.parseJsonCandidate(isolated, isolated !== raw));
-                        break;
-                    }
+                continue;
+            }
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (character === "\\") escaped = true;
+                else if (character === '"') inString = false;
+                continue;
+            }
+            if (character === '"') inString = true;
+            else if (character === "{") depth += 1;
+            else if (character === "}") {
+                depth -= 1;
+                if (depth === 0 && start >= 0) {
+                    const isolated = raw.slice(start, index + 1);
+                    this.pushCandidate(objects, this.parseJsonCandidate(isolated, isolated !== raw));
+                    start = -1;
                 }
             }
         }
@@ -196,7 +208,7 @@ class AgentActionParser {
         } catch {
             const repairs: string[] = [];
             if (this.options.tolerateUnescapedControlCharacters) repairs.push(this.escapeUnescapedControlCharacters(candidate));
-            if (this.options.repairMalformedJson) {
+            if (this.options.repairMalformedJson && this.isClosedObjectCandidate(candidate)) {
                 try {
                     const repaired = jsonrepair(candidate);
                     if (!this.repairOnlyCompletesTruncatedJson(candidate, repaired)) repairs.push(repaired);
@@ -215,6 +227,15 @@ class AgentActionParser {
             }
             return undefined;
         }
+    }
+
+    private isClosedObjectCandidate(candidate: string): boolean {
+        const normalized = candidate.trim();
+        // jsonrepair may replace a dangling comma and append a closing brace. If
+        // the provider omitted finish_reason, that would turn a cut-off action
+        // into an executable write or command. Only repair candidates whose
+        // object boundary was already present in the model response.
+        return normalized.startsWith("{") && normalized.endsWith("}");
     }
 
     private objectCandidate(value: unknown, repaired: boolean): JsonCandidate | undefined {

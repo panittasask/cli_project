@@ -166,8 +166,7 @@ ${workflowInstructions}
 
 Return ONLY valid JSON. No markdown. No code fences. No text outside JSON.
 For every tool action, include "reason" with one short user-visible sentence explaining why that action is the useful next step. Use the user's language when practical. This is a decision summary, not private chain-of-thought.
-On the first response for a task, include "task" in the same JSON object as the first action:
-{"intent":"what the user wants","task_type":"general|web_research|coding|mcp_creation","continuation":false,"requires_workspace_changes":true,"verification":"interaction","evidence_requirements":["interaction","visual"],"success_criteria":["observable result"]}
+Follow the mandatory first-response contract supplied for the current protocol state. It defines the exact nested task shape and required action fields.
 Classify the task semantically from the complete request and context. Choose the first evidence-producing action in that same response; there is no separate routing phase. For repository work, use the project index summary and request only relevant search results or file contents rather than asking for every file.
 Set continuation true only when the current request semantically asks to resume unfinished work from the session context. A continuation may already be satisfied by the current workspace state: inspect it, run every required verification, then return final citing both workspace and verification Evidence IDs without making a cosmetic file change.
 Choose every applicable evidence requirement from the requested outcome, not merely the cheapest check. Use interaction whenever success depends on a user action and its observable result. Use visual whenever success depends on rendered appearance, layout, or styling; visual work also requires interaction evidence. A build proves compilation only and must not be used as evidence that navigation, clicks, state transitions, or appearance work.
